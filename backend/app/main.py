@@ -96,6 +96,8 @@ def _process(job_id):
             job["accompaniment"] = os.path.relpath(
                 result["accompaniment"], job_dir)
             job["encoderDelayMs"] = result["encoderDelayMs"]
+            job["trimStartSec"] = result["trimStartSec"]
+            job["trimEndSec"] = result["trimEndSec"]
             _persist(job_id)
     except Exception as e:  # surface any pipeline failure to the UI
         with jobs_lock:
@@ -179,9 +181,11 @@ def get_midi(job_id: str, vel_min: int = 20, vel_max: int = 112,
         events = json.load(f)
     out = os.path.join(_job_dir(job_id), "render.mid")
     # job["encoderDelayMs"] compensates for the accompaniment MP3's fixed
-    # codec startup delay (see pipeline.MP3_ENCODER_DELAY_SAMPLES) so the
-    # user's offset_ms=0 is already correctly synced, not fighting our codec.
-    effective_offset_ms = offset_ms + job.get("encoderDelayMs", 0.0)
+    # codec startup delay (see pipeline.MP3_ENCODER_DELAY_SAMPLES), and
+    # trimStartSec mirrors the dead-space cut applied to the accompaniment,
+    # so the user's offset_ms=0 is already correctly synced.
+    effective_offset_ms = (offset_ms + job.get("encoderDelayMs", 0.0)
+                           - job.get("trimStartSec", 0.0) * 1000.0)
     midi_writer.write_midi(
         events["notes"], events["pedals"], out,
         vel_min=vel_min, vel_max=vel_max, gamma=gamma,
@@ -208,6 +212,39 @@ def get_piano_stem(job_id: str):
     if not os.path.exists(path):
         raise HTTPException(404, "stem file missing")
     return FileResponse(path, media_type="audio/wav")
+
+
+@app.post("/api/jobs/{job_id}/retrim")
+def retrim_job(job_id: str):
+    """Apply dead-space trimming to a job converted before trim support
+    existed (or re-run it). Re-encodes the accompaniment from the kept
+    no_piano stem — no separation/transcription re-run needed."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job["status"] != "done":
+        raise HTTPException(409, "job not finished")
+    job_dir = _job_dir(job_id)
+    piano_stem = job.get("pianoStem")
+    if not piano_stem:
+        raise HTTPException(409, "stems missing")
+    no_piano = os.path.join(
+        job_dir, os.path.dirname(piano_stem), "no_piano.wav")
+    input_path = os.path.join(job_dir, "input.mp3")
+    if not os.path.exists(no_piano) or not os.path.exists(input_path):
+        raise HTTPException(409, "source files missing; re-convert instead")
+
+    trim_start, trim_end = pipeline.detect_dead_space(input_path)
+    accompaniment, encoder_delay_ms = pipeline.encode_accompaniment(
+        no_piano, job_dir, lambda stage, pct: None,
+        trim_start=trim_start, trim_end=trim_end)
+    with jobs_lock:
+        job["accompaniment"] = os.path.relpath(accompaniment, job_dir)
+        job["encoderDelayMs"] = encoder_delay_ms
+        job["trimStartSec"] = trim_start
+        job["trimEndSec"] = trim_end
+        _persist(job_id)
+    return job
 
 
 @app.get("/api/jobs/{job_id}/audio/accompaniment")

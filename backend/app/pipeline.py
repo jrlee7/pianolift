@@ -105,9 +105,39 @@ def _parse_percent(line):
         return None
 
 
-def encode_accompaniment(no_piano_wav, job_dir, progress_cb):
+def detect_dead_space(audio_path):
+    """Find leading/trailing silence in the original mix.
+
+    Returns (trim_start_sec, trim_end_sec) in the original timeline, with a
+    0.2s pre-roll before the first sound and a 0.5s tail after the last so
+    attacks and reverb decays aren't clipped.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    data, sr = sf.read(audio_path)
+    mono = data.mean(axis=1) if data.ndim > 1 else data
+    total = len(mono) / float(sr)
+    peak = float(np.max(np.abs(mono)))
+    if peak <= 0:
+        return 0.0, total
+    # ~-34 dB below the track's own peak counts as "sound"
+    loud = np.where(np.abs(mono) > peak * 0.02)[0]
+    if len(loud) == 0:
+        return 0.0, total
+    start = max(0.0, loud[0] / float(sr) - 0.2)
+    end = min(total, loud[-1] / float(sr) + 0.5)
+    return round(start, 3), round(end, 3)
+
+
+def encode_accompaniment(no_piano_wav, job_dir, progress_cb,
+                         trim_start=0.0, trim_end=None):
     """Encode the piano-less stem to MP3 — this is what plays through the
-    ENSPIRE speakers while the piano itself plays the MIDI."""
+    ENSPIRE speakers while the piano itself plays the MIDI.
+
+    trim_start/trim_end cut dead space; the MIDI render applies the same
+    trim_start shift so the two stay locked.
+    """
     import lameenc
     import numpy as np
     import soundfile as sf
@@ -116,6 +146,9 @@ def encode_accompaniment(no_piano_wav, job_dir, progress_cb):
     data, sr = sf.read(no_piano_wav, dtype="int16")
     if data.ndim == 1:
         data = np.column_stack([data, data])
+    lo = int(trim_start * sr)
+    hi = len(data) if trim_end is None else min(len(data), int(trim_end * sr))
+    data = data[lo:hi]
     encoder = lameenc.Encoder()
     encoder.set_bit_rate(320)
     encoder.set_in_sample_rate(sr)
@@ -178,8 +211,11 @@ def run_job(job_dir, mp3_path, progress_cb):
     no_piano_wav = os.path.join(os.path.dirname(piano_wav), "no_piano.wav")
     if not os.path.exists(no_piano_wav):
         raise RuntimeError("Demucs finished but no_piano stem not found")
+
+    trim_start, trim_end = detect_dead_space(mp3_path)
     accompaniment, encoder_delay_ms = encode_accompaniment(
-        no_piano_wav, job_dir, progress_cb)
+        no_piano_wav, job_dir, progress_cb,
+        trim_start=trim_start, trim_end=trim_end)
 
     notes, pedals = transcribe(piano_wav, progress_cb)
 
@@ -187,16 +223,19 @@ def run_job(job_dir, mp3_path, progress_cb):
     with open(os.path.join(job_dir, "events.json"), "w") as f:
         json.dump(events, f)
 
-    # Bake in the encoder-delay compensation so a "0 ms" timing offset is
-    # already correctly synced; the user's slider is then pure room/feel
-    # adjustment on top of a correct baseline, not a fight against our codec.
+    # Bake in encoder-delay compensation and the dead-space trim so a "0 ms"
+    # timing offset is already correctly synced against the trimmed
+    # accompaniment; the user's slider is then pure room/feel adjustment.
     midi_path = os.path.join(job_dir, "output.mid")
-    midi_writer.write_midi(notes, pedals, midi_path, offset_ms=encoder_delay_ms)
+    baked_offset_ms = encoder_delay_ms - trim_start * 1000.0
+    midi_writer.write_midi(notes, pedals, midi_path, offset_ms=baked_offset_ms)
 
     return {
         "pianoStem": piano_wav,
         "accompaniment": accompaniment,
         "encoderDelayMs": encoder_delay_ms,
+        "trimStartSec": trim_start,
+        "trimEndSec": trim_end,
         "noteCount": len(notes),
         "pedalCount": len(pedals),
     }
