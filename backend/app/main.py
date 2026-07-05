@@ -95,6 +95,7 @@ def _process(job_id):
             job["pianoStem"] = os.path.relpath(result["pianoStem"], job_dir)
             job["accompaniment"] = os.path.relpath(
                 result["accompaniment"], job_dir)
+            job["encoderDelayMs"] = result["encoderDelayMs"]
             _persist(job_id)
     except Exception as e:  # surface any pipeline failure to the UI
         with jobs_lock:
@@ -177,10 +178,14 @@ def get_midi(job_id: str, vel_min: int = 20, vel_max: int = 112,
     with open(events_path) as f:
         events = json.load(f)
     out = os.path.join(_job_dir(job_id), "render.mid")
+    # job["encoderDelayMs"] compensates for the accompaniment MP3's fixed
+    # codec startup delay (see pipeline.MP3_ENCODER_DELAY_SAMPLES) so the
+    # user's offset_ms=0 is already correctly synced, not fighting our codec.
+    effective_offset_ms = offset_ms + job.get("encoderDelayMs", 0.0)
     midi_writer.write_midi(
         events["notes"], events["pedals"], out,
         vel_min=vel_min, vel_max=vel_max, gamma=gamma,
-        offset_ms=offset_ms, include_pedal=pedal)
+        offset_ms=effective_offset_ms, include_pedal=pedal)
     return FileResponse(
         out, media_type="audio/midi",
         filename=job["name"] + ".mid")

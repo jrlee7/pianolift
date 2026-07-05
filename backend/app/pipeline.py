@@ -15,6 +15,15 @@ from . import midi_writer
 
 DEMUCS_MODEL = "htdemucs_6s"  # 6-stem model with a dedicated piano stem
 
+# lameenc has no gapless/LAME-tag support, so decoders (including whatever
+# the ENSPIRE uses) get no metadata to trim the codec's algorithmic startup
+# delay. Measured empirically with a click-impulse test at our exact encode
+# settings (320kbps CBR, quality 2): a click at sample N lands at N+1105..1106
+# after encode+decode, constant across 4 positions in a 4s file -- a fixed
+# property of the codec, not signal-dependent. Without compensation the piano
+# MIDI would play ~25ms ahead of the accompaniment's audible content.
+MP3_ENCODER_DELAY_SAMPLES = 1105
+
 # piano_transcription_inference shells out to wget for this download, which
 # Windows doesn't have — fetch it ourselves.
 CHECKPOINT_URL = ("https://zenodo.org/record/4034264/files/"
@@ -119,7 +128,8 @@ def encode_accompaniment(no_piano_wav, job_dir, progress_cb):
     with open(out, "wb") as f:
         f.write(bytes(mp3_bytes))
     progress_cb("encoding", 100)
-    return out
+    delay_ms = MP3_ENCODER_DELAY_SAMPLES / sr * 1000.0
+    return out, delay_ms
 
 
 def transcribe(piano_wav, progress_cb):
@@ -168,7 +178,8 @@ def run_job(job_dir, mp3_path, progress_cb):
     no_piano_wav = os.path.join(os.path.dirname(piano_wav), "no_piano.wav")
     if not os.path.exists(no_piano_wav):
         raise RuntimeError("Demucs finished but no_piano stem not found")
-    accompaniment = encode_accompaniment(no_piano_wav, job_dir, progress_cb)
+    accompaniment, encoder_delay_ms = encode_accompaniment(
+        no_piano_wav, job_dir, progress_cb)
 
     notes, pedals = transcribe(piano_wav, progress_cb)
 
@@ -176,12 +187,16 @@ def run_job(job_dir, mp3_path, progress_cb):
     with open(os.path.join(job_dir, "events.json"), "w") as f:
         json.dump(events, f)
 
+    # Bake in the encoder-delay compensation so a "0 ms" timing offset is
+    # already correctly synced; the user's slider is then pure room/feel
+    # adjustment on top of a correct baseline, not a fight against our codec.
     midi_path = os.path.join(job_dir, "output.mid")
-    midi_writer.write_midi(notes, pedals, midi_path)
+    midi_writer.write_midi(notes, pedals, midi_path, offset_ms=encoder_delay_ms)
 
     return {
         "pianoStem": piano_wav,
         "accompaniment": accompaniment,
+        "encoderDelayMs": encoder_delay_ms,
         "noteCount": len(notes),
         "pedalCount": len(pedals),
     }
