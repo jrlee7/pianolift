@@ -73,10 +73,17 @@ export default function ResultView({ job, firebaseReady }) {
           <label>Extracted piano stem (what the transcription heard)</label>
           <audio ref={audioRef} controls src={audioUrl(job.id, 'piano')} />
         </div>
-        <div className="player">
-          <label>Original MP3 (plays through ENSPIRE speakers)</label>
-          <audio controls src={audioUrl(job.id, 'original')} />
-        </div>
+        {job.accompaniment ? (
+          <div className="player">
+            <label>Accompaniment, piano removed (plays through ENSPIRE speakers)</label>
+            <audio controls src={audioUrl(job.id, 'accompaniment')} />
+          </div>
+        ) : (
+          <div className="player">
+            <label>Original MP3 (re-convert to get a piano-less accompaniment)</label>
+            <audio controls src={audioUrl(job.id, 'original')} />
+          </div>
+        )}
       </div>
 
       {events
@@ -118,6 +125,12 @@ export default function ResultView({ job, firebaseReady }) {
         <a href={midiUrl(job.id, settings)} download={job.name + '.mid'}>
           <button className="primary">⬇ Download .mid for ENSPIRE</button>
         </a>
+        {job.accompaniment && (
+          <a href={audioUrl(job.id, 'accompaniment')}
+            download={job.name + ' (no piano).mp3'}>
+            <button className="primary">⬇ Download accompaniment .mp3</button>
+          </a>
+        )}
         {firebaseReady && (
           <button className="ghost" onClick={handleSave} disabled={saving}>
             {saving ? 'Saving…' : '☁ Save to library'}
@@ -126,10 +139,11 @@ export default function ResultView({ job, firebaseReady }) {
       </div>
 
       <div className="notice">
-        <strong>Disklavier playback:</strong> copy the .mid and the original .mp3 to a
-        USB stick. On the ENSPIRE, play the MIDI (piano keys move) and start the MP3
-        together — both share the same timeline. Use the timing offset slider if the
-        piano feels early/late, then re-download.
+        <strong>Disklavier playback:</strong> copy the .mid and the accompaniment .mp3
+        (piano removed — vocals and band only) to a USB stick. On the ENSPIRE, play the
+        MIDI (piano keys move) and start the MP3 together — both share the same
+        timeline. Use the timing offset slider if the piano feels early/late, then
+        re-download.
       </div>
     </div>
   )

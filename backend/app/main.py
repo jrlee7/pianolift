@@ -93,6 +93,8 @@ def _process(job_id):
             job["noteCount"] = result["noteCount"]
             job["pedalCount"] = result["pedalCount"]
             job["pianoStem"] = os.path.relpath(result["pianoStem"], job_dir)
+            job["accompaniment"] = os.path.relpath(
+                result["accompaniment"], job_dir)
             _persist(job_id)
     except Exception as e:  # surface any pipeline failure to the UI
         with jobs_lock:
@@ -201,6 +203,19 @@ def get_piano_stem(job_id: str):
     if not os.path.exists(path):
         raise HTTPException(404, "stem file missing")
     return FileResponse(path, media_type="audio/wav")
+
+
+@app.get("/api/jobs/{job_id}/audio/accompaniment")
+def get_accompaniment(job_id: str):
+    job = jobs.get(job_id)
+    if job is None or not job.get("accompaniment"):
+        raise HTTPException(404, "accompaniment not ready")
+    path = os.path.join(_job_dir(job_id), job["accompaniment"])
+    if not os.path.exists(path):
+        raise HTTPException(404, "accompaniment file missing")
+    return FileResponse(
+        path, media_type="audio/mpeg",
+        filename=job["name"] + " (no piano).mp3")
 
 
 @app.get("/api/health")

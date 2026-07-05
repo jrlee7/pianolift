@@ -13,7 +13,10 @@ rest of the band through the ENSPIRE speakers.
    [high-resolution piano transcription](https://github.com/bytedance/piano_transcription)
    converts the piano stem to note events with per-note velocity **and**
    sustain-pedal events.
-3. **MIDI render** — a Type-0 Standard MIDI File is written, zero-aligned to the
+3. **Accompaniment** — the piano-less stem (vocals + band) is encoded to a
+   320 kbps MP3; this is what plays through the ENSPIRE speakers so the real
+   piano isn't doubled by a recorded one.
+4. **MIDI render** — a Type-0 Standard MIDI File is written, zero-aligned to the
    MP3 timeline (second 0 = second 0), so starting both together keeps them in sync.
 
 ## Setup
@@ -49,7 +52,8 @@ velocity/pedal/offset controls, download the `.mid`.
 
 ## Playing on the Disklavier ENSPIRE
 
-1. Copy the downloaded `.mid` **and** the original `.mp3` to a USB stick.
+1. Copy the downloaded `.mid` **and** the accompaniment `.mp3` (piano removed)
+   to a USB stick.
 2. Play the MIDI on the ENSPIRE (keys move) and start the MP3 at the same moment —
    both share the same timeline.
 3. If the piano feels early or late, adjust the **Timing offset** slider and

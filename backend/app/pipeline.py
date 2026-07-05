@@ -96,6 +96,32 @@ def _parse_percent(line):
         return None
 
 
+def encode_accompaniment(no_piano_wav, job_dir, progress_cb):
+    """Encode the piano-less stem to MP3 — this is what plays through the
+    ENSPIRE speakers while the piano itself plays the MIDI."""
+    import lameenc
+    import numpy as np
+    import soundfile as sf
+
+    progress_cb("encoding", 0)
+    data, sr = sf.read(no_piano_wav, dtype="int16")
+    if data.ndim == 1:
+        data = np.column_stack([data, data])
+    encoder = lameenc.Encoder()
+    encoder.set_bit_rate(320)
+    encoder.set_in_sample_rate(sr)
+    encoder.set_channels(2)
+    encoder.set_quality(2)
+    encoder.silence()
+    mp3_bytes = encoder.encode(data.tobytes())
+    mp3_bytes += encoder.flush()
+    out = os.path.join(job_dir, "accompaniment.mp3")
+    with open(out, "wb") as f:
+        f.write(bytes(mp3_bytes))
+    progress_cb("encoding", 100)
+    return out
+
+
 def transcribe(piano_wav, progress_cb):
     """Transcribe piano stem to note + pedal events (with velocities)."""
     # Imported lazily: heavy modules, and the checkpoint download happens
@@ -139,6 +165,11 @@ def run_job(job_dir, mp3_path, progress_cb):
     progress_cb("separating", 0)
     piano_wav = separate_piano(mp3_path, job_dir, progress_cb)
 
+    no_piano_wav = os.path.join(os.path.dirname(piano_wav), "no_piano.wav")
+    if not os.path.exists(no_piano_wav):
+        raise RuntimeError("Demucs finished but no_piano stem not found")
+    accompaniment = encode_accompaniment(no_piano_wav, job_dir, progress_cb)
+
     notes, pedals = transcribe(piano_wav, progress_cb)
 
     events = {"notes": notes, "pedals": pedals}
@@ -150,6 +181,7 @@ def run_job(job_dir, mp3_path, progress_cb):
 
     return {
         "pianoStem": piano_wav,
+        "accompaniment": accompaniment,
         "noteCount": len(notes),
         "pedalCount": len(pedals),
     }
