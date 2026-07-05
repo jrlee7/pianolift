@@ -9,10 +9,29 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 
 from . import midi_writer
 
 DEMUCS_MODEL = "htdemucs_6s"  # 6-stem model with a dedicated piano stem
+
+# piano_transcription_inference shells out to wget for this download, which
+# Windows doesn't have — fetch it ourselves.
+CHECKPOINT_URL = ("https://zenodo.org/record/4034264/files/"
+                  "CRNN_note_F1%3D0.9677_pedal_F1%3D0.9186.pth?download=1")
+CHECKPOINT_PATH = os.path.join(
+    os.path.expanduser("~"), "piano_transcription_inference_data",
+    "note_F1=0.9677_pedal_F1=0.9186.pth")
+
+
+def _ensure_checkpoint(progress_cb):
+    if os.path.exists(CHECKPOINT_PATH):
+        return
+    progress_cb("transcribing", 10)
+    os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
+    tmp = CHECKPOINT_PATH + ".tmp"
+    urllib.request.urlretrieve(CHECKPOINT_URL, tmp)
+    os.replace(tmp, CHECKPOINT_PATH)
 
 
 def _find_stem(demucs_out, track_name, stem):
@@ -33,7 +52,7 @@ def separate_piano(mp3_path, job_dir, progress_cb):
     """Run Demucs, return path to piano stem wav."""
     demucs_out = os.path.join(job_dir, "demucs")
     cmd = [
-        sys.executable, "-m", "demucs",
+        sys.executable, "-m", "demucs.separate",
         "-n", DEMUCS_MODEL,
         "--two-stems", "piano",
         "-o", demucs_out,
@@ -81,13 +100,17 @@ def transcribe(piano_wav, progress_cb):
     """Transcribe piano stem to note + pedal events (with velocities)."""
     # Imported lazily: heavy modules, and the checkpoint download happens
     # on first construction.
-    from piano_transcription_inference import (
-        PianoTranscription, sample_rate, load_audio)
+    from piano_transcription_inference import PianoTranscription, sample_rate
+    import librosa
 
     progress_cb("transcribing", 5)
-    audio, _ = load_audio(piano_wav, sr=sample_rate, mono=True)
+    _ensure_checkpoint(progress_cb)
+    # The package's own load_audio needs an audioread backend (ffmpeg),
+    # which Windows lacks; the stem is a plain wav so soundfile handles it.
+    audio, _ = librosa.load(piano_wav, sr=sample_rate, mono=True)
     progress_cb("transcribing", 15)
-    transcriptor = PianoTranscription(device="cpu")
+    transcriptor = PianoTranscription(
+        device="cpu", checkpoint_path=CHECKPOINT_PATH)
     progress_cb("transcribing", 25)
     result = transcriptor.transcribe(audio, None)
     progress_cb("transcribing", 100)

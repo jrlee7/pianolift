@@ -70,6 +70,16 @@ Piano-forward mixes (piano + vocals) transcribe well. Dense mixes leak other
 instruments into the piano stem and produce ghost notes — expect to audition the
 extracted stem (playable in the result view) to judge before trusting the MIDI.
 
+## Troubleshooting
+
+- **`No module named demucs.separate`** — broken demucs install; run
+  `pip install --force-reinstall --no-deps --no-cache-dir --no-binary demucs demucs==4.0.1`
+  (same trick with `dora-search` if `dora.explore` is missing).
+- **`TorchCodec is required`** — torchaudio too new; this project pins
+  torch/torchaudio 2.6.0 (see requirements.txt).
+- **Transcription checkpoint** (~165 MB) auto-downloads to
+  `~/piano_transcription_inference_data/` on first run.
+
 ## Firebase library (optional)
 
 Converted MIDI files (small) can be saved to Firestore for access from any device.

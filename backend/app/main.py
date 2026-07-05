@@ -98,7 +98,7 @@ def _process(job_id):
         with jobs_lock:
             job = jobs[job_id]
             job["status"] = "error"
-            job["error"] = str(e)
+            job["error"] = str(e) or repr(e)
             _persist(job_id)
 
 
