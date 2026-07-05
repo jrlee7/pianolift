@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Personal single-family app: anyone holding the web config can
+    // read/write the song library. Do not store anything sensitive here.
+    match /songs/{songId} {
+      allow read, write: if true;
+    }
+  }
+}
