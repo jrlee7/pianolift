@@ -22,6 +22,18 @@ export default function JobCard({ job, open, onToggle, onDeleted }) {
     }
   }
 
+  async function handleCancel(e) {
+    e.stopPropagation()
+    if (!confirm('Cancel queued "' + job.name + '"?')) return
+    try {
+      await deleteJob(job.id)
+      onDeleted()
+    } catch (err) {
+      // Job likely started between render and click; it can't be cancelled now.
+      alert('Could not cancel — it already started processing.')
+    }
+  }
+
   return (
     <div className="card" style={{ cursor: 'pointer' }} onClick={onToggle}>
       <div className="row">
@@ -38,6 +50,9 @@ export default function JobCard({ job, open, onToggle, onDeleted }) {
           )}
           {job.status === 'error' && (
             <span className="status error">✗ {job.error}</span>
+          )}
+          {job.status === 'processing' && job.stage === 'queued' && (
+            <button className="ghost danger" onClick={handleCancel}>Cancel</button>
           )}
           {job.status !== 'processing' && (
             <button className="ghost danger" onClick={handleDelete}>✕</button>

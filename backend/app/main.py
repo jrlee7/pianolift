@@ -37,6 +37,8 @@ app.add_middleware(
 executor = ThreadPoolExecutor(max_workers=1)
 jobs_lock = threading.Lock()
 jobs = {}
+# job_id -> Future, so a still-queued job can be cancelled before it runs.
+futures = {}
 
 
 def _job_dir(job_id):
@@ -107,6 +109,8 @@ def _process(job_id, piano_only=False):
             job["status"] = "error"
             job["error"] = str(e) or repr(e)
             _persist(job_id)
+    finally:
+        futures.pop(job_id, None)
 
 
 @app.post("/api/jobs")
@@ -130,7 +134,7 @@ async def create_job(file: UploadFile = File(...), piano_only: bool = Form(False
     with jobs_lock:
         jobs[job_id] = job
         _persist(job_id)
-    executor.submit(_process, job_id, piano_only)
+    futures[job_id] = executor.submit(_process, job_id, piano_only)
     return job
 
 
@@ -155,9 +159,14 @@ def delete_job(job_id: str):
     if job is None:
         raise HTTPException(404, "job not found")
     if job["status"] == "processing":
-        raise HTTPException(409, "job still processing")
+        fut = futures.get(job_id)
+        # cancel() succeeds only while the job is still queued; once the
+        # worker has picked it up it returns False -> can't interrupt it.
+        if fut is None or not fut.cancel():
+            raise HTTPException(409, "job still processing")
+        futures.pop(job_id, None)
     with jobs_lock:
-        del jobs[job_id]
+        jobs.pop(job_id, None)
     shutil.rmtree(_job_dir(job_id), ignore_errors=True)
     return {"ok": True}
 
