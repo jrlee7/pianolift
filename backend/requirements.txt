@@ -2,14 +2,13 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 # torchaudio >=2.9 drops built-in decoding (requires torchcodec+FFmpeg);
-# pin 2.6 which still ships the soundfile backend demucs relies on.
+# pin 2.6 which still ships the soundfile backend piano_transcription_inference relies on.
 torch==2.6.0
 torchaudio==2.6.0
-# The demucs wheel can install incompletely (only __init__.py); force a
-# source build. If demucs.separate is missing after install, re-run:
-#   pip install --force-reinstall --no-deps --no-cache-dir --no-binary demucs demucs==4.0.1
---no-binary demucs
-demucs==4.0.1
+# CPU-only piano source separation (BS-Roformer-SW, 6-stem). Piano SDR ~7.83
+# vs ~2.23 for Demucs' htdemucs_6s, which bled badly with sustained/harmonic
+# instruments (e.g. cello) into the piano stem.
+audio-separator[cpu]>=0.30
 piano_transcription_inference>=0.0.6
 librosa>=0.10
 mido>=1.3

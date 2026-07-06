@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-electron/
 .venv/
 __pycache__/
 *.pyc
@@ -7,3 +8,6 @@ __pycache__/
 backend/jobs/
 .firebase/
 *.log
+*.exe
+build/
+release/

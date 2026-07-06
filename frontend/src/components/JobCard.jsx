@@ -2,7 +2,7 @@ import { deleteJob } from '../api.js'
 
 const STAGE_LABELS = {
   queued: 'Queued…',
-  separating: 'Extracting piano from mix (Demucs)…',
+  separating: 'Extracting piano from mix (BS-Roformer-SW)…',
   encoding: 'Encoding piano-less accompaniment MP3…',
   transcribing: 'Transcribing notes, dynamics + pedal…',
   done: 'Ready'

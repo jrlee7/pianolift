@@ -7,8 +7,9 @@ rest of the band through the ENSPIRE speakers.
 
 ## How it works
 
-1. **Separation** — [Demucs](https://github.com/facebookresearch/demucs)
-   (`htdemucs_6s`, 6-stem model) isolates the piano from the mix.
+1. **Separation** — [BS-Roformer-SW](https://huggingface.co/lainlives/audio-separator-models)
+   (6-stem model, via [audio-separator](https://github.com/nomadkaraoke/python-audio-separator))
+   isolates the piano from the mix.
 2. **Transcription** — ByteDance's
    [high-resolution piano transcription](https://github.com/bytedance/piano_transcription)
    converts the piano stem to note events with per-note velocity **and**
@@ -18,6 +19,11 @@ rest of the band through the ENSPIRE speakers.
    piano isn't doubled by a recorded one.
 4. **MIDI render** — a Type-0 Standard MIDI File is written, zero-aligned to the
    MP3 timeline (second 0 = second 0), so starting both together keeps them in sync.
+
+If the source is already piano-only (no accompaniment to remove), check
+**"This file is piano-only"** on upload to skip separation entirely — the file
+is transcribed directly, which is much faster and skips the ffmpeg/model
+download on first use.
 
 ## Setup
 
@@ -93,11 +99,10 @@ extracted stem (playable in the result view) to judge before trusting the MIDI.
 
 ## Troubleshooting
 
-- **`No module named demucs.separate`** — broken demucs install; run
-  `pip install --force-reinstall --no-deps --no-cache-dir --no-binary demucs demucs==4.0.1`
-  (same trick with `dora-search` if `dora.explore` is missing).
 - **`TorchCodec is required`** — torchaudio too new; this project pins
   torch/torchaudio 2.6.0 (see requirements.txt).
+- **Separation checkpoint** (~700 MB, `BS-Roformer-SW.ckpt`) auto-downloads
+  via `audio-separator` on first run.
 - **Transcription checkpoint** (~165 MB) auto-downloads to
   `~/piano_transcription_inference_data/` on first run.
 

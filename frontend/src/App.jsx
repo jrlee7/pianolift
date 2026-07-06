@@ -30,10 +30,10 @@ export default function App() {
     return function () { clearInterval(t) }
   }, [refresh])
 
-  async function handleFiles(files) {
+  async function handleFiles(files, pianoOnly) {
     for (let i = 0; i < files.length; i++) {
       try {
-        await uploadMp3(files[i])
+        await uploadMp3(files[i], pianoOnly)
       } catch (e) {
         alert('Upload failed: ' + e.message)
       }

@@ -3,6 +3,7 @@ import { useRef, useState } from 'react'
 export default function UploadZone({ onFiles }) {
   const inputRef = useRef(null)
   const [drag, setDrag] = useState(false)
+  const [pianoOnly, setPianoOnly] = useState(false)
 
   function pick(fileList) {
     const files = []
@@ -14,34 +15,43 @@ export default function UploadZone({ onFiles }) {
       alert('Drop an audio file (mp3, wav, m4a, flac, ogg)')
       return
     }
-    onFiles(files)
+    onFiles(files, pianoOnly)
   }
 
   return (
-    <div
-      className={'dropzone' + (drag ? ' drag' : '')}
-      onClick={function () { inputRef.current.click() }}
-      onDragOver={function (e) { e.preventDefault(); setDrag(true) }}
-      onDragLeave={function () { setDrag(false) }}
-      onDrop={function (e) {
-        e.preventDefault()
-        setDrag(false)
-        pick(e.dataTransfer.files)
-      }}
-    >
-      <div className="big">Drop an MP3 here</div>
-      <div>or click to browse — piano extraction takes a few minutes per song</div>
-      <input
-        ref={inputRef}
-        type="file"
-        accept=".mp3,.wav,.m4a,.flac,.ogg,audio/*"
-        multiple
-        hidden
-        onChange={function (e) {
-          pick(e.target.files)
-          e.target.value = ''
+    <div>
+      <div
+        className={'dropzone' + (drag ? ' drag' : '')}
+        onClick={function () { inputRef.current.click() }}
+        onDragOver={function (e) { e.preventDefault(); setDrag(true) }}
+        onDragLeave={function () { setDrag(false) }}
+        onDrop={function (e) {
+          e.preventDefault()
+          setDrag(false)
+          pick(e.dataTransfer.files)
         }}
-      />
+      >
+        <div className="big">Drop an MP3 here</div>
+        <div>or click to browse — piano extraction takes a few minutes per song</div>
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".mp3,.wav,.m4a,.flac,.ogg,audio/*"
+          multiple
+          hidden
+          onChange={function (e) {
+            pick(e.target.files)
+            e.target.value = ''
+          }}
+        />
+      </div>
+      <div className="check" style={{ marginTop: 8 }}>
+        <input id="pianoOnly" type="checkbox" checked={pianoOnly}
+          onChange={function (e) { setPianoOnly(e.target.checked) }} />
+        <label htmlFor="pianoOnly" style={{ margin: 0 }}>
+          This file is piano-only — skip separation (much faster)
+        </label>
+      </div>
     </div>
   )
 }

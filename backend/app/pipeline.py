@@ -1,5 +1,6 @@
-"""Processing pipeline: MP3 -> piano stem (Demucs) -> note/pedal events
-(ByteDance high-resolution piano transcription) -> events.json + default MIDI.
+"""Processing pipeline: MP3 -> piano stem (BS-Roformer-SW) -> note/pedal
+events (ByteDance high-resolution piano transcription) -> events.json +
+default MIDI.
 
 Runs on CPU. Each stage reports progress through a callback so the API can
 expose it to the frontend.
@@ -7,13 +8,16 @@ expose it to the frontend.
 
 import json
 import os
-import subprocess
-import sys
 import urllib.request
+import zipfile
 
 from . import midi_writer
 
-DEMUCS_MODEL = "htdemucs_6s"  # 6-stem model with a dedicated piano stem
+# 6-stem model (vocals/drums/bass/guitar/piano/other). Piano SDR ~7.83 vs
+# ~2.23 for Demucs' htdemucs_6s -- Demucs' piano stem bleeds badly with
+# other sustained/harmonic instruments (e.g. cello), which is exactly the
+# failure mode this replaced.
+SEPARATION_MODEL = "BS-Roformer-SW.ckpt"
 
 # lameenc has no gapless/LAME-tag support, so decoders (including whatever
 # the ENSPIRE uses) get no metadata to trim the codec's algorithmic startup
@@ -43,66 +47,67 @@ def _ensure_checkpoint(progress_cb):
     os.replace(tmp, CHECKPOINT_PATH)
 
 
-def _find_stem(demucs_out, track_name, stem):
-    path = os.path.join(demucs_out, DEMUCS_MODEL, track_name, stem + ".wav")
-    if os.path.exists(path):
-        return path
-    # Demucs sanitizes some characters; fall back to scanning.
-    model_dir = os.path.join(demucs_out, DEMUCS_MODEL)
-    if os.path.isdir(model_dir):
-        for d in os.listdir(model_dir):
-            candidate = os.path.join(model_dir, d, stem + ".wav")
-            if os.path.exists(candidate):
-                return candidate
-    return None
+# audio-separator hard-requires ffmpeg on PATH (pydub uses it internally for
+# I/O) and raises at construction time if it's missing. Windows has no
+# system ffmpeg by default, so fetch a static build ourselves, same as the
+# transcription checkpoint above.
+FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+FFMPEG_DIR = os.path.join(os.path.expanduser("~"), "pianolift_ffmpeg")
+FFMPEG_EXE = os.path.join(FFMPEG_DIR, "ffmpeg.exe")
+
+
+def _ensure_ffmpeg(progress_cb):
+    if not os.path.exists(FFMPEG_EXE):
+        progress_cb("separating", 2)
+        os.makedirs(FFMPEG_DIR, exist_ok=True)
+        zip_path = FFMPEG_EXE + ".zip"
+        urllib.request.urlretrieve(FFMPEG_URL, zip_path)
+        with zipfile.ZipFile(zip_path) as zf:
+            member = next(n for n in zf.namelist() if n.endswith("bin/ffmpeg.exe"))
+            with zf.open(member) as src, open(FFMPEG_EXE, "wb") as dst:
+                dst.write(src.read())
+        os.remove(zip_path)
+    os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ["PATH"]
 
 
 def separate_piano(mp3_path, job_dir, progress_cb):
-    """Run Demucs, return path to piano stem wav."""
-    demucs_out = os.path.join(job_dir, "demucs")
-    cmd = [
-        sys.executable, "-m", "demucs.separate",
-        "-n", DEMUCS_MODEL,
-        "--two-stems", "piano",
-        "-o", demucs_out,
-        mp3_path,
-    ]
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace")
-    log_lines = []
-    for line in proc.stdout:
-        line = line.strip()
-        if line:
-            log_lines.append(line)
-            # Demucs prints tqdm percentages like " 45%|...".
-            pct = _parse_percent(line)
-            if pct is not None:
-                progress_cb("separating", pct)
-    proc.wait()
-    if proc.returncode != 0:
-        tail = "\n".join(log_lines[-15:])
-        raise RuntimeError("Demucs failed (exit %d):\n%s" % (proc.returncode, tail))
+    """Run BS-Roformer-SW, return path to the piano stem wav.
 
-    track_name = os.path.splitext(os.path.basename(mp3_path))[0]
-    stem = _find_stem(demucs_out, track_name, "piano")
-    if stem is None:
-        raise RuntimeError("Demucs finished but piano stem not found")
-    return stem
+    The model has no Demucs-style "--two-stems" complement, so we also sum
+    the other 5 stems it produces into no_piano.wav -- the accompaniment
+    that plays through the ENSPIRE speakers.
+    """
+    from audio_separator.separator import Separator
+    import soundfile as sf
 
+    progress_cb("separating", 0)
+    _ensure_ffmpeg(progress_cb)
+    sep_out = os.path.join(job_dir, "separated")
+    model_dir = os.path.join(os.path.expanduser("~"), "audio_separator_models")
+    separator = Separator(output_dir=sep_out, output_format="WAV", model_file_dir=model_dir)
+    progress_cb("separating", 5)  # first run downloads a ~700MB checkpoint
+    separator.load_model(model_filename=SEPARATION_MODEL)
+    # separate() returns bare filenames, not joined with output_dir.
+    output_files = [os.path.join(sep_out, f) for f in separator.separate(mp3_path)]
+    progress_cb("separating", 100)
 
-def _parse_percent(line):
-    idx = line.find("%|")
-    if idx <= 0:
-        return None
-    head = line[:idx].split()
-    if not head:
-        return None
-    token = head[-1]
-    try:
-        return int(float(token))
-    except ValueError:
-        return None
+    piano_wav = next(
+        (f for f in output_files if "piano" in os.path.basename(f).lower()), None)
+    if piano_wav is None:
+        raise RuntimeError("Separator finished but piano stem not found")
+
+    accompaniment_stems = [f for f in output_files if f != piano_wav]
+    if not accompaniment_stems:
+        raise RuntimeError("Separator finished but no accompaniment stems found")
+    mix = None
+    sr = None
+    for f in accompaniment_stems:
+        data, sr = sf.read(f, dtype="float32")
+        mix = data if mix is None else mix + data
+    no_piano_wav = os.path.join(os.path.dirname(piano_wav), "no_piano.wav")
+    sf.write(no_piano_wav, mix, sr)
+
+    return piano_wav
 
 
 def detect_dead_space(audio_path):
@@ -203,19 +208,37 @@ def transcribe(piano_wav, progress_cb):
     return notes, pedals
 
 
-def run_job(job_dir, mp3_path, progress_cb):
-    """Full pipeline. Writes events.json and output.mid into job_dir."""
+def _decode_piano_only(mp3_path, job_dir, progress_cb):
+    """Skip separation entirely -- the input is already just piano. Decode
+    straight to wav for the transcriber; no accompaniment to encode."""
+    import soundfile as sf
+
     progress_cb("separating", 0)
-    piano_wav = separate_piano(mp3_path, job_dir, progress_cb)
+    data, sr = sf.read(mp3_path)
+    out = os.path.join(job_dir, "piano.wav")
+    sf.write(out, data, sr)
+    progress_cb("separating", 100)
+    return out
 
-    no_piano_wav = os.path.join(os.path.dirname(piano_wav), "no_piano.wav")
-    if not os.path.exists(no_piano_wav):
-        raise RuntimeError("Demucs finished but no_piano stem not found")
 
-    trim_start, trim_end = detect_dead_space(mp3_path)
-    accompaniment, encoder_delay_ms = encode_accompaniment(
-        no_piano_wav, job_dir, progress_cb,
-        trim_start=trim_start, trim_end=trim_end)
+def run_job(job_dir, mp3_path, progress_cb, piano_only=False):
+    """Full pipeline. Writes events.json and output.mid into job_dir."""
+    if piano_only:
+        piano_wav = _decode_piano_only(mp3_path, job_dir, progress_cb)
+        accompaniment, encoder_delay_ms = None, 0.0
+        trim_start, trim_end = 0.0, None
+    else:
+        progress_cb("separating", 0)
+        piano_wav = separate_piano(mp3_path, job_dir, progress_cb)
+
+        no_piano_wav = os.path.join(os.path.dirname(piano_wav), "no_piano.wav")
+        if not os.path.exists(no_piano_wav):
+            raise RuntimeError("Separator finished but no_piano stem not found")
+
+        trim_start, trim_end = detect_dead_space(mp3_path)
+        accompaniment, encoder_delay_ms = encode_accompaniment(
+            no_piano_wav, job_dir, progress_cb,
+            trim_start=trim_start, trim_end=trim_end)
 
     notes, pedals = transcribe(piano_wav, progress_cb)
 

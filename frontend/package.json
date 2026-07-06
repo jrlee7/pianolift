@@ -1,12 +1,16 @@
 {
-  "name": "pianolift-frontend",
+  "name": "pianolift",
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "main": "main.js",
+  "homepage": "./",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "electron-dev": "vite build && electron .",
+    "electron-build": "vite build && electron-builder"
   },
   "dependencies": {
     "firebase": "^11.10.0",
@@ -15,6 +19,37 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^43.0.0",
+    "electron-builder": "^26.15.3",
+    "electron-is-dev": "^3.0.1",
     "vite": "^6.3.5"
+  },
+  "build": {
+    "appId": "com.pianolift.app",
+    "productName": "PianoLift",
+    "files": [
+      "dist/**/*",
+      "main.js",
+      "preload.js",
+      "../backend.exe"
+    ],
+    "directories": {
+      "buildResources": "assets"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
   }
 }
