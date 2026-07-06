@@ -47,6 +47,17 @@ export function audioUrl(id, which) {
   return BASE + '/jobs/' + id + '/audio/' + which
 }
 
+export function hfeUrl(id, settings) {
+  const params = new URLSearchParams({
+    vel_min: String(settings.velMin),
+    vel_max: String(settings.velMax),
+    gamma: String(settings.gamma),
+    offset_ms: String(settings.offsetMs),
+    pedal: settings.pedal ? 'true' : 'false'
+  })
+  return BASE + '/jobs/' + id + '/hfe?' + params.toString()
+}
+
 export function eseqUrl(id, settings) {
   const params = new URLSearchParams({
     vel_min: String(settings.velMin),

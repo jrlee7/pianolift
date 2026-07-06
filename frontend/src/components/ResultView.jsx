@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import PianoRoll from './PianoRoll.jsx'
-import { getEvents, midiUrl, audioUrl, eseqUrl, fetchMidiBase64 } from '../api.js'
+import { getEvents, midiUrl, audioUrl, eseqUrl, hfeUrl, fetchMidiBase64 } from '../api.js'
 import { saveSong } from '../firebase.js'
 import { createPreviewPlayer } from '../previewSynth.js'
 
@@ -248,6 +248,9 @@ export default function ResultView({ job, firebaseReady }) {
         )}
         <a href={eseqUrl(job.id, settings)}>
           <button className="ghost">⬇ E-SEQ .FIL (floppy Disklavier)</button>
+        </a>
+        <a href={hfeUrl(job.id, settings)}>
+          <button className="ghost">⬇ Gotek floppy image (.hfe)</button>
         </a>
         {firebaseReady && (
           <button className="ghost" onClick={handleSave} disabled={saving}>

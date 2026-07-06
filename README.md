@@ -66,10 +66,15 @@ for pre-SMF Disklaviers (e.g. 1995 Mark II units). Format reverse-engineered
 from real PianoSoft releases; timing runs on the measured 748.8 units/sec
 Yamaha clock (see `backend/app/eseq_writer.py` for the full byte-level spec).
 
-To play on a floppy Disklavier: copy the `.FIL` to a 720KB DD floppy (or
-Gotek/Nalbantov USB emulator image) along with a `PIANODIR.FIL` index — tools
-like E-SEQ Explorer or APS MIDI Prep can build the index, or ask PianoLift's
-author to add disk-image output.
+Easiest playback path: **⬇ Gotek floppy image (.hfe)** — a complete,
+ready-to-play virtual floppy (FAT12 + `PIANODIR.FIL` index + the song,
+MFM-encoded HxC image). Copy it to the Gotek/Nalbantov USB stick as
+`DSKAxxxx.hfe` (pick a free slot number), select that slot on the emulator,
+press play on the piano. Formats cloned from a working PianoSoft disk;
+see `backend/app/disk_writer.py` for the PIANODIR byte spec.
+
+The raw `.FIL` download remains for users who build disks with their own
+tools (E-SEQ Explorer, APS MIDI Prep).
 
 ## Controls
 

@@ -19,7 +19,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import pipeline, midi_writer, eseq_writer
+from . import pipeline, midi_writer, eseq_writer, disk_writer
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
@@ -238,6 +238,40 @@ def get_eseq(job_id: str, vel_min: int = 20, vel_max: int = 112,
     return FileResponse(
         out, media_type="application/octet-stream",
         filename=eseq_writer._sanitize_83(job["name"]).strip() + ".FIL")
+
+
+@app.get("/api/jobs/{job_id}/hfe")
+def get_hfe(job_id: str, vel_min: int = 20, vel_max: int = 112,
+            gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True):
+    """Complete Gotek/Nalbantov floppy image (.hfe): FAT12 disk holding
+    PIANODIR.FIL + the E-SEQ song, MFM-encoded. Drop on the emulator USB
+    stick as DSKAxxxx.hfe and play."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    events_path = os.path.join(_job_dir(job_id), "events.json")
+    if not os.path.exists(events_path):
+        raise HTTPException(404, "events not ready")
+    with open(events_path) as f:
+        events = json.load(f)
+    effective_offset_ms = (offset_ms + job.get("encoderDelayMs", 0.0)
+                           - job.get("trimStartSec", 0.0) * 1000.0)
+    fil_path = os.path.join(_job_dir(job_id), "render.fil")
+    eseq_writer.write_eseq(
+        events["notes"], events["pedals"], fil_path, title=job["name"],
+        vel_min=vel_min, vel_max=vel_max, gamma=gamma,
+        offset_ms=effective_offset_ms, include_pedal=pedal,
+        dos_name=job["name"])
+    with open(fil_path, "rb") as f:
+        fil_bytes = f.read()
+    dos_base = eseq_writer._sanitize_83(job["name"])
+    hfe = disk_writer.build_disk_hfe(fil_bytes, dos_base)
+    out = os.path.join(_job_dir(job_id), "render.hfe")
+    with open(out, "wb") as f:
+        f.write(hfe)
+    return FileResponse(
+        out, media_type="application/octet-stream",
+        filename=dos_base.strip() + ".hfe")
 
 
 @app.post("/api/jobs/{job_id}/retrim")
