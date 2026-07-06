@@ -59,6 +59,18 @@ velocity/pedal/offset controls, download the `.mid`.
 3. If the piano feels early or late, adjust the **Timing offset** slider and
    re-download.
 
+## E-SEQ output (floppy-era Disklaviers)
+
+Alongside MIDI, each conversion can be downloaded as a Yamaha **E-SEQ `.FIL`**
+for pre-SMF Disklaviers (e.g. 1995 Mark II units). Format reverse-engineered
+from real PianoSoft releases; timing runs on the measured 748.8 units/sec
+Yamaha clock (see `backend/app/eseq_writer.py` for the full byte-level spec).
+
+To play on a floppy Disklavier: copy the `.FIL` to a 720KB DD floppy (or
+Gotek/Nalbantov USB emulator image) along with a `PIANODIR.FIL` index — tools
+like E-SEQ Explorer or APS MIDI Prep can build the index, or ask PianoLift's
+author to add disk-image output.
+
 ## Controls
 
 | Control | Effect |

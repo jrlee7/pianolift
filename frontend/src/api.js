@@ -47,6 +47,17 @@ export function audioUrl(id, which) {
   return BASE + '/jobs/' + id + '/audio/' + which
 }
 
+export function eseqUrl(id, settings) {
+  const params = new URLSearchParams({
+    vel_min: String(settings.velMin),
+    vel_max: String(settings.velMax),
+    gamma: String(settings.gamma),
+    offset_ms: String(settings.offsetMs),
+    pedal: settings.pedal ? 'true' : 'false'
+  })
+  return BASE + '/jobs/' + id + '/eseq?' + params.toString()
+}
+
 export async function fetchMidiBase64(id, settings) {
   const res = await fetch(midiUrl(id, settings))
   if (!res.ok) throw new Error('MIDI render failed')
