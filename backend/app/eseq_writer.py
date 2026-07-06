@@ -60,17 +60,19 @@ def _sanitize_83(name):
 
 
 def _preamble():
-    """Time-0 device setup: GM reset, grand piano on channel 0, pedal up."""
-    out = bytearray()
-    out += bytes([0xF1, 0x00])
-    out += bytes([0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7])  # GM system on
-    out += bytes([0xB0, 0x00, 0x00])   # bank MSB 0
-    out += bytes([0xB0, 0x20, 0x00])   # bank LSB 0
-    out += bytes([0xC0, 0x00])         # acoustic grand
-    out += bytes([0xB0, 0x07, 0x7F])   # channel volume
-    out += bytes([0xB0, 0x0A, 0x40])   # pan center
-    out += bytes([0xB0, 0x40, 0x00])   # sustain up
-    return out
+    """Time-0 device setup.
+
+    Minimal, matching real PianoSoft E-SEQ files: F1 00 then a program-change
+    to acoustic grand, and nothing else. This is exactly how real disks that
+    play on the 1995 Disklavier start (verified across 400+ PianoSoft songs).
+
+    An earlier fuller preamble here -- a universal GM-System-On SysEx
+    (F0 7E 7F 09 01 F7) plus bank-select/volume/pan CCs -- is what made our
+    disks fail to play: only ~4% of real files use any SysEx at all, and the
+    old Disklavier rejects the universal GM SysEx and the extra CCs. Note
+    dynamics come from per-note velocities, so dropping volume/pan is safe.
+    """
+    return bytes([0xF1, 0x00, 0xC0, 0x00])
 
 
 def write_eseq(notes, pedals, out_path, title="",
