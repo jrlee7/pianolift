@@ -1,8 +1,9 @@
 const BASE = '/api'
 
-export async function uploadMp3(file) {
+export async function uploadMp3(file, pianoOnly) {
   const form = new FormData()
   form.append('file', file)
+  form.append('piano_only', pianoOnly ? 'true' : 'false')
   const res = await fetch(BASE + '/jobs', { method: 'POST', body: form })
   if (!res.ok) throw new Error('Upload failed (' + res.status + ')')
   return res.json()
@@ -56,6 +57,28 @@ export function hfeUrl(id, settings) {
     pedal: settings.pedal ? 'true' : 'false'
   })
   return BASE + '/jobs/' + id + '/hfe?' + params.toString()
+}
+
+export async function getUsbStatus() {
+  const res = await fetch(BASE + '/usb')
+  if (!res.ok) throw new Error('USB status failed')
+  return res.json()
+}
+
+export async function saveToUsb(id, settings) {
+  const params = new URLSearchParams({
+    vel_min: String(settings.velMin),
+    vel_max: String(settings.velMax),
+    gamma: String(settings.gamma),
+    offset_ms: String(settings.offsetMs),
+    pedal: settings.pedal ? 'true' : 'false'
+  })
+  const res = await fetch(BASE + '/jobs/' + id + '/usb?' + params.toString(), {
+    method: 'POST'
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail || 'USB save failed')
+  return data
 }
 
 export function eseqUrl(id, settings) {

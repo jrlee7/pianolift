@@ -2,7 +2,7 @@
 
 Jobs live under backend/jobs/<id>/ :
   input.mp3      uploaded audio
-  demucs/        Demucs output (piano stem)
+  separated/     BS-Roformer-SW output (piano + no_piano stems)
   events.json    transcribed notes + pedals (raw model output)
   output.mid     default-settings MIDI render
   job.json       persisted job metadata/status
@@ -15,11 +15,11 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import pipeline, midi_writer, eseq_writer, disk_writer
+from . import pipeline, midi_writer, eseq_writer, disk_writer, usb
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
@@ -80,11 +80,12 @@ def _progress(job_id):
     return cb
 
 
-def _process(job_id):
+def _process(job_id, piano_only=False):
     job_dir = _job_dir(job_id)
     mp3_path = os.path.join(job_dir, "input.mp3")
     try:
-        result = pipeline.run_job(job_dir, mp3_path, _progress(job_id))
+        result = pipeline.run_job(
+            job_dir, mp3_path, _progress(job_id), piano_only=piano_only)
         with jobs_lock:
             job = jobs[job_id]
             job["status"] = "done"
@@ -93,8 +94,9 @@ def _process(job_id):
             job["noteCount"] = result["noteCount"]
             job["pedalCount"] = result["pedalCount"]
             job["pianoStem"] = os.path.relpath(result["pianoStem"], job_dir)
-            job["accompaniment"] = os.path.relpath(
-                result["accompaniment"], job_dir)
+            job["accompaniment"] = (
+                os.path.relpath(result["accompaniment"], job_dir)
+                if result["accompaniment"] else None)
             job["encoderDelayMs"] = result["encoderDelayMs"]
             job["trimStartSec"] = result["trimStartSec"]
             job["trimEndSec"] = result["trimEndSec"]
@@ -108,7 +110,7 @@ def _process(job_id):
 
 
 @app.post("/api/jobs")
-async def create_job(file: UploadFile = File(...)):
+async def create_job(file: UploadFile = File(...), piano_only: bool = Form(False)):
     name = file.filename or "untitled.mp3"
     job_id = uuid.uuid4().hex[:12]
     job_dir = _job_dir(job_id)
@@ -123,11 +125,12 @@ async def create_job(file: UploadFile = File(...)):
         "stage": "queued",
         "progress": 0,
         "error": None,
+        "pianoOnly": piano_only,
     }
     with jobs_lock:
         jobs[job_id] = job
         _persist(job_id)
-    executor.submit(_process, job_id)
+    executor.submit(_process, job_id, piano_only)
     return job
 
 
@@ -240,12 +243,8 @@ def get_eseq(job_id: str, vel_min: int = 20, vel_max: int = 112,
         filename=eseq_writer._sanitize_83(job["name"]).strip() + ".FIL")
 
 
-@app.get("/api/jobs/{job_id}/hfe")
-def get_hfe(job_id: str, vel_min: int = 20, vel_max: int = 112,
-            gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True):
-    """Complete Gotek/Nalbantov floppy image (.hfe): FAT12 disk holding
-    PIANODIR.FIL + the E-SEQ song, MFM-encoded. Drop on the emulator USB
-    stick as DSKAxxxx.hfe and play."""
+def _render_hfe(job_id, vel_min, vel_max, gamma, offset_ms, pedal):
+    """Build the .hfe disk image for a job; returns (path, dos_base)."""
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "job not found")
@@ -269,9 +268,58 @@ def get_hfe(job_id: str, vel_min: int = 20, vel_max: int = 112,
     out = os.path.join(_job_dir(job_id), "render.hfe")
     with open(out, "wb") as f:
         f.write(hfe)
+    return out, dos_base
+
+
+@app.get("/api/jobs/{job_id}/hfe")
+def get_hfe(job_id: str, vel_min: int = 20, vel_max: int = 112,
+            gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True):
+    """Complete Gotek/Nalbantov floppy image (.hfe): FAT12 disk holding
+    PIANODIR.FIL + the E-SEQ song, MFM-encoded. Drop on the emulator USB
+    stick as DSKAxxxx.hfe and play."""
+    out, dos_base = _render_hfe(job_id, vel_min, vel_max, gamma,
+                                offset_ms, pedal)
     return FileResponse(
         out, media_type="application/octet-stream",
         filename=dos_base.strip() + ".hfe")
+
+
+@app.get("/api/usb")
+def usb_status():
+    """Detect the emulator stick and report the next free slot."""
+    root = usb.find_usb_drive()
+    if root is None:
+        return {"found": False}
+    _used, free = usb.used_and_free(root, scan_from=14, stop_after_free=1)
+    return {
+        "found": True,
+        "drive": root,
+        "nextFreeSlot": free[0] if free else None,
+    }
+
+
+@app.post("/api/jobs/{job_id}/usb")
+def save_job_to_usb(job_id: str, vel_min: int = 20, vel_max: int = 112,
+                    gamma: float = 1.0, offset_ms: int = 0,
+                    pedal: bool = True):
+    """Render the .hfe and write it straight into the first blank slot on
+    the emulator stick. Blankness is verified by decoding each slot's FAT
+    root directory, so existing songs can't be overwritten."""
+    out, _dos_base = _render_hfe(job_id, vel_min, vel_max, gamma,
+                                 offset_ms, pedal)
+    with open(out, "rb") as f:
+        hfe_bytes = f.read()
+    try:
+        root, slot = usb.save_to_next_free(hfe_bytes)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except (RuntimeError, OSError) as e:
+        raise HTTPException(500, str(e))
+    return {
+        "drive": root,
+        "slot": slot,
+        "filename": "DSKA%04d.hfe" % slot,
+    }
 
 
 @app.post("/api/jobs/{job_id}/retrim")
@@ -323,3 +371,8 @@ def get_accompaniment(job_id: str):
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)

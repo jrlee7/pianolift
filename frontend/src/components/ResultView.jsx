@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import PianoRoll from './PianoRoll.jsx'
-import { getEvents, midiUrl, audioUrl, eseqUrl, hfeUrl, fetchMidiBase64 } from '../api.js'
+import {
+  getEvents, midiUrl, audioUrl, eseqUrl, hfeUrl, fetchMidiBase64,
+  getUsbStatus, saveToUsb
+} from '../api.js'
 import { saveSong } from '../firebase.js'
 import { createPreviewPlayer } from '../previewSynth.js'
 
@@ -12,6 +15,9 @@ export default function ResultView({ job, firebaseReady }) {
   const [playhead, setPlayhead] = useState(0)
   const [saving, setSaving] = useState(false)
   const [previewing, setPreviewing] = useState(false)
+  const [usb, setUsb] = useState(null)
+  const [usbSaving, setUsbSaving] = useState(false)
+  const [usbResult, setUsbResult] = useState(null)
   const stemRef = useRef(null)
   const accompRef = useRef(null)
   const playerRef = useRef(null)
@@ -49,6 +55,29 @@ export default function ResultView({ job, firebaseReady }) {
     raf = requestAnimationFrame(tick)
     return function () { cancelAnimationFrame(raf) }
   }, [events, trimStart])
+
+  useEffect(function () {
+    let alive = true
+    getUsbStatus().then(function (s) {
+      if (alive) setUsb(s)
+    }).catch(function () {
+      if (alive) setUsb({ found: false })
+    })
+    return function () { alive = false }
+  }, [job.id])
+
+  async function handleUsbSave() {
+    setUsbSaving(true)
+    setUsbResult(null)
+    try {
+      const r = await saveToUsb(job.id, settings)
+      setUsbResult(r)
+    } catch (e) {
+      alert('USB save failed: ' + e.message)
+    } finally {
+      setUsbSaving(false)
+    }
+  }
 
   function set(key, value) {
     const next = {}
@@ -252,12 +281,28 @@ export default function ResultView({ job, firebaseReady }) {
         <a href={hfeUrl(job.id, settings)}>
           <button className="ghost">⬇ Gotek floppy image (.hfe)</button>
         </a>
+        {usb && usb.found && (
+          <button className="primary" onClick={handleUsbSave} disabled={usbSaving}>
+            {usbSaving
+              ? 'Writing to USB…'
+              : '💾 Save to piano USB (slot ' +
+                (usbResult ? 'saved: ' + usbResult.slot : usb.nextFreeSlot) + ')'}
+          </button>
+        )}
         {firebaseReady && (
           <button className="ghost" onClick={handleSave} disabled={saving}>
             {saving ? 'Saving…' : '☁ Save to library'}
           </button>
         )}
       </div>
+
+      {usbResult && (
+        <div className="notice" style={{ borderColor: 'var(--green)' }}>
+          ✓ Written to <strong>{usbResult.filename}</strong> on {usbResult.drive} —
+          on the piano, select disk <strong>{usbResult.slot}</strong> on the
+          Nalbantov display and press play.
+        </div>
+      )}
 
       <div className="notice">
         <strong>Disklavier playback:</strong> copy the .mid and the accompaniment .mp3
