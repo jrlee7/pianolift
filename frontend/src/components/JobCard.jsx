@@ -2,10 +2,26 @@ import { deleteJob } from '../api.js'
 
 const STAGE_LABELS = {
   queued: 'Queued…',
+  downloading: 'Downloading audio from link…',
   separating: 'Extracting piano from mix (BS-Roformer-SW)…',
   encoding: 'Encoding piano-less accompaniment MP3…',
   transcribing: 'Transcribing notes, dynamics + pedal…',
   done: 'Ready'
+}
+
+// each stage owns a slice of the overall progress bar
+const STAGE_SPAN = {
+  queued: [0, 0],
+  downloading: [0, 15],
+  separating: [15, 50],
+  encoding: [50, 55],
+  transcribing: [55, 100]
+}
+
+function barWidth(stage, progress) {
+  const span = STAGE_SPAN[stage]
+  if (!span) return progress
+  return span[0] + (span[1] - span[0]) * progress / 100
 }
 
 export default function JobCard({ job, open, onToggle, onDeleted }) {
@@ -24,13 +40,13 @@ export default function JobCard({ job, open, onToggle, onDeleted }) {
 
   async function handleCancel(e) {
     e.stopPropagation()
-    if (!confirm('Cancel queued "' + job.name + '"?')) return
+    const verb = job.stage === 'queued' ? 'queued' : 'in-progress'
+    if (!confirm('Cancel ' + verb + ' "' + job.name + '"?')) return
     try {
       await deleteJob(job.id)
       onDeleted()
     } catch (err) {
-      // Job likely started between render and click; it can't be cancelled now.
-      alert('Could not cancel — it already started processing.')
+      alert(err.message)
     }
   }
 
@@ -51,7 +67,7 @@ export default function JobCard({ job, open, onToggle, onDeleted }) {
           {job.status === 'error' && (
             <span className="status error">✗ {job.error}</span>
           )}
-          {job.status === 'processing' && job.stage === 'queued' && (
+          {job.status === 'processing' && (
             <button className="ghost danger" onClick={handleCancel}>Cancel</button>
           )}
           {job.status !== 'processing' && (
@@ -63,11 +79,7 @@ export default function JobCard({ job, open, onToggle, onDeleted }) {
         <div className="progress-track">
           <div
             className="progress-fill"
-            style={{
-              width: (job.stage === 'transcribing'
-                ? 50 + job.progress / 2
-                : job.progress / 2) + '%'
-            }}
+            style={{ width: barWidth(job.stage, job.progress) + '%' }}
           />
         </div>
       )}
