@@ -11,7 +11,9 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        // VITE_API_PORT lets a second dev instance pair with a backend on
+        // a non-default port (parallel sessions); default stays 8000
+        target: 'http://localhost:' + (process.env.VITE_API_PORT || '8000'),
         changeOrigin: true
       }
     }

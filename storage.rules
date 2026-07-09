@@ -1,0 +1,11 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Personal single-family app: anyone holding the web config can read/write
+    // the source MP3s that back the song library. Do not store anything
+    // sensitive here. Mirrors the open posture of firestore.rules.
+    match /songs/{songId}/{fileName} {
+      allow read, write: if true;
+    }
+  }
+}

@@ -8,6 +8,7 @@ Jobs live under backend/jobs/<id>/ :
   job.json       persisted job metadata/status
 """
 
+import base64
 import json
 import multiprocessing
 import os
@@ -17,6 +18,7 @@ import shutil
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -243,6 +245,58 @@ def create_job_from_url(payload: dict = Body(...)):
     return job
 
 
+@app.post("/api/jobs/from-library")
+def create_job_from_midi(payload: dict = Body(...)):
+    """Re-open a library song in the editor. Library songs are stored only as
+    baked MIDI, so decode it back into editable note/pedal events and register
+    a finished, MIDI-only job (no accompaniment — that was dropped at archive
+    time). The result opens straight in the piano-roll editor."""
+    name = _safe_name(payload.get("name") or "Library song")
+    try:
+        raw = base64.b64decode(payload.get("midiBase64") or "", validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "invalid midiBase64")
+    if not raw:
+        raise HTTPException(400, "empty MIDI payload")
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = _job_dir(job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    mid_path = os.path.join(job_dir, "input.mid")
+    with open(mid_path, "wb") as f:
+        f.write(raw)
+    try:
+        notes, pedals = midi_writer.read_midi(mid_path)
+    except Exception as e:  # malformed MIDI -> clean up, report
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, "could not parse MIDI: " + str(e))
+
+    with open(os.path.join(job_dir, "events.json"), "w") as f:
+        json.dump({"notes": notes, "pedals": pedals}, f)
+
+    job = {
+        "id": job_id,
+        "name": name,
+        "status": "done",
+        "stage": "done",
+        "progress": 100,
+        "error": None,
+        "pianoOnly": True,
+        "noteCount": len(notes),
+        "pedalCount": len(pedals),
+        "pianoStem": None,
+        "accompaniment": None,
+        "encoderDelayMs": 0.0,
+        "trimStartSec": 0.0,
+        "trimEndSec": None,
+        "fromLibrary": True,
+    }
+    with jobs_lock:
+        jobs[job_id] = job
+        _persist(job_id)
+    return job
+
+
 @app.get("/api/jobs")
 def list_jobs():
     with jobs_lock:
@@ -372,14 +426,28 @@ def save_events(job_id: str, payload: dict = Body(...)):
 
 @app.post("/api/jobs/{job_id}/events/reset")
 def reset_events(job_id: str):
-    """Throw away all edits and restore the original transcription."""
+    """Throw away all edits and restore the original transcription. If the song
+    was destructively trimmed, also restore the full-length piano stem and
+    accompaniment from the pristine backups."""
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "job not found")
-    original_path = os.path.join(_job_dir(job_id), "events_original.json")
+    job_dir = _job_dir(job_id)
+    original_path = os.path.join(job_dir, "events_original.json")
     if not os.path.exists(original_path):
         raise HTTPException(409, "no saved edits to reset")
-    events_path = os.path.join(_job_dir(job_id), "events.json")
+
+    # Destructively trimmed: rebuild the full (0..end) window from the backups,
+    # which restores events, stem and accompaniment together.
+    if job.get("pianoStemOrig"):
+        _regen_from_originals(job, job_dir, 0.0, None)
+        with jobs_lock:
+            job["edited"] = False
+            _persist(job_id)
+        with open(os.path.join(job_dir, "events.json")) as f:
+            return json.load(f)
+
+    events_path = os.path.join(job_dir, "events.json")
     shutil.copyfile(original_path, events_path)
     with open(events_path) as f:
         events = json.load(f)
@@ -391,9 +459,22 @@ def reset_events(job_id: str):
     return events
 
 
+def _trim_tail(job, events):
+    """Drop notes/pedals that start after the song's trim-end so every export
+    ends where the (identically trimmed) accompaniment MP3 ends. The front cut
+    is handled by the trimStartSec shift baked into the offset below."""
+    trim_end = job.get("trimEndSec")
+    if trim_end is None:
+        return events["notes"], events["pedals"]
+    notes = [n for n in events["notes"] if n["onset"] < trim_end]
+    pedals = [p for p in events["pedals"] if p["onset"] < trim_end]
+    return notes, pedals
+
+
 @app.get("/api/jobs/{job_id}/midi")
 def get_midi(job_id: str, vel_min: int = 20, vel_max: int = 112,
-             gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True):
+             gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True,
+             release_ms: int = 0, cap_sustain: bool = True):
     """Render MIDI with the given settings from stored events (no re-ML)."""
     job = jobs.get(job_id)
     if job is None:
@@ -403,6 +484,7 @@ def get_midi(job_id: str, vel_min: int = 20, vel_max: int = 112,
         raise HTTPException(404, "events not ready")
     with open(events_path) as f:
         events = json.load(f)
+    notes, pedals = _trim_tail(job, events)
     out = os.path.join(_job_dir(job_id), "render.mid")
     # job["encoderDelayMs"] compensates for the accompaniment MP3's fixed
     # codec startup delay (see pipeline.MP3_ENCODER_DELAY_SAMPLES), and
@@ -411,9 +493,10 @@ def get_midi(job_id: str, vel_min: int = 20, vel_max: int = 112,
     effective_offset_ms = (offset_ms + job.get("encoderDelayMs", 0.0)
                            - job.get("trimStartSec", 0.0) * 1000.0)
     midi_writer.write_midi(
-        events["notes"], events["pedals"], out,
+        notes, pedals, out,
         vel_min=vel_min, vel_max=vel_max, gamma=gamma,
-        offset_ms=effective_offset_ms, include_pedal=pedal)
+        offset_ms=effective_offset_ms, include_pedal=pedal,
+        release_ms=release_ms, cap_sustain=cap_sustain)
     return FileResponse(
         out, media_type="audio/midi",
         filename=job["name"] + ".mid")
@@ -441,7 +524,8 @@ def get_piano_stem(job_id: str):
 
 @app.get("/api/jobs/{job_id}/eseq")
 def get_eseq(job_id: str, vel_min: int = 20, vel_max: int = 112,
-             gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True):
+             gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True,
+             release_ms: int = 0, cap_sustain: bool = True):
     """Render Yamaha E-SEQ (.FIL) for floppy-era Disklaviers, with the same
     settings and baked offsets as the MIDI render."""
     job = jobs.get(job_id)
@@ -452,20 +536,22 @@ def get_eseq(job_id: str, vel_min: int = 20, vel_max: int = 112,
         raise HTTPException(404, "events not ready")
     with open(events_path) as f:
         events = json.load(f)
+    notes, pedals = _trim_tail(job, events)
     effective_offset_ms = (offset_ms + job.get("encoderDelayMs", 0.0)
                            - job.get("trimStartSec", 0.0) * 1000.0)
     out = os.path.join(_job_dir(job_id), "render.fil")
     eseq_writer.write_eseq(
-        events["notes"], events["pedals"], out, title=job["name"],
+        notes, pedals, out, title=job["name"],
         vel_min=vel_min, vel_max=vel_max, gamma=gamma,
         offset_ms=effective_offset_ms, include_pedal=pedal,
-        dos_name=job["name"])
+        dos_name=job["name"], release_ms=release_ms, cap_sustain=cap_sustain)
     return FileResponse(
         out, media_type="application/octet-stream",
         filename=eseq_writer._sanitize_83(job["name"]).strip() + ".FIL")
 
 
-def _render_hfe(job_id, vel_min, vel_max, gamma, offset_ms, pedal):
+def _render_hfe(job_id, vel_min, vel_max, gamma, offset_ms, pedal,
+                release_ms=0, cap_sustain=True):
     """Build the .hfe disk image for a job; returns (path, dos_base)."""
     job = jobs.get(job_id)
     if job is None:
@@ -475,14 +561,15 @@ def _render_hfe(job_id, vel_min, vel_max, gamma, offset_ms, pedal):
         raise HTTPException(404, "events not ready")
     with open(events_path) as f:
         events = json.load(f)
+    notes, pedals = _trim_tail(job, events)
     effective_offset_ms = (offset_ms + job.get("encoderDelayMs", 0.0)
                            - job.get("trimStartSec", 0.0) * 1000.0)
     fil_path = os.path.join(_job_dir(job_id), "render.fil")
     eseq_writer.write_eseq(
-        events["notes"], events["pedals"], fil_path, title=job["name"],
+        notes, pedals, fil_path, title=job["name"],
         vel_min=vel_min, vel_max=vel_max, gamma=gamma,
         offset_ms=effective_offset_ms, include_pedal=pedal,
-        dos_name=job["name"])
+        dos_name=job["name"], release_ms=release_ms, cap_sustain=cap_sustain)
     with open(fil_path, "rb") as f:
         fil_bytes = f.read()
     dos_base = eseq_writer._sanitize_83(job["name"])
@@ -495,12 +582,13 @@ def _render_hfe(job_id, vel_min, vel_max, gamma, offset_ms, pedal):
 
 @app.get("/api/jobs/{job_id}/hfe")
 def get_hfe(job_id: str, vel_min: int = 20, vel_max: int = 112,
-            gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True):
+            gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True,
+            release_ms: int = 0, cap_sustain: bool = True):
     """Complete Gotek/Nalbantov floppy image (.hfe): FAT12 disk holding
     PIANODIR.FIL + the E-SEQ song, MFM-encoded. Drop on the emulator USB
     stick as DSKAxxxx.hfe and play."""
     out, dos_base = _render_hfe(job_id, vel_min, vel_max, gamma,
-                                offset_ms, pedal)
+                                offset_ms, pedal, release_ms, cap_sustain)
     return FileResponse(
         out, media_type="application/octet-stream",
         filename=dos_base.strip() + ".hfe")
@@ -540,7 +628,8 @@ def _fs_safe_name(name):
 def export_job_file(job_id: str, kind: str, dest: str,
                     vel_min: int = 20, vel_max: int = 112,
                     gamma: float = 1.0, offset_ms: int = 0,
-                    pedal: bool = True):
+                    pedal: bool = True, release_ms: int = 0,
+                    cap_sustain: bool = True):
     """Render one deliverable (midi / mp3 / hfe) and copy it into `dest`
     (typically a removable drive root chosen in the UI)."""
     job = jobs.get(job_id)
@@ -551,7 +640,8 @@ def export_job_file(job_id: str, kind: str, dest: str,
 
     if kind == "midi":
         # same render path as GET /midi
-        get_midi(job_id, vel_min, vel_max, gamma, offset_ms, pedal)
+        get_midi(job_id, vel_min, vel_max, gamma, offset_ms, pedal,
+                 release_ms, cap_sustain)
         src = os.path.join(_job_dir(job_id), "render.mid")
         filename = _fs_safe_name(job["name"]) + ".mid"
     elif kind == "mp3":
@@ -563,7 +653,7 @@ def export_job_file(job_id: str, kind: str, dest: str,
         filename = _fs_safe_name(job["name"]) + " (no piano).mp3"
     elif kind == "hfe":
         src, dos_base = _render_hfe(job_id, vel_min, vel_max, gamma,
-                                    offset_ms, pedal)
+                                    offset_ms, pedal, release_ms, cap_sustain)
         filename = dos_base.strip() + ".hfe"
     else:
         raise HTTPException(400, "kind must be midi, mp3 or hfe")
@@ -583,12 +673,13 @@ def export_job_file(job_id: str, kind: str, dest: str,
 @app.post("/api/jobs/{job_id}/usb")
 def save_job_to_usb(job_id: str, vel_min: int = 20, vel_max: int = 112,
                     gamma: float = 1.0, offset_ms: int = 0,
-                    pedal: bool = True):
+                    pedal: bool = True, release_ms: int = 0,
+                    cap_sustain: bool = True):
     """Render the .hfe and write it straight into the first blank slot on
     the emulator stick. Blankness is verified by decoding each slot's FAT
     root directory, so existing songs can't be overwritten."""
     out, _dos_base = _render_hfe(job_id, vel_min, vel_max, gamma,
-                                 offset_ms, pedal)
+                                 offset_ms, pedal, release_ms, cap_sustain)
     with open(out, "rb") as f:
         hfe_bytes = f.read()
     try:
@@ -604,36 +695,145 @@ def save_job_to_usb(job_id: str, vel_min: int = 20, vel_max: int = 112,
     }
 
 
-@app.post("/api/jobs/{job_id}/retrim")
-def retrim_job(job_id: str):
-    """Apply dead-space trimming to a job converted before trim support
-    existed (or re-run it). Re-encodes the accompaniment from the kept
-    no_piano stem — no separation/transcription re-run needed."""
+def _trim_events_window(events, abs_start, abs_end):
+    """Cut events to absolute-time [abs_start, abs_end] and shift so the window
+    starts at 0. Drops anything wholly outside; clips events straddling an edge."""
+    def cut(items):
+        out = []
+        for it in items:
+            onset = it["onset"]
+            offset = it["offset"]
+            if offset <= abs_start:
+                continue                      # entirely before the window
+            if abs_end is not None and onset >= abs_end:
+                continue                      # entirely after the window
+            new_on = max(0.0, onset - abs_start)
+            hi = offset if abs_end is None else min(offset, abs_end)
+            new_off = hi - abs_start
+            if new_off <= new_on:
+                continue
+            clone = dict(it)
+            clone["onset"] = round(new_on, 4)
+            clone["offset"] = round(new_off, 4)
+            out.append(clone)
+        return out
+    return {"notes": cut(events["notes"]), "pedals": cut(events["pedals"])}
+
+
+def _ensure_trim_originals(job, job_dir):
+    """Back up the pristine, full-length sources once, so destructive trims can
+    always be recomputed from them (and fully reset). Returns the paths."""
+    events_path = os.path.join(job_dir, "events.json")
+    original_events = os.path.join(job_dir, "events_original.json")
+    if not os.path.exists(original_events):
+        if not os.path.exists(events_path):
+            raise HTTPException(404, "events not ready")
+        shutil.copyfile(events_path, original_events)
+    stem_orig = job.get("pianoStemOrig")
+    piano_stem = job.get("pianoStem")
+    if stem_orig is None and piano_stem:
+        stem_path = os.path.join(job_dir, piano_stem)
+        stem_orig = "piano_original.wav"
+        dst = os.path.join(job_dir, stem_orig)
+        if os.path.exists(stem_path) and not os.path.exists(dst):
+            shutil.copyfile(stem_path, dst)
+        job["pianoStemOrig"] = stem_orig
+    return original_events, stem_orig
+
+
+def _regen_from_originals(job, job_dir, abs_start, abs_end):
+    """Rebuild events.json, the piano stem, and the accompaniment MP3 for the
+    absolute-time window [abs_start, abs_end] from the pristine backups, then
+    shift everything to a 0-based timeline. Composable across repeated trims."""
+    import soundfile as sf
+
+    original_events = os.path.join(job_dir, "events_original.json")
+    with open(original_events) as f:
+        orig = json.load(f)
+    trimmed = _trim_events_window(orig, abs_start, abs_end)
+    with open(os.path.join(job_dir, "events.json"), "w") as f:
+        json.dump(trimmed, f)
+
+    # piano stem, cut from the pristine full-length copy
+    stem_orig = job.get("pianoStemOrig")
+    piano_stem = job.get("pianoStem")
+    if stem_orig and piano_stem:
+        src = os.path.join(job_dir, stem_orig)
+        if os.path.exists(src):
+            data, sr = sf.read(src)
+            lo = int(abs_start * sr)
+            hi = len(data) if abs_end is None else min(len(data), int(abs_end * sr))
+            sf.write(os.path.join(job_dir, piano_stem), data[lo:hi], sr)
+
+    # accompaniment, re-encoded from the never-cut no_piano stem
+    if piano_stem and job.get("accompaniment"):
+        no_piano = os.path.join(
+            job_dir, os.path.dirname(piano_stem), "no_piano.wav")
+        if not os.path.exists(no_piano):
+            raise HTTPException(
+                409, "accompaniment stem missing; re-convert to change trim")
+        accompaniment, encoder_delay_ms = pipeline.encode_accompaniment(
+            no_piano, job_dir, lambda stage, pct: None,
+            trim_start=abs_start, trim_end=abs_end)
+        job["accompaniment"] = os.path.relpath(accompaniment, job_dir)
+        job["encoderDelayMs"] = encoder_delay_ms
+
+    with jobs_lock:
+        job["srcStartSec"] = round(abs_start, 3)
+        job["srcEndSec"] = round(abs_end, 3) if abs_end is not None else None
+        job["trimStartSec"] = 0.0
+        job["trimEndSec"] = None
+        job["noteCount"] = len(trimmed["notes"])
+        job["pedalCount"] = len(trimmed["pedals"])
+        job["edited"] = True
+        _persist(job["id"])
+    return trimmed
+
+
+@app.post("/api/jobs/{job_id}/trim")
+def trim_job(job_id: str, trim_start: float = 0.0,
+             trim_end: Optional[float] = None):
+    """Manually trim the song's start/end (seconds, in the currently displayed
+    timeline). Destructive: events outside the window are deleted and the rest
+    shifted to start at 0, and the piano stem + accompaniment MP3 are cut to
+    match — audio and piano stay locked, the dead space is truly gone. The
+    pristine sources are kept, so Reset to original restores everything."""
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "job not found")
-    if job["status"] != "done":
+    if job.get("status") != "done":
         raise HTTPException(409, "job not finished")
+    trim_start = max(0.0, float(trim_start))
+    if trim_end is not None:
+        trim_end = float(trim_end)
+        if trim_end <= trim_start:
+            raise HTTPException(400, "trim end must be after trim start")
     job_dir = _job_dir(job_id)
-    piano_stem = job.get("pianoStem")
-    if not piano_stem:
-        raise HTTPException(409, "stems missing")
-    no_piano = os.path.join(
-        job_dir, os.path.dirname(piano_stem), "no_piano.wav")
-    input_path = _input_path(job_id)
-    if not os.path.exists(no_piano) or not os.path.exists(input_path):
-        raise HTTPException(409, "source files missing; re-convert instead")
+    _ensure_trim_originals(job, job_dir)
+    # Convert from the displayed (0-based) timeline into absolute source time so
+    # repeated trims compose correctly.
+    src_start = job.get("srcStartSec", 0.0) or 0.0
+    abs_start = src_start + trim_start
+    abs_end = None if trim_end is None else src_start + trim_end
+    _regen_from_originals(job, job_dir, abs_start, abs_end)
+    return job
 
+
+@app.post("/api/jobs/{job_id}/retrim")
+def retrim_job(job_id: str):
+    """Auto-detect dead space and apply it destructively (from pristine
+    sources). For jobs converted before trim support, or to snap to detected
+    bounds."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    input_path = _input_path(job_id)
+    if not os.path.exists(input_path):
+        raise HTTPException(409, "source audio missing; re-convert instead")
+    job_dir = _job_dir(job_id)
+    _ensure_trim_originals(job, job_dir)
     trim_start, trim_end = pipeline.detect_dead_space(input_path)
-    accompaniment, encoder_delay_ms = pipeline.encode_accompaniment(
-        no_piano, job_dir, lambda stage, pct: None,
-        trim_start=trim_start, trim_end=trim_end)
-    with jobs_lock:
-        job["accompaniment"] = os.path.relpath(accompaniment, job_dir)
-        job["encoderDelayMs"] = encoder_delay_ms
-        job["trimStartSec"] = trim_start
-        job["trimEndSec"] = trim_end
-        _persist(job_id)
+    _regen_from_originals(job, job_dir, trim_start, trim_end)
     return job
 
 

@@ -10,11 +10,17 @@ makes the check immune to how the blank was created; a slot holding any
 song can never be overwritten.
 """
 
+import ctypes
 import os
 import re
 import struct
 
 SLOT_RE = re.compile(r"^DSKA(\d{4})\.hfe$", re.IGNORECASE)
+
+# A drive root with at least this many DSKAxxxx.hfe files is treated as the
+# Gotek/Nalbantov emulator stick. Factory sticks ship with hundreds, but a
+# user-prepared stick may carry far fewer.
+GOTEK_MIN_SLOTS = 10
 
 
 def _crc16(data, crc=0xFFFF):
@@ -125,8 +131,17 @@ def is_blank_slot(path):
             first = root[i]
             if first == 0x00:
                 break
-            if first != 0xE5:
-                return False  # a live directory entry -> not blank
+            if first == 0xE5:
+                continue  # deleted entry
+            attr = root[i + 11]
+            if attr == 0x0F or attr & 0x08:
+                continue  # LFN / volume label, not a file
+            if root[i:i + 11].upper() == b"PIANODIRFIL":
+                # Disklavier-formatted blanks carry an empty PIANODIR.FIL
+                # catalog; songs always appear as their own .FIL entries,
+                # so a catalog-only disk holds no music.
+                continue
+            return False  # a real file -> not blank
         return True
     except OSError:
         return False
@@ -147,9 +162,50 @@ def find_usb_drive():
         except OSError:
             continue
         slots = [n for n in names if SLOT_RE.match(n)]
-        if len(slots) >= 20:
+        if len(slots) >= GOTEK_MIN_SLOTS:
             return root
     return None
+
+
+def _slot_count(root):
+    try:
+        return sum(1 for n in os.listdir(root) if SLOT_RE.match(n))
+    except OSError:
+        return 0
+
+
+def list_removable_drives():
+    """All removable drives (USB sticks) currently mounted, with volume
+    label, free space and whether the drive looks like the Gotek stick.
+    Windows-only; returns [] elsewhere."""
+    if os.name != "nt":
+        return []
+    k32 = ctypes.windll.kernel32
+    DRIVE_REMOVABLE = 2
+    drives = []
+    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+        root = letter + ":\\"
+        if k32.GetDriveTypeW(root) != DRIVE_REMOVABLE:
+            continue
+        label_buf = ctypes.create_unicode_buffer(261)
+        fs_buf = ctypes.create_unicode_buffer(261)
+        ok = k32.GetVolumeInformationW(
+            ctypes.c_wchar_p(root), label_buf, 261,
+            None, None, None, fs_buf, 261)
+        if not ok:
+            continue  # no media in the slot (card readers etc.)
+        free = ctypes.c_ulonglong(0)
+        total = ctypes.c_ulonglong(0)
+        k32.GetDiskFreeSpaceExW(
+            ctypes.c_wchar_p(root),
+            ctypes.byref(free), ctypes.byref(total), None)
+        drives.append({
+            "root": root,
+            "label": label_buf.value or "USB drive",
+            "freeBytes": free.value,
+            "isGotek": _slot_count(root) >= GOTEK_MIN_SLOTS,
+        })
+    return drives
 
 
 def used_and_free(root, scan_from=0, stop_after_free=1):
@@ -187,8 +243,19 @@ def save_to_next_free(hfe_bytes, scan_from=14):
         raise RuntimeError("No blank slots left on the stick.")
     slot = free[0]
     path = os.path.join(root, "DSKA%04d.hfe" % slot)
+    write_flushed(path, hfe_bytes)
+    return root, slot
+
+
+def write_flushed(path, data):
+    """Write bytes to path and force them onto the physical device before
+    returning. Without the fsync the data lingers in Windows' write-back
+    cache; if the user pulls the USB stick before the OS flushes, the file
+    is left half-written on the medium (fine when re-read on the PC from
+    cache, but corrupt/unreadable on the piano). Atomic via a .tmp rename."""
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
-        f.write(hfe_bytes)
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
-    return root, slot

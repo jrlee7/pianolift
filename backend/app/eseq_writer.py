@@ -39,7 +39,7 @@ competition releases) cross-checked against the open-source fil2mid decoder
 
 import struct
 
-from .midi_writer import map_velocity
+from .midi_writer import map_velocity, shape_note_end
 
 UNITS_PER_SEC = 748.8
 MAX_F4 = 16383
@@ -52,8 +52,14 @@ def _sec_to_units(sec):
 
 
 def _sanitize_83(name):
-    """8-char uppercase DOS-safe base name."""
-    clean = "".join(c for c in name.upper() if c.isalnum() or c in "-_")
+    """8-char uppercase DOS base name, alphanumeric only.
+
+    The 1995 Disklavier's song-select firmware only handles plain A-Z/0-9
+    names (all real PianoSoft and user disks use them). A stray '-' or '_'
+    that survives into the 8.3 name -- and thus into the PIANODIR catalog
+    entry -- makes the piano refuse the song even though the FAT/E-SEQ are
+    valid. Strip everything but letters and digits."""
+    clean = "".join(c for c in name.upper() if c.isalnum())
     if not clean:
         clean = "PIANO01"
     return (clean[:8] + "        ")[:8].rstrip().ljust(8)
@@ -77,9 +83,12 @@ def _preamble():
 
 def write_eseq(notes, pedals, out_path, title="",
                vel_min=20, vel_max=112, gamma=1.0,
-               offset_ms=0, include_pedal=True, dos_name="PIANO01"):
+               offset_ms=0, include_pedal=True, dos_name="PIANO01",
+               release_ms=0, cap_sustain=True):
     """Write an E-SEQ .FIL. Same event semantics as midi_writer.write_midi:
-    times in seconds on the original timeline, offset_ms shifts everything.
+    times in seconds on the original timeline, offset_ms shifts everything,
+    release_ms trims each note's tail and cap_sustain clamps to the physical
+    sustain ceiling (pedal segments are left untouched).
     Returns number of notes written."""
     shift = offset_ms / 1000.0
 
@@ -92,6 +101,8 @@ def write_eseq(notes, pedals, out_path, title="",
         offset = n["offset"] + shift
         if offset <= 0:
             continue
+        offset = shape_note_end(onset, offset, n["pitch"], release_ms,
+                                cap_sustain)
         note_count += 1
         vel = map_velocity(n["velocity"], vel_min, vel_max, gamma)
         on_u = _sec_to_units(onset)

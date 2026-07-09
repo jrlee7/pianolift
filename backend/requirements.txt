@@ -13,3 +13,8 @@ piano_transcription_inference>=0.0.6
 librosa>=0.10
 mido>=1.3
 soundfile>=0.12
+# URL import (YouTube/Facebook/Instagram/...). Site extractors rot fast;
+# keep this fresh when downloads start failing. [default] pulls yt-dlp-ejs,
+# the JS challenge solver YouTube needs (runs via node or deno; one must be
+# on PATH or downloads 403).
+yt-dlp[default]>=2026.7.4

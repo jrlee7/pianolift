@@ -108,5 +108,37 @@ extracted stem (playable in the result view) to judge before trusting the MIDI.
 
 ## Firebase library (optional)
 
-Converted MIDI files (small) can be saved to Firestore for access from any device.
-Fill `frontend/.env` with a Firebase web app config. MP3s stay local.
+Save conversions to the cloud for access from any device. The baked **MIDI**
+lives in Firestore (small, well under the 1 MiB doc cap); the piano-removed
+**accompaniment MP3** lives in Firebase **Storage** (5 GB free ≈ ~500 songs at
+320 kbps). Fill `frontend/.env` with a Firebase web app config (including
+`VITE_FIREBASE_STORAGE_BUCKET`).
+
+From the **Library** tab you can multi-select songs and **Copy to USB folder…** —
+pick a folder (e.g. on the ENSPIRE USB stick) and each song's `.mid` +
+accompaniment `.mp3` is written straight into it. Runs in the browser; needs
+Chrome/Edge or the desktop app (File System Access API).
+
+### One-time cloud setup
+
+```cmd
+firebase deploy --only firestore:rules,storage
+```
+
+The `storage.rules` allow open read/write (personal single-family app — don't
+store anything sensitive).
+
+**Storage must be enabled** first: Firebase console → Build → Storage → Get
+started. Newest projects may put the default bucket on the Blaze plan, which
+still includes the 5 GB free allowance.
+
+**CORS** — the Library's *Copy to USB folder* fetches MP3 bytes from Storage via
+JavaScript, which the browser blocks cross-origin until the bucket allows it.
+Playback and archiving don't need this; the byte-level copy does. Apply once:
+
+```cmd
+gsutil cors set cors.json gs://<your-storage-bucket>
+```
+
+(`cors.json` in the repo root allows read-only `GET` from any origin; narrow
+`origin` to your app URL if you prefer.)

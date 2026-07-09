@@ -16,6 +16,7 @@ hidden_imports = [
     'librosa',
     'scipy',
     'sklearn',
+    'yt_dlp',
 ]
 
 # Collect data files from site-packages
@@ -46,6 +47,9 @@ args = [
 # Add hidden imports
 for imp in hidden_imports:
     args.extend(['--hidden-import', imp])
+
+# yt-dlp's YouTube JS challenge solver ships .js files as package data
+args.extend(['--collect-all', 'yt_dlp_ejs'])
 
 # Add data files
 for src, dest in datas:

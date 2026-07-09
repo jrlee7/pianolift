@@ -18,6 +18,45 @@ def _sec_to_ticks(sec):
     return int(round(sec * TICKS_PER_SECOND))
 
 
+# The ByteDance transcriber marks note-off where the string finally damps
+# (natural decay + sustain ring), not where a finger would lift, so raw note
+# durations run long and keys stay depressed longer than they need to.
+# release_ms trims a fixed amount off each note's tail; MIN_NOTE_SEC keeps a
+# note from collapsing to nothing so it still sounds.
+MIN_NOTE_SEC = 0.03
+
+# Longest a struck string can audibly ring on a concert grand, by pitch. Bass
+# strings (long, heavy, high energy) sustain on the order of 30 s with the key
+# held; the top octave (short strings, and no dampers at all above ~C7) barely
+# rings 1 s. Between the anchors sustain falls off roughly geometrically per
+# octave, so a smooth exponential fit tracks the real instrument. A note the
+# transcriber marks longer than this could never have been physically sounding,
+# so capping it there removes stuck-key artifacts without touching real holds.
+_SUSTAIN_LOW_SEC = 30.0   # pitch 21 (A0)
+_SUSTAIN_HIGH_SEC = 1.0   # pitch 108 (C8)
+_PITCH_LOW = 21
+_PITCH_HIGH = 108
+
+
+def max_sustain_sec(pitch):
+    """Physical audible-ring ceiling for a held key at this MIDI pitch."""
+    p = min(_PITCH_HIGH, max(_PITCH_LOW, pitch))
+    frac = (p - _PITCH_LOW) / float(_PITCH_HIGH - _PITCH_LOW)
+    return _SUSTAIN_LOW_SEC * (_SUSTAIN_HIGH_SEC / _SUSTAIN_LOW_SEC) ** frac
+
+
+def shape_note_end(onset, offset, pitch, release_ms, cap_sustain):
+    """Trim a note's end by release_ms and, if cap_sustain, clamp it to the
+    physical sustain ceiling for its pitch. Floored to MIN_NOTE_SEC length."""
+    end = offset - release_ms / 1000.0
+    if cap_sustain:
+        cap = onset + max_sustain_sec(pitch)
+        if end > cap:
+            end = cap
+    floor = onset + MIN_NOTE_SEC
+    return end if end > floor else floor
+
+
 def map_velocity(raw, vel_min, vel_max, gamma):
     """Map raw model velocity (1-127) onto a playable Disklavier range.
 
@@ -37,12 +76,62 @@ def map_velocity(raw, vel_min, vel_max, gamma):
     return out
 
 
+def read_midi(path):
+    """Parse a Standard MIDI File back into (notes, pedals) events — the
+    inverse of write_midi, used to pull a library song (stored only as baked
+    MIDI) back into the editor. Iterating the MidiFile yields per-message delta
+    times already in seconds (mido applies the tempo map), so absolute onset/
+    offset times fall out by accumulation. Note velocities come back as-is
+    (already mapped when the file was written); pedal = CC64 >= 64 held."""
+    import mido
+
+    mid = mido.MidiFile(path)
+    abs_t = 0.0
+    active = {}      # pitch -> (onset_sec, velocity)
+    ped_on = None    # onset_sec while CC64 is held down, else None
+    notes = []
+    pedals = []
+    for msg in mid:
+        abs_t += msg.time
+        if msg.type == "note_on" and msg.velocity > 0:
+            active[msg.note] = (abs_t, msg.velocity)
+        elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+            st = active.pop(msg.note, None)
+            if st is not None:
+                onset, vel = st
+                notes.append({
+                    "onset": round(onset, 4), "offset": round(abs_t, 4),
+                    "pitch": msg.note, "velocity": vel,
+                })
+        elif msg.type == "control_change" and msg.control == 64:
+            if msg.value >= 64:
+                if ped_on is None:
+                    ped_on = abs_t
+            elif ped_on is not None:
+                pedals.append({"onset": round(ped_on, 4), "offset": round(abs_t, 4)})
+                ped_on = None
+    # Close anything left hanging at end-of-file so nothing is dropped.
+    for pitch, (onset, vel) in active.items():
+        notes.append({
+            "onset": round(onset, 4), "offset": round(abs_t, 4),
+            "pitch": pitch, "velocity": vel,
+        })
+    if ped_on is not None:
+        pedals.append({"onset": round(ped_on, 4), "offset": round(abs_t, 4)})
+    notes.sort(key=lambda n: n["onset"])
+    pedals.sort(key=lambda p: p["onset"])
+    return notes, pedals
+
+
 def write_midi(notes, pedals, out_path,
                vel_min=20, vel_max=112, gamma=1.0,
-               offset_ms=0, include_pedal=True):
+               offset_ms=0, include_pedal=True, release_ms=0,
+               cap_sustain=True):
     """notes: [{onset, offset, pitch, velocity}], pedals: [{onset, offset}].
 
     Times in seconds. offset_ms shifts every event (positive = later).
+    release_ms trims each note's tail so keys don't hold too long; cap_sustain
+    clamps any note to its pitch's physical sustain ceiling.
     Returns number of notes written.
     """
     shift = offset_ms / 1000.0
@@ -53,6 +142,8 @@ def write_midi(notes, pedals, out_path,
         offset = n["offset"] + shift
         if offset <= 0:
             continue
+        offset = shape_note_end(onset, offset, n["pitch"], release_ms,
+                                cap_sustain)
         vel = map_velocity(n["velocity"], vel_min, vel_max, gamma)
         on_tick = _sec_to_ticks(onset)
         off_tick = _sec_to_ticks(offset)

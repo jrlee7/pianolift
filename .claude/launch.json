@@ -11,9 +11,24 @@
     {
       "name": "backend",
       "runtimeExecutable": ".venv/Scripts/python.exe",
-      "runtimeArgs": ["-m", "uvicorn", "app.main:app", "--port", "8000"],
+      "runtimeArgs": ["-m", "uvicorn", "app.main:app", "--port", "8000", "--reload", "--reload-dir", "app"],
       "cwd": "backend",
       "port": 8000
+    },
+    {
+      "name": "dev-alt",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--", "--port", "5175"],
+      "cwd": "frontend",
+      "port": 5175,
+      "env": { "VITE_API_PORT": "8001" }
+    },
+    {
+      "name": "backend-alt",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "uvicorn", "app.main:app", "--port", "8001", "--reload", "--reload-dir", "app"],
+      "cwd": "backend",
+      "port": 8001
     }
   ]
 }

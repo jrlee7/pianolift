@@ -7,6 +7,14 @@ function midiToFreq(pitch) {
   return 440 * Math.pow(2, (pitch - 69) / 12)
 }
 
+// Physical audible-ring ceiling by pitch — mirrors midi_writer.max_sustain_sec
+// so the preview key-hold matches the exported files.
+function maxSustainSec(pitch) {
+  const p = Math.min(108, Math.max(21, pitch))
+  const frac = (p - 21) / (108 - 21)
+  return 30 * Math.pow(1 / 30, frac)
+}
+
 function mapVelocity(raw, velMin, velMax, gamma) {
   let norm = raw / 127
   if (norm < 0) norm = 0
@@ -14,6 +22,49 @@ function mapVelocity(raw, velMin, velMax, gamma) {
   const shaped = Math.pow(norm, gamma)
   const out = velMin + shaped * (velMax - velMin)
   return Math.max(1, Math.min(127, out))
+}
+
+// Schedule one synth note at AudioContext time `when`. Shared by both the
+// accompaniment-locked player and the standalone MIDI-only player, so what you
+// hear (dynamics, release trim, sustain cap) matches the exported files.
+function synthNote(ctx, master, settings, note, when) {
+  const vel = mapVelocity(
+    note.velocity, settings.velMin, settings.velMax, settings.gamma)
+  const gainVal = Math.pow(vel / 127, 1.6) * 0.35
+  // mirror the backend's note-tail trim + sustain cap so preview matches
+  const release = (settings.releaseMs || 0) / 1000
+  let end = note.offset - release
+  if (settings.capSustain) {
+    const cap = note.onset + maxSustainSec(note.pitch)
+    if (end > cap) end = cap
+  }
+  // Clamp to the bass sustain ceiling (30s) rather than a flat 4s so a
+  // capped vs uncapped long note is actually audibly different in preview.
+  const dur = Math.max(0.15, Math.min(30, end - note.onset))
+
+  const gain = ctx.createGain()
+  gain.connect(master)
+  gain.gain.setValueAtTime(0, when)
+  gain.gain.linearRampToValueAtTime(gainVal, when + 0.008)
+  gain.gain.exponentialRampToValueAtTime(0.0004, when + dur)
+
+  const freq = midiToFreq(note.pitch)
+  const o1 = ctx.createOscillator()
+  o1.type = 'triangle'
+  o1.frequency.value = freq
+  o1.connect(gain)
+  const g2 = ctx.createGain()
+  g2.gain.value = 0.25
+  g2.connect(gain)
+  const o2 = ctx.createOscillator()
+  o2.type = 'sine'
+  o2.frequency.value = freq * 2
+  o2.connect(g2)
+
+  o1.start(when)
+  o2.start(when)
+  o1.stop(when + dur + 0.05)
+  o2.stop(when + dur + 0.05)
 }
 
 export function createPreviewPlayer(notes, settings, audioEl, effOffsetSec) {
@@ -32,34 +83,7 @@ export function createPreviewPlayer(notes, settings, audioEl, effOffsetSec) {
   const INTERVAL = 120    // ms between scheduler ticks
 
   function scheduleNote(note, when) {
-    const vel = mapVelocity(
-      note.velocity, settings.velMin, settings.velMax, settings.gamma)
-    const gainVal = Math.pow(vel / 127, 1.6) * 0.35
-    const dur = Math.max(0.15, Math.min(4, note.offset - note.onset))
-
-    const gain = ctx.createGain()
-    gain.connect(master)
-    gain.gain.setValueAtTime(0, when)
-    gain.gain.linearRampToValueAtTime(gainVal, when + 0.008)
-    gain.gain.exponentialRampToValueAtTime(0.0004, when + dur)
-
-    const freq = midiToFreq(note.pitch)
-    const o1 = ctx.createOscillator()
-    o1.type = 'triangle'
-    o1.frequency.value = freq
-    o1.connect(gain)
-    const g2 = ctx.createGain()
-    g2.gain.value = 0.25
-    g2.connect(gain)
-    const o2 = ctx.createOscillator()
-    o2.type = 'sine'
-    o2.frequency.value = freq * 2
-    o2.connect(g2)
-
-    o1.start(when)
-    o2.start(when)
-    o1.stop(when + dur + 0.05)
-    o2.stop(when + dur + 0.05)
+    synthNote(ctx, master, settings, note, when)
   }
 
   function tick() {
@@ -105,5 +129,67 @@ export function createPreviewPlayer(notes, settings, audioEl, effOffsetSec) {
     get done() {
       return audioEl.ended
     }
+  }
+}
+
+// Standalone player for MIDI-only songs (e.g. library imports with no
+// accompaniment). Clocks straight off the AudioContext — no <audio> element.
+// onTime(sec) fires each tick to drive the playhead/keyboard; onEnded fires
+// once the last note has passed. startSec begins playback mid-song.
+export function createNotePlayer(notes, settings, onTime, onEnded, startSec) {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)()
+  const master = ctx.createGain()
+  master.gain.value = 0.5
+  master.connect(ctx.destination)
+
+  const LOOKAHEAD = 0.4
+  const INTERVAL = 120
+  let endSec = 0
+  for (let i = 0; i < notes.length; i++) {
+    if (notes[i].offset > endSec) endSec = notes[i].offset
+  }
+
+  let timer = null
+  let nextIdx = 0
+  let stopped = false
+  let anchor = 0        // AudioContext time that maps to song-time 0
+  const begin = startSec > 0 ? startSec : 0
+
+  function stop() {
+    if (stopped) return
+    stopped = true
+    if (timer) clearInterval(timer)
+    try { ctx.close() } catch (e) { /* already closed */ }
+  }
+
+  function tick() {
+    if (stopped) return
+    const elapsed = ctx.currentTime - anchor
+    const horizon = elapsed + LOOKAHEAD
+    while (nextIdx < notes.length) {
+      const n = notes[nextIdx]
+      if (n.onset > horizon) break
+      if (n.onset >= elapsed - 0.05) synthNote(ctx, master, settings, n, anchor + n.onset)
+      nextIdx++
+    }
+    if (onTime) onTime(elapsed)
+    if (elapsed > endSec + 0.3) {
+      stop()
+      if (onEnded) onEnded()
+    }
+  }
+
+  return {
+    async start() {
+      await ctx.resume()
+      stopped = false
+      // anchor so that ctx.currentTime - anchor == begin at t0
+      anchor = ctx.currentTime + 0.1 - begin
+      nextIdx = 0
+      while (nextIdx < notes.length && notes[nextIdx].onset < begin) nextIdx++
+      tick()
+      timer = setInterval(tick, INTERVAL)
+    },
+    stop
   }
 }

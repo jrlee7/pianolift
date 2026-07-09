@@ -1,6 +1,6 @@
-"""Processing pipeline: MP3 -> piano stem (BS-Roformer-SW) -> note/pedal
-events (ByteDance high-resolution piano transcription) -> events.json +
-default MIDI.
+"""Processing pipeline: audio (MP3/WAV/M4A/...) -> piano stem
+(BS-Roformer-SW) -> note/pedal events (ByteDance high-resolution piano
+transcription) -> events.json + default MIDI.
 
 Runs on CPU. Each stage reports progress through a callback so the API can
 expose it to the frontend.
@@ -70,7 +70,7 @@ def _ensure_ffmpeg(progress_cb):
     os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ["PATH"]
 
 
-def separate_piano(mp3_path, job_dir, progress_cb):
+def separate_piano(audio_path, job_dir, progress_cb):
     """Run BS-Roformer-SW, return path to the piano stem wav.
 
     The model has no Demucs-style "--two-stems" complement, so we also sum
@@ -88,7 +88,7 @@ def separate_piano(mp3_path, job_dir, progress_cb):
     progress_cb("separating", 5)  # first run downloads a ~700MB checkpoint
     separator.load_model(model_filename=SEPARATION_MODEL)
     # separate() returns bare filenames, not joined with output_dir.
-    output_files = [os.path.join(sep_out, f) for f in separator.separate(mp3_path)]
+    output_files = [os.path.join(sep_out, f) for f in separator.separate(audio_path)]
     progress_cb("separating", 100)
 
     piano_wav = next(
@@ -208,34 +208,34 @@ def transcribe(piano_wav, progress_cb):
     return notes, pedals
 
 
-def _decode_piano_only(mp3_path, job_dir, progress_cb):
+def _decode_piano_only(audio_path, job_dir, progress_cb):
     """Skip separation entirely -- the input is already just piano. Decode
     straight to wav for the transcriber; no accompaniment to encode."""
     import soundfile as sf
 
     progress_cb("separating", 0)
-    data, sr = sf.read(mp3_path)
+    data, sr = sf.read(audio_path)
     out = os.path.join(job_dir, "piano.wav")
     sf.write(out, data, sr)
     progress_cb("separating", 100)
     return out
 
 
-def run_job(job_dir, mp3_path, progress_cb, piano_only=False):
+def run_job(job_dir, audio_path, progress_cb, piano_only=False):
     """Full pipeline. Writes events.json and output.mid into job_dir."""
     if piano_only:
-        piano_wav = _decode_piano_only(mp3_path, job_dir, progress_cb)
+        piano_wav = _decode_piano_only(audio_path, job_dir, progress_cb)
         accompaniment, encoder_delay_ms = None, 0.0
         trim_start, trim_end = 0.0, None
     else:
         progress_cb("separating", 0)
-        piano_wav = separate_piano(mp3_path, job_dir, progress_cb)
+        piano_wav = separate_piano(audio_path, job_dir, progress_cb)
 
         no_piano_wav = os.path.join(os.path.dirname(piano_wav), "no_piano.wav")
         if not os.path.exists(no_piano_wav):
             raise RuntimeError("Separator finished but no_piano stem not found")
 
-        trim_start, trim_end = detect_dead_space(mp3_path)
+        trim_start, trim_end = detect_dead_space(audio_path)
         accompaniment, encoder_delay_ms = encode_accompaniment(
             no_piano_wav, job_dir, progress_cb,
             trim_start=trim_start, trim_end=trim_end)

@@ -6,5 +6,8 @@ service cloud.firestore {
     match /songs/{songId} {
       allow read, write: if true;
     }
+    match /folders/{folderId} {
+      allow read, write: if true;
+    }
   }
 }

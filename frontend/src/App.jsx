@@ -3,7 +3,7 @@ import UploadZone from './components/UploadZone.jsx'
 import JobCard from './components/JobCard.jsx'
 import ResultView from './components/ResultView.jsx'
 import LibraryView from './components/LibraryView.jsx'
-import { listJobs, uploadMp3 } from './api.js'
+import { listJobs, uploadMp3, submitUrl, deleteJob } from './api.js'
 import { firebaseReady } from './firebase.js'
 
 export default function App() {
@@ -41,7 +41,34 @@ export default function App() {
     refresh()
   }
 
-  const openJob = jobs.find(function (j) { return j.id === openJobId })
+  async function handleUrl(url, pianoOnly) {
+    try {
+      await submitUrl(url, pianoOnly)
+    } catch (e) {
+      alert('Could not start download: ' + e.message)
+    }
+    refresh()
+  }
+
+  // Library → editor: the imported job already lives in the backend, so jump
+  // to Convert, open it, and refresh so it appears in the list.
+  const handleEditFromLibrary = useCallback(async function (jobId) {
+    setTab('convert')
+    setOpenJobId(jobId)
+    await refresh()
+  }, [refresh])
+
+  // Save-to-library succeeded: the song now lives in the cloud library, so
+  // drop the finished job off the Convert tab and collapse the editor.
+  async function handleArchived(jobId) {
+    try {
+      await deleteJob(jobId)
+    } catch (e) {
+      // already gone / backend blip — refresh will reconcile
+    }
+    setOpenJobId(null)
+    refresh()
+  }
 
   return (
     <div>
@@ -69,27 +96,33 @@ export default function App() {
               <code> uvicorn app.main:app --port 8000</code> in backend/).
             </div>
           )}
-          <UploadZone onFiles={handleFiles} />
+          <UploadZone onFiles={handleFiles} onUrl={handleUrl} />
           {jobs.slice().reverse().map(function (job) {
+            const isOpen = openJobId === job.id
             return (
-              <JobCard
-                key={job.id}
-                job={job}
-                open={openJobId === job.id}
-                onToggle={function () {
-                  setOpenJobId(openJobId === job.id ? null : job.id)
-                }}
-                onDeleted={refresh}
-              />
+              <div key={job.id} className={isOpen ? 'job-open' : ''}>
+                <JobCard
+                  job={job}
+                  open={isOpen}
+                  onToggle={function () {
+                    setOpenJobId(isOpen ? null : job.id)
+                  }}
+                  onDeleted={refresh}
+                />
+                {isOpen && job.status === 'done' && (
+                  <ResultView
+                    job={job}
+                    firebaseReady={firebaseReady}
+                    onArchived={handleArchived}
+                  />
+                )}
+              </div>
             )
           })}
-          {openJob && openJob.status === 'done' && (
-            <ResultView job={openJob} firebaseReady={firebaseReady} />
-          )}
         </div>
       )}
 
-      {tab === 'library' && <LibraryView />}
+      {tab === 'library' && <LibraryView onEdit={handleEditFromLibrary} />}
     </div>
   )
 }

@@ -1,9 +1,27 @@
 import { useRef, useState } from 'react'
 
-export default function UploadZone({ onFiles }) {
+export default function UploadZone({ onFiles, onUrl }) {
   const inputRef = useRef(null)
   const [drag, setDrag] = useState(false)
   const [pianoOnly, setPianoOnly] = useState(false)
+  const [url, setUrl] = useState('')
+  const [fetching, setFetching] = useState(false)
+
+  async function submitUrl() {
+    const u = url.trim()
+    if (!u) return
+    if (!/^https?:\/\//i.test(u)) {
+      alert('Paste a full link starting with http:// or https://')
+      return
+    }
+    setFetching(true)
+    try {
+      await onUrl(u, pianoOnly)
+      setUrl('')
+    } finally {
+      setFetching(false)
+    }
+  }
 
   function pick(fileList) {
     const files = []
@@ -44,6 +62,21 @@ export default function UploadZone({ onFiles }) {
             e.target.value = ''
           }}
         />
+      </div>
+      <div className="url-row">
+        <input
+          type="text"
+          className="url-input"
+          placeholder="…or paste a link — YouTube, Facebook, Instagram, SoundCloud…"
+          value={url}
+          disabled={fetching}
+          onChange={function (e) { setUrl(e.target.value) }}
+          onKeyDown={function (e) { if (e.key === 'Enter') submitUrl() }}
+        />
+        <button className="primary" disabled={fetching || !url.trim()}
+          onClick={submitUrl}>
+          {fetching ? 'Starting…' : '⬇ Fetch & convert'}
+        </button>
       </div>
       <div className="check" style={{ marginTop: 8 }}>
         <input id="pianoOnly" type="checkbox" checked={pianoOnly}

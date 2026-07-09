@@ -1,15 +1,27 @@
 import { useEffect, useRef, useState } from 'react'
-import PianoRoll from './PianoRoll.jsx'
+import NoteEditor from './NoteEditor.jsx'
 import {
   getEvents, midiUrl, audioUrl, eseqUrl, hfeUrl, fetchMidiBase64,
-  getUsbStatus, saveToUsb
+  getUsbStatus, saveToUsb, saveEvents, resetEvents,
+  getDrives, exportToDrive, trimJob
 } from '../api.js'
 import { saveSong } from '../firebase.js'
-import { createPreviewPlayer } from '../previewSynth.js'
+import { createPreviewPlayer, createNotePlayer } from '../previewSynth.js'
 
-const DEFAULTS = { velMin: 20, velMax: 112, gamma: 1.0, offsetMs: 0, pedal: true }
+const DEFAULTS = {
+  velMin: 20, velMax: 112, gamma: 1.0, offsetMs: 0, pedal: true,
+  releaseMs: 0, capSustain: true
+}
 
-export default function ResultView({ job, firebaseReady }) {
+// give every note/pedal a stable id the editor can track selections with
+function tagIds(ev) {
+  let id = 1
+  for (let i = 0; i < ev.notes.length; i++) ev.notes[i]._id = id++
+  for (let i = 0; i < ev.pedals.length; i++) ev.pedals[i]._id = id++
+  return ev
+}
+
+export default function ResultView({ job, firebaseReady, onArchived }) {
   const [events, setEvents] = useState(null)
   const [settings, setSettings] = useState(DEFAULTS)
   const [playhead, setPlayhead] = useState(0)
@@ -18,17 +30,32 @@ export default function ResultView({ job, firebaseReady }) {
   const [usb, setUsb] = useState(null)
   const [usbSaving, setUsbSaving] = useState(false)
   const [usbResult, setUsbResult] = useState(null)
+  const [drives, setDrives] = useState([])
+  const [driveSel, setDriveSel] = useState('')
+  const [exporting, setExporting] = useState(false)
+  const [exportResult, setExportResult] = useState(null)
+  const [dirty, setDirty] = useState(false)
+  const [savingEdits, setSavingEdits] = useState(false)
+  const [trimStart, setTrimStart] = useState(job.trimStartSec || 0)
+  const [trimEnd, setTrimEnd] = useState(
+    job.trimEndSec == null ? null : job.trimEndSec)
+  const [trimming, setTrimming] = useState(false)
+  const [audioVer, setAudioVer] = useState(0)
   const stemRef = useRef(null)
   const accompRef = useRef(null)
   const playerRef = useRef(null)
+  const usbRootRef = useRef(null)
 
-  const trimStart = job.trimStartSec || 0
   const encDelay = (job.encoderDelayMs || 0) / 1000
+  // drive picked in the select, else the only/first drive present
+  const selDrive = drives.length
+    ? (drives.find(function (d) { return d.root === driveSel }) || drives[0])
+    : null
 
   useEffect(function () {
     let alive = true
     getEvents(job.id).then(function (ev) {
-      if (alive) setEvents(ev)
+      if (alive) setEvents(tagIds(ev))
     }).catch(function (e) {
       console.error(e)
     })
@@ -37,6 +64,96 @@ export default function ResultView({ job, firebaseReady }) {
       if (playerRef.current) playerRef.current.stop()
     }
   }, [job.id])
+
+  function handleEdit(next) {
+    setEvents(next)
+    setDirty(true)
+  }
+
+  // Scrub: dragging the playhead in the editor seeks the audio (stem on the
+  // original timeline, accompaniment shifted by the trim). setPlayhead moves
+  // the line immediately even while paused.
+  function handleSeek(t) {
+    setPlayhead(t)
+    const stem = stemRef.current
+    const acc = accompRef.current
+    if (stem) { try { stem.currentTime = t } catch (e) { /* not seekable yet */ } }
+    if (acc) { try { acc.currentTime = Math.max(0, t - trimStart) } catch (e) { /* not seekable yet */ } }
+  }
+
+  // Trim front/end — destructive. Backend deletes events outside the window,
+  // shifts the rest to start at 0, and cuts the MP3 + piano stem to match, so
+  // the dead space is truly gone and everything stays locked. Reload the
+  // rewritten events and bump audioVer so both <audio> elements re-fetch.
+  async function handleApplyTrim(start, end) {
+    // Persist any unsaved note edits first — the backend trims events.json.
+    if (dirty) {
+      try {
+        await saveEvents(job.id, events)
+      } catch (e) {
+        alert('Save your edits before trimming failed: ' + e.message)
+        return
+      }
+    }
+    setTrimming(true)
+    try {
+      const updated = await trimJob(job.id, start, end)
+      const ev = await getEvents(job.id)
+      setEvents(tagIds(ev))
+      setTrimStart(0)
+      setTrimEnd(null)
+      setPlayhead(0)
+      setDirty(false)
+      job.trimStartSec = 0
+      job.trimEndSec = null
+      job.encoderDelayMs = updated.encoderDelayMs
+      job.noteCount = updated.noteCount
+      job.pedalCount = updated.pedalCount
+      setAudioVer(function (v) { return v + 1 })
+    } catch (e) {
+      alert('Trim failed: ' + e.message)
+    } finally {
+      setTrimming(false)
+    }
+  }
+
+  async function handleSaveEdits() {
+    setSavingEdits(true)
+    try {
+      await saveEvents(job.id, events)
+      setDirty(false)
+    } catch (e) {
+      alert('Saving edits failed: ' + e.message)
+    } finally {
+      setSavingEdits(false)
+    }
+  }
+
+  async function handleResetEvents() {
+    if (!window.confirm(
+      'Throw away ALL edits and restore the original transcription?')) return
+    try {
+      const ev = await resetEvents(job.id)
+      setEvents(tagIds(ev))
+      setDirty(false)
+      // reset may also restore a trimmed stem/accompaniment to full length
+      setTrimStart(0)
+      setTrimEnd(null)
+      setPlayhead(0)
+      job.trimStartSec = 0
+      job.trimEndSec = null
+      setAudioVer(function (v) { return v + 1 })
+    } catch (e) {
+      // 409 = never saved edits; local-only edits just reload from server
+      try {
+        const ev = await getEvents(job.id)
+        setEvents(tagIds(ev))
+        setDirty(false)
+      } catch (e2) {
+        alert('Reset failed: ' + e2.message)
+      }
+    }
+  }
 
   useEffect(function () {
     let raf = null
@@ -56,14 +173,33 @@ export default function ResultView({ job, firebaseReady }) {
     return function () { cancelAnimationFrame(raf) }
   }, [events, trimStart])
 
+  // Poll for drives every 5s so buttons appear the moment a stick is
+  // plugged in. The cheap /drives listing runs every tick; the expensive
+  // Gotek slot scan only runs when the stick first shows up (or changes).
   useEffect(function () {
     let alive = true
-    getUsbStatus().then(function (s) {
-      if (alive) setUsb(s)
-    }).catch(function () {
-      if (alive) setUsb({ found: false })
-    })
-    return function () { alive = false }
+    async function poll() {
+      try {
+        const d = await getDrives()
+        if (!alive) return
+        setDrives(d.removable)
+        if (d.gotekRoot) {
+          if (usbRootRef.current !== d.gotekRoot) {
+            usbRootRef.current = d.gotekRoot
+            const s = await getUsbStatus()
+            if (alive) setUsb(s)
+          }
+        } else {
+          usbRootRef.current = null
+          setUsb(null)
+        }
+      } catch (e) {
+        // backend not up yet / mid-restart; try again next tick
+      }
+    }
+    poll()
+    const t = setInterval(poll, 5000)
+    return function () { alive = false; clearInterval(t) }
   }, [job.id])
 
   async function handleUsbSave() {
@@ -72,10 +208,65 @@ export default function ResultView({ job, firebaseReady }) {
     try {
       const r = await saveToUsb(job.id, settings)
       setUsbResult(r)
+      const s = await getUsbStatus()  // slot just filled; refresh next-free
+      setUsb(s)
     } catch (e) {
       alert('USB save failed: ' + e.message)
     } finally {
       setUsbSaving(false)
+    }
+  }
+
+  // Native save-as dialog (Chrome/Edge/Electron). Falls back to a plain
+  // browser download where the File System Access API is missing.
+  async function saveAsDialog(url, suggestedName, desc, mime, ext) {
+    if (!window.showSaveFilePicker) {
+      const a = document.createElement('a')
+      a.href = url
+      a.download = suggestedName
+      a.click()
+      return
+    }
+    let handle
+    try {
+      const accept = {}
+      accept[mime] = [ext]
+      handle = await window.showSaveFilePicker({
+        suggestedName: suggestedName,
+        types: [{ description: desc, accept: accept }]
+      })
+    } catch (e) {
+      if (e.name === 'AbortError') return // user cancelled the dialog
+      // picker blocked (permissions etc.) — plain download instead
+      const a = document.createElement('a')
+      a.href = url
+      a.download = suggestedName
+      a.click()
+      return
+    }
+    try {
+      const res = await fetch(url)
+      if (!res.ok) throw new Error('render failed (' + res.status + ')')
+      const blob = await res.blob()
+      const w = await handle.createWritable()
+      await w.write(blob)
+      await w.close()
+      setExportResult({ filename: handle.name, path: null })
+    } catch (e) {
+      alert('Save failed: ' + e.message)
+    }
+  }
+
+  async function handleExportHfe(destRoot) {
+    setExporting(true)
+    setExportResult(null)
+    try {
+      const r = await exportToDrive(job.id, 'hfe', destRoot, settings)
+      setExportResult(r)
+    } catch (e) {
+      alert('Save to drive failed: ' + e.message)
+    } finally {
+      setExporting(false)
     }
   }
 
@@ -116,6 +307,32 @@ export default function ResultView({ job, firebaseReady }) {
     }
   }
 
+  // Piano-only playback for songs with no accompaniment (library imports,
+  // piano-only jobs). Clocks off the AudioContext and drives the playhead so
+  // you can hear the notes — and A/B the sustain cap — with no audio track.
+  async function playPiano() {
+    if (previewing) {
+      stopPreview()
+      return
+    }
+    if (!events) return
+    if (stemRef.current) stemRef.current.pause()
+    const startAt = (playhead > 0) ? playhead : 0
+    const player = createNotePlayer(
+      events.notes, settings,
+      function (t) { setPlayhead(t) },
+      function () { stopPreview() },
+      startAt)
+    playerRef.current = player
+    setPreviewing(true)
+    try {
+      await player.start()
+    } catch (e) {
+      alert('Playback failed: ' + e.message)
+      stopPreview()
+    }
+  }
+
   useEffect(function () {
     const acc = accompRef.current
     if (!acc) return
@@ -129,24 +346,46 @@ export default function ResultView({ job, firebaseReady }) {
   }, [events])
 
   async function handleSave() {
+    if (dirty && !window.confirm(
+      'You have unsaved edits. Move to library using the last SAVED version? ' +
+      'Hit Cancel, then "Save edits" first to include them.')) return
     setSaving(true)
     try {
       const b64 = await fetchMidiBase64(job.id, settings)
       if (b64.length > 900000) {
         alert('MIDI too large for the cloud library (>900KB). Download it instead.')
+        setSaving(false)
         return
       }
-      await saveSong({
+      // Keep the piano-removed accompaniment MP3 alongside the MIDI — that's the
+      // file the Disklavier plays through its speakers, already encoded by the
+      // pipeline (small, no re-transcode). Piano-only / library jobs have no
+      // accompaniment; those stay MIDI-only.
+      let mp3Blob = null
+      if (job.accompaniment) {
+        try {
+          const res = await fetch(audioUrl(job.id, 'accompaniment'))
+          if (res.ok) mp3Blob = await res.blob()
+        } catch (e) {
+          /* audio fetch failed — still archive the MIDI below */
+        }
+      }
+      const r = await saveSong({
         title: job.name,
-        noteCount: job.noteCount,
-        pedalCount: job.pedalCount,
+        noteCount: events ? events.notes.length : job.noteCount,
+        pedalCount: events ? events.pedals.length : job.pedalCount,
         settings: settings,
         midiBase64: b64
-      })
-      alert('Saved to library ✓')
+      }, mp3Blob)
+      if (mp3Blob && !r.mp3Uploaded) {
+        alert('Saved the MIDI, but the source audio upload failed: ' +
+          (r.mp3Error || 'unknown error') +
+          '\nThe song is in the library without its MP3.')
+      }
+      // Saved: hand the job off to App, which drops it from the Convert tab.
+      if (onArchived) onArchived(job.id)
     } catch (e) {
       alert('Save failed: ' + e.message)
-    } finally {
       setSaving(false)
     }
   }
@@ -155,22 +394,35 @@ export default function ResultView({ job, firebaseReady }) {
     <div className="card">
       <h3>{job.name} — preview & export</h3>
 
-      <div className="players">
-        <div className="player">
-          <label>Extracted piano stem (what the transcription heard)</label>
-          <audio ref={stemRef} controls src={audioUrl(job.id, 'piano')} />
+      {job.fromLibrary && (
+        <div className="notice">
+          Imported from the library — <strong>MIDI only</strong> (the
+          accompaniment was dropped when archived). Use <strong>▶ Play piano
+          (synth)</strong> below to hear the notes and A/B the sustain cap, edit
+          or cap them, then re-export the .mid / E-SEQ / USB.
         </div>
+      )}
+
+      <div className="players">
+        {job.pianoStem && (
+          <div className="player">
+            <label>Extracted piano stem (what the transcription heard)</label>
+            <audio ref={stemRef} controls
+              src={audioUrl(job.id, 'piano') + '?v=' + audioVer} />
+          </div>
+        )}
         {job.accompaniment ? (
           <div className="player">
             <label>Accompaniment, piano removed (plays through ENSPIRE speakers)</label>
-            <audio ref={accompRef} controls src={audioUrl(job.id, 'accompaniment')} />
+            <audio ref={accompRef} controls
+              src={audioUrl(job.id, 'accompaniment') + '?v=' + audioVer} />
           </div>
-        ) : (
+        ) : (!job.fromLibrary && (
           <div className="player">
             <label>Original MP3 (re-convert to get a piano-less accompaniment)</label>
             <audio controls src={audioUrl(job.id, 'original')} />
           </div>
-        )}
+        ))}
       </div>
 
       {job.accompaniment && (
@@ -186,9 +438,38 @@ export default function ResultView({ job, firebaseReady }) {
         </div>
       )}
 
+      {!job.accompaniment && (
+        <div className="actions" style={{ marginTop: 10 }}>
+          <button className={previewing ? 'ghost' : 'primary'} onClick={playPiano}
+            disabled={!events}>
+            {previewing ? '■ Stop' : '▶ Play piano (synth)'}
+          </button>
+          <span className="meta" style={{ alignSelf: 'center' }}>
+            No accompaniment — plays the notes alone through the synth using the
+            current settings. Toggle the sustain cap / release and replay to hear
+            before vs after. Drag the playhead first to start mid-song.
+          </span>
+        </div>
+      )}
+
       {events
-        ? <PianoRoll events={events} playheadSec={playhead} />
+        ? <NoteEditor events={events} onChange={handleEdit}
+            onSave={handleSaveEdits} onReset={handleResetEvents}
+            dirty={dirty} saving={savingEdits} playheadSec={playhead}
+            onSeek={handleSeek}
+            trimStart={trimStart} trimEnd={trimEnd}
+            onApplyTrim={handleApplyTrim} trimming={trimming}
+            hasAccompaniment={!!job.accompaniment}
+            onPlay={job.accompaniment ? playBoth : playPiano}
+            previewing={previewing} />
         : <div className="meta">Loading note data…</div>}
+
+      {dirty && (
+        <div className="notice warn">
+          Unsaved edits — the downloads and USB save below still use the last
+          saved version. Hit <strong>Save edits</strong> in the editor first.
+        </div>
+      )}
 
       <div className="controls">
         <div className="control">
@@ -229,6 +510,32 @@ export default function ResultView({ job, firebaseReady }) {
           <div className="hint">
             0 is already synced. Piano ahead of the band → go negative; piano
             behind → positive. Move in 50 ms steps, re-download, re-test.
+          </div>
+        </div>
+        <div className="control">
+          <label>Note release — <span className="val">{settings.releaseMs} ms</span></label>
+          <input type="range" min="0" max="400" step="10" value={settings.releaseMs}
+            onChange={function (e) { set('releaseMs', Number(e.target.value)) }} />
+          <div className="hint">
+            Trims the tail off every note so keys don't stay depressed too long
+            (the transcriber marks note-off at full decay, not finger-lift). 0 =
+            as transcribed. Raise for tighter, more staccato playing; if notes
+            start cutting off unnaturally, back it down or turn sustain pedal on.
+          </div>
+        </div>
+        <div className="control">
+          <div className="check">
+            <input id="capSustain" type="checkbox" checked={settings.capSustain}
+              onChange={function (e) { set('capSustain', e.target.checked) }} />
+            <label htmlFor="capSustain" style={{ margin: 0 }}>
+              Cap over-long notes to physical piano sustain
+            </label>
+          </div>
+          <div className="hint">
+            Clamps any note the transcriber marked longer than a real string
+            could ring — bass ~30s down to ~1s in the top octave. Removes
+            stuck-key artifacts without shortening genuine held notes. Leave on
+            unless you want the raw, uncapped durations.
           </div>
         </div>
         <div className="control">
@@ -290,17 +597,70 @@ export default function ResultView({ job, firebaseReady }) {
           </button>
         )}
         {firebaseReady && (
-          <button className="ghost" onClick={handleSave} disabled={saving}>
-            {saving ? 'Saving…' : '☁ Save to library'}
+          <button className="primary" onClick={handleSave} disabled={saving}>
+            {saving ? 'Moving…' : '☁ Move to library'}
           </button>
+        )}
+      </div>
+
+      <div className="actions" style={{ marginTop: 10 }}>
+        <button className="ghost" onClick={function () {
+          saveAsDialog(midiUrl(job.id, settings), job.name + '.mid',
+            'MIDI file', 'audio/midi', '.mid')
+        }}>
+          💾 Save .mid as…
+        </button>
+        {job.accompaniment && (
+          <button className="ghost" onClick={function () {
+            saveAsDialog(audioUrl(job.id, 'accompaniment'),
+              job.name + ' (no piano).mp3', 'MP3 audio', 'audio/mpeg', '.mp3')
+          }}>
+            💾 Save .mp3 as…
+          </button>
+        )}
+        {drives.length > 1 && (
+          <select value={selDrive ? selDrive.root : ''}
+            onChange={function (e) { setDriveSel(e.target.value) }}>
+            {drives.map(function (d) {
+              return (
+                <option key={d.root} value={d.root}>
+                  {d.root + ' — ' + d.label}
+                </option>
+              )
+            })}
+          </select>
+        )}
+        {selDrive ? (
+          <button className="ghost" disabled={exporting}
+            onClick={function () { handleExportHfe(selDrive.root) }}>
+            {exporting
+              ? 'Writing…'
+              : '💾 .hfe → ' + selDrive.root + ' (' + selDrive.label + ')'}
+          </button>
+        ) : (
+          <span className="meta" style={{ alignSelf: 'center' }}>
+            No USB drive detected — plug one in and save buttons appear here.
+          </span>
         )}
       </div>
 
       {usbResult && (
         <div className="notice" style={{ borderColor: 'var(--green)' }}>
           ✓ Written to <strong>{usbResult.filename}</strong> on {usbResult.drive} —
-          on the piano, select disk <strong>{usbResult.slot}</strong> on the
-          Nalbantov display and press play.
+          fully flushed to the stick, safe to unplug now.
+          <br />
+          The Nalbantov scans the stick <strong>at power-on</strong>: after adding
+          a new disk, move the stick to the piano and <strong>power-cycle the
+          emulator/piano</strong> so it re-indexes, then select disk{' '}
+          <strong>{usbResult.slot}</strong> and press play. A freshly added slot
+          won't appear until that re-scan.
+        </div>
+      )}
+
+      {exportResult && (
+        <div className="notice" style={{ borderColor: 'var(--green)' }}>
+          ✓ Saved <strong>{exportResult.filename}</strong>
+          {exportResult.path ? ' to ' + exportResult.path : ''}
         </div>
       )}
 

@@ -1,8 +1,11 @@
 import { initializeApp } from 'firebase/app'
 import {
-  getFirestore, collection, addDoc, getDocs, deleteDoc, doc,
+  getFirestore, collection, addDoc, getDocs, deleteDoc, doc, updateDoc,
   query, orderBy, serverTimestamp
 } from 'firebase/firestore'
+import {
+  getStorage, ref as storageRef, uploadBytes, getDownloadURL, deleteObject
+} from 'firebase/storage'
 
 const config = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -16,24 +19,64 @@ const config = {
 export const firebaseReady = Boolean(config.apiKey && config.projectId)
 
 let db = null
+let storage = null
 if (firebaseReady) {
   const app = initializeApp(config)
   db = getFirestore(app)
+  // Storage holds the source MP3s — too big for a Firestore doc (1 MiB cap).
+  // Only usable if a storageBucket is set in the web config.
+  if (config.storageBucket) storage = getStorage(app)
+}
+
+function extFromType(type) {
+  if (type === 'audio/wav' || type === 'audio/x-wav') return '.wav'
+  if (type === 'audio/mp4' || type === 'audio/x-m4a') return '.m4a'
+  if (type === 'audio/flac' || type === 'audio/x-flac') return '.flac'
+  if (type === 'audio/ogg') return '.ogg'
+  return '.mp3'
 }
 
 const SONGS = 'songs'
+const FOLDERS = 'folders'
 
-export async function saveSong(song) {
+// Upload the source MP3 to Storage, then write the song doc (MIDI stays in
+// Firestore, the audio lives in Storage as a URL). If the audio upload fails
+// the song is still saved MIDI-only so the library isn't lost. Returns
+// { id, mp3Uploaded, mp3Error }.
+export async function saveSong(song, mp3Blob) {
   if (!db) throw new Error('Firebase not configured')
+  let mp3Url = null
+  let mp3Path = null
+  let mp3Error = null
+  if (mp3Blob && storage) {
+    try {
+      const ext = extFromType(mp3Blob.type)
+      mp3Path = 'songs/' + crypto.randomUUID() + '/source' + ext
+      const dest = storageRef(storage, mp3Path)
+      await uploadBytes(dest, mp3Blob, {
+        contentType: mp3Blob.type || 'audio/mpeg'
+      })
+      mp3Url = await getDownloadURL(dest)
+    } catch (e) {
+      mp3Url = null
+      mp3Path = null
+      mp3Error = e.message || String(e)
+    }
+  } else if (mp3Blob && !storage) {
+    mp3Error = 'Storage bucket not configured (VITE_FIREBASE_STORAGE_BUCKET).'
+  }
   const ref = await addDoc(collection(db, SONGS), {
     title: song.title,
     noteCount: song.noteCount,
     pedalCount: song.pedalCount,
     settings: song.settings,
     midiBase64: song.midiBase64,
+    mp3Url: mp3Url,
+    mp3Path: mp3Path,
+    folder: song.folder || null,
     createdAt: serverTimestamp()
   })
-  return ref.id
+  return { id: ref.id, mp3Uploaded: Boolean(mp3Url), mp3Error: mp3Error }
 }
 
 export async function listSongs() {
@@ -49,9 +92,57 @@ export async function listSongs() {
   return out
 }
 
-export async function deleteSong(id) {
+export async function deleteSong(id, mp3Path) {
   if (!db) throw new Error('Firebase not configured')
+  // Delete the Storage object first; a missing/failed audio delete must not
+  // block removing the song doc (best-effort cleanup).
+  if (mp3Path && storage) {
+    try {
+      await deleteObject(storageRef(storage, mp3Path))
+    } catch (e) {
+      /* already gone or rules changed — drop the doc anyway */
+    }
+  }
   await deleteDoc(doc(db, SONGS, id))
+}
+
+export async function renameSong(id, title) {
+  if (!db) throw new Error('Firebase not configured')
+  await updateDoc(doc(db, SONGS, id), { title: title })
+}
+
+// Folders are identified by name (stored on each song's `folder` field). The
+// `folders` collection just persists names so empty folders survive reloads.
+export async function listFolders() {
+  if (!db) return []
+  const q = query(collection(db, FOLDERS), orderBy('name'))
+  const snap = await getDocs(q)
+  const out = []
+  snap.forEach(function (d) {
+    const data = d.data()
+    data.id = d.id
+    out.push(data)
+  })
+  return out
+}
+
+export async function createFolder(name) {
+  if (!db) throw new Error('Firebase not configured')
+  const ref = await addDoc(collection(db, FOLDERS), {
+    name: name,
+    createdAt: serverTimestamp()
+  })
+  return ref.id
+}
+
+export async function deleteFolder(id) {
+  if (!db) throw new Error('Firebase not configured')
+  await deleteDoc(doc(db, FOLDERS, id))
+}
+
+export async function setSongFolder(id, folder) {
+  if (!db) throw new Error('Firebase not configured')
+  await updateDoc(doc(db, SONGS, id), { folder: folder || null })
 }
 
 export function downloadMidiBase64(b64, filename) {
