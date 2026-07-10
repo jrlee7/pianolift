@@ -153,6 +153,7 @@ export function createNotePlayer(notes, settings, onTime, onEnded, startSec) {
   let nextIdx = 0
   let stopped = false
   let anchor = 0        // AudioContext time that maps to song-time 0
+  let lastElapsed = 0
   const begin = startSec > 0 ? startSec : 0
 
   function stop() {
@@ -165,6 +166,9 @@ export function createNotePlayer(notes, settings, onTime, onEnded, startSec) {
   function tick() {
     if (stopped) return
     const elapsed = ctx.currentTime - anchor
+    // Seek-back (playhead dragged earlier): re-derive the schedule cursor.
+    if (elapsed < lastElapsed - 0.5) nextIdx = 0
+    lastElapsed = elapsed
     const horizon = elapsed + LOOKAHEAD
     while (nextIdx < notes.length) {
       const n = notes[nextIdx]
@@ -185,10 +189,20 @@ export function createNotePlayer(notes, settings, onTime, onEnded, startSec) {
       stopped = false
       // anchor so that ctx.currentTime - anchor == begin at t0
       anchor = ctx.currentTime + 0.1 - begin
+      lastElapsed = begin
       nextIdx = 0
       while (nextIdx < notes.length && notes[nextIdx].onset < begin) nextIdx++
       tick()
       timer = setInterval(tick, INTERVAL)
+    },
+    // Move the play position live (dragging the playhead): re-anchor so
+    // song-time == sec now, and let tick reschedule from there.
+    seek(sec) {
+      const b = sec > 0 ? sec : 0
+      anchor = ctx.currentTime - b
+      lastElapsed = b
+      nextIdx = 0
+      while (nextIdx < notes.length && notes[nextIdx].onset < b) nextIdx++
     },
     stop
   }

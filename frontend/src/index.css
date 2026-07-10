@@ -126,11 +126,20 @@ canvas { display: block; }
 .editor-stage-row { display: flex; align-items: flex-start; gap: 12px; }
 .editor-vstage { display: flex; flex-direction: column; max-width: 100%; }
 .editor-side {
-  display: flex; flex-direction: column; gap: 8px;
-  width: 150px; position: sticky; top: 8px;
+  display: flex; flex-direction: column; gap: 6px;
+  width: 172px; position: sticky; top: 8px;
 }
 .editor-side button { width: 100%; }
-.editor-side-hint { color: var(--muted); font-size: 12px; line-height: 1.35; }
+.editor-side-row { display: flex; gap: 6px; }
+.editor-side-row button { flex: 1; }
+.editor-side-title {
+  color: var(--muted); font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em; margin-top: 8px;
+}
+.editor-side-title:first-child { margin-top: 0; }
+.editor-side-hint {
+  color: var(--muted); font-size: 12px; line-height: 1.35; margin-top: 8px;
+}
 .editor-vwrap {
   height: 440px; overflow-y: auto; overflow-x: auto;
   margin-top: 0; border-radius: 10px 10px 0 0;

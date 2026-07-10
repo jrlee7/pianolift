@@ -79,6 +79,10 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
     const acc = accompRef.current
     if (stem) { try { stem.currentTime = t } catch (e) { /* not seekable yet */ } }
     if (acc) { try { acc.currentTime = Math.max(0, t - trimStart) } catch (e) { /* not seekable yet */ } }
+    // Piano-only synth preview: re-anchor so playback continues from the new
+    // spot. (Accompaniment preview follows the <audio> clock above already.)
+    const p = playerRef.current
+    if (p && p.seek) p.seek(t)
   }
 
   // Trim front/end — destructive. Backend deletes events outside the window,
@@ -285,11 +289,9 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
     setPreviewing(false)
   }
 
-  async function playBoth() {
-    if (previewing) {
-      stopPreview()
-      return
-    }
+  // Synth + accompaniment from the top. createPreviewPlayer.start() resets the
+  // <audio> to 0, so this always begins at the beginning.
+  function startBoth() {
     if (!events || !accompRef.current) return
     if (stemRef.current) stemRef.current.pause()
     // Same math the backend bakes into the real MIDI render:
@@ -299,25 +301,26 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
       events.notes, settings, accompRef.current, effOffset)
     playerRef.current = player
     setPreviewing(true)
-    try {
-      await player.start()
-    } catch (e) {
+    player.start().catch(function (e) {
       alert('Playback failed: ' + e.message)
       stopPreview()
+    })
+  }
+
+  async function playBoth() {
+    if (previewing) {
+      stopPreview()
+      return
     }
+    startBoth()
   }
 
   // Piano-only playback for songs with no accompaniment (library imports,
   // piano-only jobs). Clocks off the AudioContext and drives the playhead so
   // you can hear the notes — and A/B the sustain cap — with no audio track.
-  async function playPiano() {
-    if (previewing) {
-      stopPreview()
-      return
-    }
+  function startPianoAt(startAt) {
     if (!events) return
     if (stemRef.current) stemRef.current.pause()
-    const startAt = (playhead > 0) ? playhead : 0
     const player = createNotePlayer(
       events.notes, settings,
       function (t) { setPlayhead(t) },
@@ -325,11 +328,30 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
       startAt)
     playerRef.current = player
     setPreviewing(true)
-    try {
-      await player.start()
-    } catch (e) {
+    player.start().catch(function (e) {
       alert('Playback failed: ' + e.message)
       stopPreview()
+    })
+  }
+
+  async function playPiano() {
+    if (previewing) {
+      stopPreview()
+      return
+    }
+    startPianoAt((playhead > 0) ? playhead : 0)
+  }
+
+  // Restart from the very beginning regardless of where the start bar sits.
+  function handleRestart() {
+    stopPreview()
+    setPlayhead(0)
+    if (job.accompaniment) {
+      const acc = accompRef.current
+      if (acc) { try { acc.currentTime = 0 } catch (e) { /* not seekable yet */ } }
+      startBoth()
+    } else {
+      startPianoAt(0)
     }
   }
 
@@ -461,7 +483,7 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
             onApplyTrim={handleApplyTrim} trimming={trimming}
             hasAccompaniment={!!job.accompaniment}
             onPlay={job.accompaniment ? playBoth : playPiano}
-            previewing={previewing} />
+            onRestart={handleRestart} previewing={previewing} />
         : <div className="meta">Loading note data…</div>}
 
       {dirty && (

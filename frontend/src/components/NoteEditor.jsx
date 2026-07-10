@@ -129,7 +129,7 @@ function mergePedals(pedals) {
 export default function NoteEditor({
   events, onChange, onSave, onReset, dirty, saving, playheadSec, onSeek,
   trimStart, trimEnd, onApplyTrim, trimming, hasAccompaniment,
-  onPlay, previewing
+  onPlay, onRestart, previewing
 }) {
   const [pxPerSec, setPxPerSec] = useState(40)
   const [tool, setTool] = useState('select')
@@ -225,6 +225,14 @@ export default function NoteEditor({
 
   function clearSelection() {
     setSel({ notes: new Set(), pedals: new Set() })
+    setGhostMsg('')
+  }
+
+  function selectAll() {
+    const ev = eventsRef.current
+    const ids = new Set()
+    for (let i = 0; i < ev.notes.length; i++) ids.add(ev.notes[i]._id)
+    setSel({ notes: ids, pedals: new Set() })
     setGhostMsg('')
   }
 
@@ -1133,10 +1141,51 @@ export default function NoteEditor({
       </div>
         {onPlay && (
           <div className="editor-side">
+            <div className="editor-side-title">Playback</div>
             <button className={previewing ? 'ghost' : 'primary'} onClick={onPlay}
               title="Play from the start bar (click the roll to move it)">
-              {previewing ? '■ Stop' : '▶ Play'}
+              {previewing ? '■ Stop' : '▶ Play from bar'}
             </button>
+            {onRestart && (
+              <button className="tool" onClick={onRestart}
+                title="Play from the very beginning">
+                ⏮ Restart
+              </button>
+            )}
+            {onSeek && (
+              <button className="tool" onClick={function () { onSeek(0) }}
+                title="Move the start bar to the beginning (no play)">
+                ⤒ Bar to start
+              </button>
+            )}
+
+            <div className="editor-side-title">Clean up</div>
+            <button className="tool" onClick={findGhosts}
+              title="Select faint/short ghost notes for review, then Delete">
+              👻 Find ghosts
+            </button>
+            <button className="tool" onClick={capLongNotes}
+              title="Shorten notes held longer than a real string can ring">
+              ⭰ Cap long notes
+            </button>
+            <button className="tool" onClick={selectAll}
+              title="Select every note">
+              ▦ Select all
+            </button>
+            <button className="tool danger" disabled={selCount === 0}
+              onClick={deleteSelected}
+              title="Delete the selected notes / pedals (Del)">
+              🗑 Delete{selCount > 0 ? ' (' + selCount + ')' : ''}
+            </button>
+
+            <div className="editor-side-title">History</div>
+            <div className="editor-side-row">
+              <button className="tool" disabled={!canUndo} onClick={undo}
+                title="Undo (Ctrl+Z)">↶ Undo</button>
+              <button className="tool" disabled={!canRedo} onClick={redo}
+                title="Redo (Ctrl+Y)">↷ Redo</button>
+            </div>
+
             <span className="editor-side-hint">
               Click anywhere on the roll to move the start bar, then Play.
             </span>
