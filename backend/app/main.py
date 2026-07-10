@@ -433,9 +433,11 @@ def save_events(job_id: str, payload: dict = Body(...)):
 def verify_job(job_id: str, deep: bool = False):
     """Run the spectral verification pass (ghost-note removal + over-held
     offset trimming, see note_verify) against the job's piano stem — for
-    songs converted before the pipeline did this itself. Deterministic:
-    a second run on the same song finds nothing new, and `verified` on the
-    job records that it's been done so the UI can stop offering it. The
+    songs converted before the pipeline did this itself. Repeated runs
+    converge fast — spectral features are measured over the (possibly
+    already-trimmed) note span, so a second pass may catch a few more weak
+    notes, a third essentially none. `verified` on the job records that
+    it's been done so the UI can stop offering it. The
     pre-cleanup events are kept via the same events_original.json backup
     the editor uses, so Reset to original still restores them.
 

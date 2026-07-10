@@ -55,12 +55,22 @@ _ATTACK_FRAMES = 4      # ~93ms windows around the onset for the rise test
 # Mix cross-check: a stem note counts as confirmed when the transcription
 # of the ORIGINAL mix contains the same pitch within this onset window.
 # The piano in the mix has no separation artifacts, so confirmation is
-# strong evidence the note is real; absence is only suspicion (the note
-# may be masked by other instruments there), so unconfirmed notes are not
-# dropped outright — they face a stricter spectral bar than the base rule.
+# strong evidence the note is real; absence is only suspicion — measured
+# on a piano+cello track, 21% of real stem notes went unconfirmed purely
+# because the other instrument masked them in the mix, with median
+# spectral score 67 (clearly real). Unconfirmed notes therefore face a
+# stricter spectral bar than the base rule, never outright deletion.
+# The window is insensitive between 0.05 and 0.12 on the same data.
 MATCH_WINDOW_SEC = 0.08
-UNCONF_SCORE_MAX = 3.0
-UNCONF_RISE_MAX = 2.0
+UNCONF_SCORE_MAX = 5.0
+UNCONF_RISE_MAX = 3.0
+
+# Micro-note rule: a keystroke this short is mechanically impossible
+# (a Disklavier action can't articulate it) and at low spectral score is
+# always a transient artifact — measured examples sit at 6-15ms with
+# velocity 19-39 in cello-bleed register. Independent of confirmation.
+MICRO_DUR_SEC = 0.03
+MICRO_SCORE_MAX = 10.0
 
 
 def _cqt_mag(piano_wav):
@@ -161,6 +171,10 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None):
 
     kept = []
     for i, (n, (score, rise, b, f0, f1)) in enumerate(zip(notes, feats)):
+        if (n["offset"] - n["onset"] < MICRO_DUR_SEC
+                and score < MICRO_SCORE_MAX):
+            stats["ghosts"] += 1
+            continue
         if confirmed is None:
             is_ghost = score < GHOST_SCORE_MAX and rise < GHOST_RISE_MAX
         elif confirmed[i]:
