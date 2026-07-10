@@ -1,6 +1,7 @@
 """Processing pipeline: audio (MP3/WAV/M4A/...) -> piano stem
 (BS-Roformer-SW) -> note/pedal events (ByteDance high-resolution piano
-transcription) -> events.json + default MIDI.
+transcription) -> spectral verification against the stem (note_verify)
+-> events.json + default MIDI.
 
 Runs on CPU. Each stage reports progress through a callback so the API can
 expose it to the frontend.
@@ -11,7 +12,7 @@ import os
 import urllib.request
 import zipfile
 
-from . import midi_writer
+from . import midi_writer, note_verify
 
 # 6-stem model (vocals/drums/bass/guitar/piano/other). Piano SDR ~7.83 vs
 # ~2.23 for Demucs' htdemucs_6s -- Demucs' piano stem bleeds badly with
@@ -170,25 +171,16 @@ def encode_accompaniment(no_piano_wav, job_dir, progress_cb,
     return out, delay_ms
 
 
-def transcribe(piano_wav, progress_cb):
-    """Transcribe piano stem to note + pedal events (with velocities)."""
+def _load_transcriptor(progress_cb):
     # Imported lazily: heavy modules, and the checkpoint download happens
     # on first construction.
-    from piano_transcription_inference import PianoTranscription, sample_rate
-    import librosa
+    from piano_transcription_inference import PianoTranscription
 
-    progress_cb("transcribing", 5)
     _ensure_checkpoint(progress_cb)
-    # The package's own load_audio needs an audioread backend (ffmpeg),
-    # which Windows lacks; the stem is a plain wav so soundfile handles it.
-    audio, _ = librosa.load(piano_wav, sr=sample_rate, mono=True)
-    progress_cb("transcribing", 15)
-    transcriptor = PianoTranscription(
-        device="cpu", checkpoint_path=CHECKPOINT_PATH)
-    progress_cb("transcribing", 25)
-    result = transcriptor.transcribe(audio, None)
-    progress_cb("transcribing", 100)
+    return PianoTranscription(device="cpu", checkpoint_path=CHECKPOINT_PATH)
 
+
+def _events_from_result(result):
     notes = []
     for ev in result["est_note_events"]:
         notes.append({
@@ -206,6 +198,55 @@ def transcribe(piano_wav, progress_cb):
     notes.sort(key=lambda n: n["onset"])
     pedals.sort(key=lambda p: p["onset"])
     return notes, pedals
+
+
+def transcribe(piano_wav, progress_cb, mix_path=None):
+    """Transcribe piano stem to note + pedal events (with velocities).
+
+    With mix_path, the original (pre-separation) mix is transcribed too and
+    its note list returned as cross-check evidence for note_verify: the
+    piano in the mix has no separation artifacts, so a stem note with no
+    counterpart there is suspect. Non-piano instruments the model picks up
+    from the mix don't matter — they were never in the stem's list, so they
+    can't add notes, only confirm. Roughly doubles transcription time.
+    """
+    from piano_transcription_inference import sample_rate
+    import librosa
+
+    progress_cb("transcribing", 5)
+    transcriptor = _load_transcriptor(progress_cb)
+    # The package's own load_audio needs an audioread backend (ffmpeg),
+    # which Windows lacks; the stem is a plain wav so soundfile handles it.
+    audio, _ = librosa.load(piano_wav, sr=sample_rate, mono=True)
+    progress_cb("transcribing", 15)
+    result = transcriptor.transcribe(audio, None)
+    notes, pedals = _events_from_result(result)
+
+    mix_notes = None
+    if mix_path is not None:
+        progress_cb("transcribing", 55)
+        # Compressed inputs (mp3/m4a) decode through audioread+ffmpeg;
+        # separation always runs first and puts our ffmpeg on PATH.
+        mix_audio, _ = librosa.load(mix_path, sr=sample_rate, mono=True)
+        progress_cb("transcribing", 60)
+        mix_result = transcriptor.transcribe(mix_audio, None)
+        mix_notes, _ = _events_from_result(mix_result)
+
+    progress_cb("transcribing", 100)
+    return notes, pedals, mix_notes
+
+
+def transcribe_mix_notes(mix_path, progress_cb):
+    """Note list of the original mix only — cross-check evidence for a
+    retroactive deep clean-up of an already-converted job."""
+    from piano_transcription_inference import sample_rate
+    import librosa
+
+    _ensure_ffmpeg(progress_cb)  # compressed inputs need it; wav doesn't care
+    transcriptor = _load_transcriptor(progress_cb)
+    audio, _ = librosa.load(mix_path, sr=sample_rate, mono=True)
+    notes, _ = _events_from_result(transcriptor.transcribe(audio, None))
+    return notes
 
 
 def _decode_piano_only(audio_path, job_dir, progress_cb):
@@ -240,7 +281,16 @@ def run_job(job_dir, audio_path, progress_cb, piano_only=False):
             no_piano_wav, job_dir, progress_cb,
             trim_start=trim_start, trim_end=trim_end)
 
-    notes, pedals = transcribe(piano_wav, progress_cb)
+    # piano_only inputs ARE the mix, so there is nothing to cross-check.
+    notes, pedals, mix_notes = transcribe(
+        piano_wav, progress_cb, mix_path=None if piano_only else audio_path)
+
+    # The transcriber hallucinates notes from separation bleed and marks
+    # note-offs at final string damp; both are checked against the stem's
+    # own spectrogram (and the original mix's transcription, when there is
+    # one) and corrected before anything is persisted.
+    notes, pedals, verify_stats = note_verify.refine(
+        piano_wav, notes, pedals, progress_cb, mix_notes=mix_notes)
 
     events = {"notes": notes, "pedals": pedals}
     with open(os.path.join(job_dir, "events.json"), "w") as f:
@@ -261,4 +311,6 @@ def run_job(job_dir, audio_path, progress_cb, piano_only=False):
         "trimEndSec": trim_end,
         "noteCount": len(notes),
         "pedalCount": len(pedals),
+        "ghostCount": verify_stats["ghosts"],
+        "trimmedCount": verify_stats["trimmed"],
     }

@@ -1,4 +1,5 @@
-import { deleteJob } from '../api.js'
+import { useState } from 'react'
+import { deleteJob, verifyJob } from '../api.js'
 
 const STAGE_LABELS = {
   queued: 'Queued…',
@@ -6,6 +7,7 @@ const STAGE_LABELS = {
   separating: 'Extracting piano from mix (BS-Roformer-SW)…',
   encoding: 'Encoding piano-less accompaniment MP3…',
   transcribing: 'Transcribing notes, dynamics + pedal…',
+  verifying: 'Checking notes against the audio…',
   done: 'Ready'
 }
 
@@ -15,7 +17,8 @@ const STAGE_SPAN = {
   downloading: [0, 15],
   separating: [15, 50],
   encoding: [50, 55],
-  transcribing: [55, 100]
+  transcribing: [55, 92],
+  verifying: [92, 100]
 }
 
 function barWidth(stage, progress) {
@@ -24,8 +27,28 @@ function barWidth(stage, progress) {
   return span[0] + (span[1] - span[0]) * progress / 100
 }
 
-export default function JobCard({ job, open, onToggle, onDeleted }) {
+export default function JobCard({ job, open, onToggle, onDeleted, onCleaned }) {
   const stageLabel = STAGE_LABELS[job.stage] || job.stage
+  const [cleaning, setCleaning] = useState(false)
+  // Songs converted before the pipeline verified notes against the audio
+  // can have it run retroactively — needs the piano stem on disk, so
+  // library imports (MIDI only) don't qualify.
+  const canClean = job.status === 'done' && job.pianoStem && !job.verified
+
+  async function handleClean(e) {
+    e.stopPropagation()
+    setCleaning(true)
+    try {
+      const r = await verifyJob(job.id)
+      alert('Removed ' + r.ghostCount + ' ghost note' + (r.ghostCount === 1 ? '' : 's')
+        + ', trimmed ' + r.trimmedCount + ' over-held note ending' + (r.trimmedCount === 1 ? '' : 's')
+        + '. Reset to original in the editor undoes this.')
+      if (onCleaned) onCleaned()
+    } catch (err) {
+      alert(err.message)
+    }
+    setCleaning(false)
+  }
 
   async function handleDelete(e) {
     e.stopPropagation()
@@ -57,7 +80,9 @@ export default function JobCard({ job, open, onToggle, onDeleted }) {
         <div className="row" style={{ gap: 8 }}>
           {job.status === 'done' && (
             <span className="status done">
-              ✓ {job.noteCount} notes, {job.pedalCount} pedal events
+              ✓ {job.noteCount} notes
+              {job.ghostCount > 0 && ` (${job.ghostCount} ghost${job.ghostCount === 1 ? '' : 's'} removed)`}
+              , {job.pedalCount} pedal events
               {open ? ' — click to close' : ' — click to open'}
             </span>
           )}
@@ -66,6 +91,11 @@ export default function JobCard({ job, open, onToggle, onDeleted }) {
           )}
           {job.status === 'error' && (
             <span className="status error">✗ {job.error}</span>
+          )}
+          {canClean && (
+            <button className="ghost" disabled={cleaning} onClick={handleClean}>
+              {cleaning ? 'Cleaning…' : '✨ Clean up'}
+            </button>
           )}
           {job.status === 'processing' && (
             <button className="ghost danger" onClick={handleCancel}>Cancel</button>

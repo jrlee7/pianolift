@@ -84,6 +84,16 @@ export async function saveEvents(id, events) {
   return data
 }
 
+// Re-check a finished song's notes against its piano stem (ghost-note
+// removal + held-note trimming) — for songs converted before the pipeline
+// ran this pass itself. Safe to run once per song; a repeat finds nothing.
+export async function verifyJob(id) {
+  const res = await fetch(BASE + '/jobs/' + id + '/verify', { method: 'POST' })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail || 'Clean-up failed')
+  return data
+}
+
 export async function resetEvents(id) {
   const res = await fetch(BASE + '/jobs/' + id + '/events/reset', {
     method: 'POST'

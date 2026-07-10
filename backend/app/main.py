@@ -3,7 +3,7 @@
 Jobs live under backend/jobs/<id>/ :
   input.mp3      uploaded audio
   separated/     BS-Roformer-SW output (piano + no_piano stems)
-  events.json    transcribed notes + pedals (raw model output)
+  events.json    transcribed notes + pedals (spectrally verified)
   output.mid     default-settings MIDI render
   job.json       persisted job metadata/status
 """
@@ -24,7 +24,8 @@ from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import pipeline, midi_writer, eseq_writer, disk_writer, usb, job_runner
+from . import (pipeline, midi_writer, note_verify, eseq_writer, disk_writer,
+               usb, job_runner)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
@@ -175,6 +176,10 @@ def _process(job_id, kind, source, piano_only=False):
             job["progress"] = 100
             job["noteCount"] = result["noteCount"]
             job["pedalCount"] = result["pedalCount"]
+            job["ghostCount"] = result.get("ghostCount", 0)
+            # The pipeline already ran the spectral verification pass, so
+            # the Clean up button never needs to appear for this job.
+            job["verified"] = True
             job["pianoStem"] = os.path.relpath(result["pianoStem"], job_dir)
             job["accompaniment"] = (
                 os.path.relpath(result["accompaniment"], job_dir)
@@ -422,6 +427,73 @@ def save_events(job_id: str, payload: dict = Body(...)):
         job["edited"] = True
         _persist(job_id)
     return {"ok": True, "noteCount": len(notes), "pedalCount": len(pedals)}
+
+
+@app.post("/api/jobs/{job_id}/verify")
+def verify_job(job_id: str, deep: bool = False):
+    """Run the spectral verification pass (ghost-note removal + over-held
+    offset trimming, see note_verify) against the job's piano stem — for
+    songs converted before the pipeline did this itself. Deterministic:
+    a second run on the same song finds nothing new, and `verified` on the
+    job records that it's been done so the UI can stop offering it. The
+    pre-cleanup events are kept via the same events_original.json backup
+    the editor uses, so Reset to original still restores them.
+
+    deep=true additionally transcribes the original mix as cross-check
+    evidence (same as new conversions do in the pipeline) — minutes, not
+    seconds, and needs the source audio still on disk."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job.get("status") != "done":
+        raise HTTPException(409, "job not finished")
+    stem_rel = job.get("pianoStem")
+    if not stem_rel:
+        raise HTTPException(
+            409, "no piano stem kept for this song (library import) — "
+                 "nothing to check the notes against")
+    job_dir = _job_dir(job_id)
+    stem_path = os.path.join(job_dir, stem_rel)
+    if not os.path.exists(stem_path):
+        raise HTTPException(409, "piano stem file missing; re-convert instead")
+    events_path = os.path.join(job_dir, "events.json")
+    if not os.path.exists(events_path):
+        raise HTTPException(404, "events not ready")
+
+    mix_notes = None
+    if deep:
+        input_path = _input_path(job_id)
+        if not os.path.exists(input_path):
+            raise HTTPException(
+                409, "source audio missing; deep check needs the original mix")
+        mix_notes = pipeline.transcribe_mix_notes(
+            input_path, lambda stage, pct: None)
+        # Destructively trimmed jobs live on a 0-based timeline but the
+        # source audio was never cut — shift the mix onsets to match.
+        src_start = job.get("srcStartSec", 0.0) or 0.0
+        if src_start:
+            mix_notes = [dict(m, onset=round(m["onset"] - src_start, 4))
+                         for m in mix_notes]
+
+    with open(events_path) as f:
+        events = json.load(f)
+    notes, pedals, stats = note_verify.refine(
+        stem_path, events["notes"], events["pedals"], lambda stage, pct: None,
+        mix_notes=mix_notes)
+
+    original_path = os.path.join(job_dir, "events_original.json")
+    if not os.path.exists(original_path):
+        shutil.copyfile(events_path, original_path)
+    with open(events_path, "w") as f:
+        json.dump({"notes": notes, "pedals": pedals}, f)
+    with jobs_lock:
+        job["noteCount"] = len(notes)
+        job["pedalCount"] = len(pedals)
+        job["ghostCount"] = stats["ghosts"]
+        job["verified"] = True
+        _persist(job_id)
+    return {"noteCount": len(notes), "pedalCount": len(pedals),
+            "ghostCount": stats["ghosts"], "trimmedCount": stats["trimmed"]}
 
 
 @app.post("/api/jobs/{job_id}/events/reset")

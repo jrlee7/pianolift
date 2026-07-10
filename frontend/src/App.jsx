@@ -3,7 +3,7 @@ import UploadZone from './components/UploadZone.jsx'
 import JobCard from './components/JobCard.jsx'
 import ResultView from './components/ResultView.jsx'
 import LibraryView from './components/LibraryView.jsx'
-import { listJobs, uploadMp3, submitUrl, deleteJob } from './api.js'
+import { listJobs, uploadMp3, submitUrl, deleteJob, verifyJob } from './api.js'
 import { firebaseReady } from './firebase.js'
 
 export default function App() {
@@ -11,6 +11,7 @@ export default function App() {
   const [jobs, setJobs] = useState([])
   const [openJobId, setOpenJobId] = useState(null)
   const [backendUp, setBackendUp] = useState(true)
+  const [cleanAllBusy, setCleanAllBusy] = useState(null) // "3/15" while running
 
   const refresh = useCallback(async function () {
     try {
@@ -48,6 +49,36 @@ export default function App() {
       alert('Could not start download: ' + e.message)
     }
     refresh()
+  }
+
+  // Songs converted before the pipeline verified notes against the audio.
+  // Library imports have no stem to check against, so they never qualify.
+  const cleanable = jobs.filter(function (j) {
+    return j.status === 'done' && j.pianoStem && !j.verified
+  })
+
+  async function handleCleanAll() {
+    if (!confirm('Clean up ' + cleanable.length + ' song(s)? Removes ghost '
+      + 'notes and trims over-held notes — about 20 seconds per song. '
+      + 'Reset to original in the editor undoes it per song.')) return
+    let ghosts = 0
+    let trimmed = 0
+    const failed = []
+    for (let i = 0; i < cleanable.length; i++) {
+      setCleanAllBusy((i + 1) + '/' + cleanable.length)
+      try {
+        const r = await verifyJob(cleanable[i].id)
+        ghosts += r.ghostCount
+        trimmed += r.trimmedCount
+      } catch (e) {
+        failed.push(cleanable[i].name)
+      }
+      refresh()
+    }
+    setCleanAllBusy(null)
+    alert('Clean-up done: removed ' + ghosts + ' ghost notes, trimmed '
+      + trimmed + ' over-held note endings across ' + (cleanable.length - failed.length)
+      + ' songs.' + (failed.length ? ' Failed: ' + failed.join(', ') : ''))
   }
 
   // Library → editor: the imported job already lives in the backend, so jump
@@ -97,6 +128,17 @@ export default function App() {
             </div>
           )}
           <UploadZone onFiles={handleFiles} onUrl={handleUrl} />
+          {cleanable.length > 0 && (
+            <div className="row" style={{ margin: '12px 0' }}>
+              <button disabled={!!cleanAllBusy} onClick={handleCleanAll}>
+                {cleanAllBusy
+                  ? 'Cleaning ' + cleanAllBusy + '…'
+                  : '✨ Clean up ' + cleanable.length + ' song'
+                    + (cleanable.length === 1 ? '' : 's')
+                    + ' — remove ghost notes, fix held notes'}
+              </button>
+            </div>
+          )}
           {jobs.slice().reverse().map(function (job) {
             const isOpen = openJobId === job.id
             return (
@@ -108,6 +150,7 @@ export default function App() {
                     setOpenJobId(isOpen ? null : job.id)
                   }}
                   onDeleted={refresh}
+                  onCleaned={refresh}
                 />
                 {isOpen && job.status === 'done' && (
                   <ResultView
