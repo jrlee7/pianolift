@@ -90,10 +90,13 @@ def separate_piano(audio_path, job_dir, progress_cb):
     # boundary artifacts in the stem for ~2x separation time. Separation is
     # a fraction of total job time, and stem artifacts are precisely what
     # the transcriber hallucinates notes from, so the trade is worth it.
+    # On a GPU the same pass is ~10x faster, so push overlap further; 32 is
+    # deep into diminishing returns, anything higher is pure waste.
+    overlap = 32 if compute_device() == "cuda" else 16
     separator = Separator(
         output_dir=sep_out, output_format="WAV", model_file_dir=model_dir,
         mdxc_params={"segment_size": 256, "override_model_segment_size": False,
-                     "batch_size": 1, "overlap": 16, "pitch_shift": 0})
+                     "batch_size": 1, "overlap": overlap, "pitch_shift": 0})
     progress_cb("separating", 5)  # first run downloads a ~700MB checkpoint
     separator.load_model(model_filename=SEPARATION_MODEL)
     # separate() returns bare filenames, not joined with output_dir.
@@ -207,13 +210,25 @@ def encode_accompaniment(no_piano_wav, job_dir, progress_cb,
     return out, delay_ms
 
 
+def compute_device():
+    """"cuda" when a usable NVIDIA GPU + CUDA torch build are present,
+    else "cpu". A CPU-only torch wheel (this repo's default install)
+    reports cuda unavailable, so the CPU path needs no special casing —
+    installing the CUDA wheel on a GPU machine is the only switch.
+    audio-separator does its own equivalent detection for separation."""
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def _load_transcriptor(progress_cb):
     # Imported lazily: heavy modules, and the checkpoint download happens
     # on first construction.
     from piano_transcription_inference import PianoTranscription
 
     _ensure_checkpoint(progress_cb)
-    return PianoTranscription(device="cpu", checkpoint_path=CHECKPOINT_PATH)
+    return PianoTranscription(device=compute_device(),
+                              checkpoint_path=CHECKPOINT_PATH)
 
 
 def _events_from_result(result):

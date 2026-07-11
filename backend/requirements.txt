@@ -3,6 +3,14 @@ uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 # torchaudio >=2.9 drops built-in decoding (requires torchcodec+FFmpeg);
 # pin 2.6 which still ships the soundfile backend piano_transcription_inference relies on.
+#
+# GPU machines: the pipeline auto-detects CUDA at runtime (pipeline.
+# compute_device) — no code change needed, just install the CUDA builds
+# instead of these CPU wheels:
+#   pip install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#   pip install "audio-separator[gpu]>=0.44.3"   (instead of [cpu])
+# Everything (separation, both transcription engines) then runs on the
+# GPU, and separation automatically uses a higher-quality overlap.
 torch==2.6.0
 torchaudio==2.6.0
 # CPU-only piano source separation (BS-Roformer-SW, 6-stem). Piano SDR ~7.83

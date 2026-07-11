@@ -17,23 +17,26 @@ the ByteDance model there is nothing to download at runtime.
 import numpy as np
 
 _model = None  # loaded once per job process, reused for stem + any retries
+_device = None
 
 
 def _load_model():
-    global _model
+    global _model, _device
     if _model is not None:
         return _model
     import torch
     import moduleconf
     from importlib import resources
+    from . import pipeline
 
+    _device = pipeline.compute_device()
     weight = str(resources.files("transkun") / "pretrained" / "2.0.pt")
     conf_path = str(resources.files("transkun") / "pretrained" / "2.0.conf")
     conf_mgr = moduleconf.parseFromFile(conf_path)
     TransKun = conf_mgr["Model"].module.TransKun
     conf = conf_mgr["Model"].config
-    checkpoint = torch.load(weight, map_location="cpu")
-    model = TransKun(conf=conf).to("cpu")
+    checkpoint = torch.load(weight, map_location=_device)
+    model = TransKun(conf=conf).to(_device)
     state = checkpoint.get("best_state_dict") or checkpoint.get("state_dict")
     model.load_state_dict(state, strict=False)
     model.eval()
@@ -63,7 +66,8 @@ def transcribe(wav_path):
         data = soxr.resample(data, sr, model.fs)
 
     with torch.no_grad():
-        raw = model.transcribe(torch.from_numpy(data), discardSecondHalf=False)
+        raw = model.transcribe(torch.from_numpy(data).to(_device),
+                               discardSecondHalf=False)
 
     notes, pedals = [], []
     for ev in raw:
