@@ -2,6 +2,7 @@
   "name": "pianolift",
   "private": true,
   "version": "0.1.0",
+  "repository": "github:jrlee7/pianolift",
   "type": "module",
   "main": "main.js",
   "homepage": "./",
