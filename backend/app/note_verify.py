@@ -72,6 +72,18 @@ UNCONF_RISE_MAX = 3.0
 MICRO_DUR_SEC = 0.03
 MICRO_SCORE_MAX = 10.0
 
+# Ensemble cross-check: same-pitch onsets from the two transcription
+# engines (ByteDance high-res + Transkun V2) within this window are the
+# same keystroke. Wider than DEDUPE (intra-engine double fire) because the
+# engines carry slightly different onset biases; still narrower than any
+# musical re-strike at one pitch.
+ALT_MATCH_WINDOW_SEC = 0.05
+
+# Two pedal lifts closer than this are re-pedal flutter (or an engine
+# double-fire), not a musical re-pedal — a pianist can't cycle the physical
+# pedal that fast, and the Disklavier certainly can't.
+PEDAL_GAP_MERGE_SEC = 0.05
+
 
 def _cqt_mag(piano_wav):
     import librosa
@@ -122,45 +134,155 @@ def _trim_offset(mag, note, b, f0, f1):
     return round(min(note["offset"], new_off), 4)
 
 
-def _confirmed_mask(notes, mix_notes):
-    """For each stem note: does the mix transcription have the same pitch
-    within MATCH_WINDOW_SEC of its onset?"""
+def _match_indices(notes, others, window):
+    """For each note: index of the nearest same-pitch onset in `others`
+    within `window` seconds, else None."""
     from bisect import bisect_left
 
     by_pitch = {}
-    for m in mix_notes:
-        by_pitch.setdefault(m["pitch"], []).append(m["onset"])
-    for onsets in by_pitch.values():
-        onsets.sort()
+    for idx, m in enumerate(others):
+        by_pitch.setdefault(m["pitch"], []).append((m["onset"], idx))
+    for lst in by_pitch.values():
+        lst.sort()
 
-    mask = []
+    matches = []
     for n in notes:
-        onsets = by_pitch.get(n["pitch"])
-        hit = False
-        if onsets:
+        cands = by_pitch.get(n["pitch"])
+        best = None
+        if cands:
+            onsets = [c[0] for c in cands]
             i = bisect_left(onsets, n["onset"])
             for j in (i - 1, i):
-                if (0 <= j < len(onsets)
-                        and abs(onsets[j] - n["onset"]) <= MATCH_WINDOW_SEC):
-                    hit = True
-                    break
-        mask.append(hit)
-    return mask
+                if 0 <= j < len(cands):
+                    dist = abs(cands[j][0] - n["onset"])
+                    if dist <= window and (best is None or dist < best[0]):
+                        best = (dist, cands[j][1])
+        matches.append(best[1] if best else None)
+    return matches
 
 
-def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None):
+def _confirmed_mask(notes, mix_notes):
+    """For each stem note: does the mix transcription have the same pitch
+    within MATCH_WINDOW_SEC of its onset?"""
+    return [m is not None
+            for m in _match_indices(notes, mix_notes, MATCH_WINDOW_SEC)]
+
+
+def _merge_alt(notes, alt_notes, evidence_only):
+    """Fold Transkun's transcription into the ByteDance note list.
+
+    Returns (merged_notes, evidence) where evidence[i] is "both" when the
+    two engines agree on the keystroke, "bd"/"alt" when only one saw it.
+    Agreed notes take Transkun's offset and velocity (its offsets mark key
+    release, measurably closer to truth than ByteDance's string-damp
+    times), and notes only Transkun heard join the list as candidates.
+
+    evidence_only=True (the retroactive clean-up path, where `notes` may
+    carry user edits) suppresses both — Transkun then only *confirms*
+    existing notes, never retimes them or adds new ones.
+    """
+    matches = _match_indices(notes, alt_notes, ALT_MATCH_WINDOW_SEC)
+    merged, evidence = [], []
+    matched_alt = set()
+    for n, m in zip(notes, matches):
+        if m is None:
+            merged.append(dict(n))
+            evidence.append("bd")
+            continue
+        matched_alt.add(m)
+        a = alt_notes[m]
+        out = dict(n)
+        if not evidence_only:
+            out["offset"] = round(
+                max(a["offset"], n["onset"] + MIN_NOTE_SEC), 4)
+            out["velocity"] = a["velocity"]
+        merged.append(out)
+        evidence.append("both")
+    if not evidence_only:
+        for idx, a in enumerate(alt_notes):
+            if idx not in matched_alt:
+                merged.append(dict(a))
+                evidence.append("alt")
+    order = sorted(range(len(merged)), key=lambda i: merged[i]["onset"])
+    return [merged[i] for i in order], [evidence[i] for i in order]
+
+
+def _refine_pedals(pedals, alt_pedals, notes, stats):
+    """Verify sustain-pedal segments instead of passing them through.
+
+    * silence rule -- a pedal segment overlapping no note interval at all
+      sustains nothing audible; it can only be separation-bleed fallout.
+    * cross-check rule -- with a second engine's pedal list in hand, a
+      segment neither engine agrees on AND containing no note onset is
+      dropped (a real "catch the chord" pedal always covers ringing notes
+      whose intervals overlap it, and near-always a fresh onset).
+    * flutter merge -- lifts shorter than PEDAL_GAP_MERGE_SEC between two
+      segments can't be played on the physical pedal; merged into one.
+    """
+    if not pedals:
+        return pedals
+
+    spans = [(n["onset"], n["offset"]) for n in notes]
+    spans.sort()
+
+    def overlaps_note(p):
+        return any(s < p["offset"] and e > p["onset"] for s, e in spans)
+
+    def onset_inside(p):
+        return any(p["onset"] <= s <= p["offset"] for s, _ in spans)
+
+    def alt_overlap(p):
+        return any(a["onset"] < p["offset"] and a["offset"] > p["onset"]
+                   for a in alt_pedals)
+
+    kept = []
+    for p in pedals:
+        if not overlaps_note(p):
+            stats["pedalsDropped"] += 1
+            continue
+        if (alt_pedals is not None and not alt_overlap(p)
+                and not onset_inside(p)):
+            stats["pedalsDropped"] += 1
+            continue
+        kept.append(dict(p))
+
+    merged = []
+    for p in sorted(kept, key=lambda p: p["onset"]):
+        if merged and p["onset"] - merged[-1]["offset"] < PEDAL_GAP_MERGE_SEC:
+            merged[-1]["offset"] = max(merged[-1]["offset"], p["offset"])
+            continue
+        merged.append(p)
+    return merged
+
+
+def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
+           alt_notes=None, alt_pedals=None, alt_evidence_only=False):
     """Drop ghost notes, trim over-held offsets, dedupe double-fired
-    onsets, declash same-pitch repeats. Pedals pass through untouched.
+    onsets, declash same-pitch repeats, verify pedals.
 
     mix_notes (transcription of the original, pre-separation mix) sharpens
     ghost detection: confirmed notes are never dropped, unconfirmed ones
     face the stricter UNCONF_* spectral bar instead of the base rule.
 
+    alt_notes/alt_pedals (Transkun V2's independent transcription of the
+    same stem) sharpen it further: a keystroke both engines report is
+    never a ghost and takes Transkun's offset + velocity; a keystroke only
+    one engine reports faces the stricter bar unless the mix confirms it.
+    alt_evidence_only=True (retroactive clean-up of possibly user-edited
+    events) keeps Transkun as pure confirmation evidence — no retiming, no
+    injected notes.
+
     Returns (notes, pedals, stats).
     """
-    stats = {"ghosts": 0, "trimmed": 0, "deduped": 0, "unconfirmed": 0}
-    if not notes:
+    stats = {"ghosts": 0, "trimmed": 0, "deduped": 0, "unconfirmed": 0,
+             "altOnly": 0, "pedalsDropped": 0}
+    if not notes and not alt_notes:
         return notes, pedals, stats
+
+    evidence = None
+    if alt_notes is not None:
+        notes, evidence = _merge_alt(notes, alt_notes, alt_evidence_only)
+        stats["altOnly"] = sum(1 for e in evidence if e == "alt")
 
     progress_cb("verifying", 0)
     mag = _cqt_mag(piano_wav)
@@ -175,11 +297,15 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None):
                 and score < MICRO_SCORE_MAX):
             stats["ghosts"] += 1
             continue
-        if confirmed is None:
-            is_ghost = score < GHOST_SCORE_MAX and rise < GHOST_RISE_MAX
-        elif confirmed[i]:
+        if evidence is not None and evidence[i] == "both":
             is_ghost = False
+        elif confirmed is not None and confirmed[i]:
+            is_ghost = False
+        elif evidence is None and confirmed is None:
+            # No cross-evidence at all: the original conservative rule.
+            is_ghost = score < GHOST_SCORE_MAX and rise < GHOST_RISE_MAX
         else:
+            # Single-engine note that no other evidence source backs up.
             stats["unconfirmed"] += 1
             is_ghost = score < UNCONF_SCORE_MAX and rise < UNCONF_RISE_MAX
         if is_ghost:
@@ -216,5 +342,6 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None):
             prev["offset"] = max(limit, prev["onset"] + MIN_NOTE_SEC)
 
     deduped.sort(key=lambda n: n["onset"])
+    pedals = _refine_pedals(pedals, alt_pedals, deduped, stats)
     progress_cb("verifying", 100)
     return deduped, pedals, stats

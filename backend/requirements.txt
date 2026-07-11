@@ -8,8 +8,14 @@ torchaudio==2.6.0
 # CPU-only piano source separation (BS-Roformer-SW, 6-stem). Piano SDR ~7.83
 # vs ~2.23 for Demucs' htdemucs_6s, which bled badly with sustained/harmonic
 # instruments (e.g. cello) into the piano stem.
-audio-separator[cpu]>=0.30
+audio-separator[cpu]>=0.44.3
 piano_transcription_inference>=0.0.6
+# Second transcription engine (semi-CRF, MIT; checkpoint ships in the
+# wheel). Ensemble with the ByteDance model: agreement confirms notes,
+# Transkun supplies key-release offsets + velocities (MAESTRO
+# onset+offset+velocity F1 93.1 vs ~80.9) and an independent sustain-pedal
+# detector used to verify pedal events.
+transkun>=2.0.1
 librosa>=0.10
 mido>=1.3
 soundfile>=0.12

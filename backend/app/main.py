@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from . import (pipeline, midi_writer, note_verify, eseq_writer, disk_writer,
+               transkun_engine,
                usb, job_runner)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -463,6 +464,7 @@ def verify_job(job_id: str, deep: bool = False):
         raise HTTPException(404, "events not ready")
 
     mix_notes = None
+    alt_notes, alt_pedals = None, None
     if deep:
         input_path = _input_path(job_id)
         if not os.path.exists(input_path):
@@ -476,12 +478,17 @@ def verify_job(job_id: str, deep: bool = False):
         if src_start:
             mix_notes = [dict(m, onset=round(m["onset"] - src_start, 4))
                          for m in mix_notes]
+        # Second-engine evidence on the stem itself (already on the job's
+        # timeline, no shift needed). Evidence-only: deep clean-up of
+        # possibly-edited events must not retime or add notes.
+        alt_notes, alt_pedals = transkun_engine.transcribe(stem_path)
 
     with open(events_path) as f:
         events = json.load(f)
     notes, pedals, stats = note_verify.refine(
         stem_path, events["notes"], events["pedals"], lambda stage, pct: None,
-        mix_notes=mix_notes)
+        mix_notes=mix_notes, alt_notes=alt_notes, alt_pedals=alt_pedals,
+        alt_evidence_only=True)
 
     original_path = os.path.join(job_dir, "events_original.json")
     if not os.path.exists(original_path):

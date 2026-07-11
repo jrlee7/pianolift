@@ -1,6 +1,7 @@
 """Processing pipeline: audio (MP3/WAV/M4A/...) -> piano stem
 (BS-Roformer-SW) -> note/pedal events (ByteDance high-resolution piano
-transcription) -> spectral verification against the stem (note_verify)
+transcription + Transkun V2 as an independent second engine) -> spectral
+verification and two-engine merge against the stem (note_verify)
 -> events.json + default MIDI.
 
 Runs on CPU. Each stage reports progress through a callback so the API can
@@ -12,7 +13,7 @@ import os
 import urllib.request
 import zipfile
 
-from . import midi_writer, note_verify
+from . import midi_writer, note_verify, transkun_engine
 
 # 6-stem model (vocals/drums/bass/guitar/piano/other). Piano SDR ~7.83 vs
 # ~2.23 for Demucs' htdemucs_6s -- Demucs' piano stem bleeds badly with
@@ -85,7 +86,14 @@ def separate_piano(audio_path, job_dir, progress_cb):
     _ensure_ffmpeg(progress_cb)
     sep_out = os.path.join(job_dir, "separated")
     model_dir = os.path.join(os.path.expanduser("~"), "audio_separator_models")
-    separator = Separator(output_dir=sep_out, output_format="WAV", model_file_dir=model_dir)
+    # overlap 16 (default 8) doubles prediction-window overlap: fewer
+    # boundary artifacts in the stem for ~2x separation time. Separation is
+    # a fraction of total job time, and stem artifacts are precisely what
+    # the transcriber hallucinates notes from, so the trade is worth it.
+    separator = Separator(
+        output_dir=sep_out, output_format="WAV", model_file_dir=model_dir,
+        mdxc_params={"segment_size": 256, "override_model_segment_size": False,
+                     "batch_size": 1, "overlap": 16, "pitch_shift": 0})
     progress_cb("separating", 5)  # first run downloads a ~700MB checkpoint
     separator.load_model(model_filename=SEPARATION_MODEL)
     # separate() returns bare filenames, not joined with output_dir.
@@ -228,8 +236,24 @@ def _events_from_result(result):
     return notes, pedals
 
 
+def _peak_normalize(audio):
+    """Lift a quiet stem to ~-0.4 dBFS peak. Both transcribers trained on
+    full-level MAESTRO recordings; a piano mixed low in the source comes out
+    of the separator quiet, and soft notes then sit below the models' onset
+    sensitivity. Never attenuates a hot stem by more than to 0.95."""
+    import numpy as np
+
+    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+    if peak > 0:
+        return audio * (0.95 / max(peak, 0.95))
+    return audio
+
+
 def transcribe(piano_wav, progress_cb, mix_path=None):
-    """Transcribe piano stem to note + pedal events (with velocities).
+    """Transcribe piano stem to note + pedal events (with velocities),
+    with two engines: ByteDance high-res (primary) and Transkun V2
+    (independent second witness; better offsets/velocities, own pedal
+    detector). note_verify merges the two.
 
     With mix_path, the original (pre-separation) mix is transcribed too and
     its note list returned as cross-check evidence for note_verify: the
@@ -237,6 +261,8 @@ def transcribe(piano_wav, progress_cb, mix_path=None):
     counterpart there is suspect. Non-piano instruments the model picks up
     from the mix don't matter — they were never in the stem's list, so they
     can't add notes, only confirm. Roughly doubles transcription time.
+
+    Returns (notes, pedals, mix_notes, alt_notes, alt_pedals).
     """
     from piano_transcription_inference import sample_rate
     import librosa
@@ -246,22 +272,27 @@ def transcribe(piano_wav, progress_cb, mix_path=None):
     # The package's own load_audio needs an audioread backend (ffmpeg),
     # which Windows lacks; the stem is a plain wav so soundfile handles it.
     audio, _ = librosa.load(piano_wav, sr=sample_rate, mono=True)
+    audio = _peak_normalize(audio)
     progress_cb("transcribing", 15)
     result = transcriptor.transcribe(audio, None)
     notes, pedals = _events_from_result(result)
 
+    # Second engine on the same stem (Transkun normalizes internally).
+    progress_cb("transcribing", 45)
+    alt_notes, alt_pedals = transkun_engine.transcribe(piano_wav)
+
     mix_notes = None
     if mix_path is not None:
-        progress_cb("transcribing", 55)
+        progress_cb("transcribing", 60)
         # Compressed inputs (mp3/m4a) decode through audioread+ffmpeg;
         # separation always runs first and puts our ffmpeg on PATH.
         mix_audio, _ = librosa.load(mix_path, sr=sample_rate, mono=True)
-        progress_cb("transcribing", 60)
+        progress_cb("transcribing", 65)
         mix_result = transcriptor.transcribe(mix_audio, None)
         mix_notes, _ = _events_from_result(mix_result)
 
     progress_cb("transcribing", 100)
-    return notes, pedals, mix_notes
+    return notes, pedals, mix_notes, alt_notes, alt_pedals
 
 
 def transcribe_mix_notes(mix_path, progress_cb):
@@ -316,15 +347,17 @@ def run_job(job_dir, audio_path, progress_cb, piano_only=False):
             accompaniment, encoder_delay_ms = None, 0.0
 
     # piano_only inputs ARE the mix, so there is nothing to cross-check.
-    notes, pedals, mix_notes = transcribe(
+    notes, pedals, mix_notes, alt_notes, alt_pedals = transcribe(
         piano_wav, progress_cb, mix_path=None if piano_only else audio_path)
 
     # The transcriber hallucinates notes from separation bleed and marks
     # note-offs at final string damp; both are checked against the stem's
-    # own spectrogram (and the original mix's transcription, when there is
-    # one) and corrected before anything is persisted.
+    # own spectrogram, the original mix's transcription (when there is
+    # one), and Transkun's independent transcription, then corrected
+    # before anything is persisted.
     notes, pedals, verify_stats = note_verify.refine(
-        piano_wav, notes, pedals, progress_cb, mix_notes=mix_notes)
+        piano_wav, notes, pedals, progress_cb, mix_notes=mix_notes,
+        alt_notes=alt_notes, alt_pedals=alt_pedals)
 
     events = {"notes": notes, "pedals": pedals}
     with open(os.path.join(job_dir, "events.json"), "w") as f:
