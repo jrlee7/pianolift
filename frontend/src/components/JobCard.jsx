@@ -27,7 +27,7 @@ function barWidth(stage, progress) {
   return span[0] + (span[1] - span[0]) * progress / 100
 }
 
-export default function JobCard({ job, open, onToggle, onDeleted, onCleaned }) {
+export default function JobCard({ job, open, onToggle, onDeleted, onCleaned, selected, onSelectToggle }) {
   const stageLabel = STAGE_LABELS[job.stage] || job.stage
   const [cleaning, setCleaning] = useState(false)
   // Songs converted before the pipeline verified notes against the audio
@@ -76,6 +76,16 @@ export default function JobCard({ job, open, onToggle, onDeleted, onCleaned }) {
   return (
     <div className="card" style={{ cursor: 'pointer' }} onClick={onToggle}>
       <div className="row">
+        {job.status === 'done' && onSelectToggle && (
+          <input
+            type="checkbox"
+            className="job-select"
+            checked={!!selected}
+            title="Select for bulk copy / move"
+            onClick={function (e) { e.stopPropagation() }}
+            onChange={function () { onSelectToggle(job.id) }}
+          />
+        )}
         <h3>{job.name}</h3>
         <div className="row" style={{ gap: 8 }}>
           {job.status === 'done' && (

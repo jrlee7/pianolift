@@ -117,6 +117,18 @@ export default function LibraryView({ onEdit }) {
     setImportingId(song.id)
     try {
       const job = await importFromLibrary(song.title, song.midiBase64)
+      // Moving back to Convert: drop the library copy so the song lives in one
+      // place only (no duplicates). Its stored MP3 goes too — editor imports are
+      // MIDI-only anyway. Delete before navigating so it runs while mounted.
+      try {
+        await deleteSong(song.id, song.mp3Path)
+        setSongs(function (prev) {
+          return prev.filter(function (s) { return s.id !== song.id })
+        })
+      } catch (e) {
+        alert('Opened in editor, but could not remove the old library copy: '
+          + e.message)
+      }
       if (onEdit) await onEdit(job.id)
     } catch (e) {
       alert('Could not open in editor: ' + e.message +
@@ -426,6 +438,12 @@ export default function LibraryView({ onEdit }) {
                     ? ' · ' + song.createdAt.toDate().toLocaleDateString()
                     : ''}
                 </div>
+                {song.sourceUrl && (
+                  <div className="meta">
+                    <a href={song.sourceUrl} target="_blank" rel="noreferrer"
+                      title="Open the original source video">🔗 source video</a>
+                  </div>
+                )}
                 <select
                   className="lib-folder-sel"
                   value={song.folder || ''}

@@ -533,6 +533,24 @@ def reset_events(job_id: str):
     return events
 
 
+@app.put("/api/jobs/{job_id}/settings")
+def save_settings(job_id: str, payload: dict = Body(...)):
+    """Persist the export sliders (velocity/gamma/offset/pedal/release/cap) on
+    the job so bulk USB-copy and library-move render each song the way it was
+    tuned in the editor, not with pipeline defaults. Stored camelCase to match
+    the frontend settings object."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    keys = ("velMin", "velMax", "gamma", "offsetMs",
+            "pedal", "releaseMs", "capSustain")
+    settings = {k: payload[k] for k in keys if k in payload}
+    with jobs_lock:
+        job["settings"] = settings
+        _persist(job_id)
+    return {"ok": True, "settings": settings}
+
+
 def _trim_tail(job, events):
     """Drop notes/pedals that start after the song's trim-end so every export
     ends where the (identically trimmed) accompaniment MP3 ends. The front cut

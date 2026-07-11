@@ -1,7 +1,7 @@
 import { initializeApp } from 'firebase/app'
 import {
   getFirestore, collection, addDoc, getDocs, deleteDoc, doc, updateDoc,
-  query, orderBy, serverTimestamp
+  query, orderBy, where, serverTimestamp
 } from 'firebase/firestore'
 import {
   getStorage, ref as storageRef, uploadBytes, getDownloadURL, deleteObject
@@ -38,6 +38,61 @@ function extFromType(type) {
 
 const SONGS = 'songs'
 const FOLDERS = 'folders'
+const SOURCES = 'sources'
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '')
+  } catch (e) {
+    return ''
+  }
+}
+
+// Record a converted link so its source video can be found again later.
+// De-duplicates on the exact URL: a repeat conversion bumps the timestamp and
+// count instead of adding a second row. Best-effort — callers ignore failures.
+export async function saveSourceUrl(url, title) {
+  if (!db || !url) return null
+  const existing = await getDocs(
+    query(collection(db, SOURCES), where('url', '==', url)))
+  if (!existing.empty) {
+    const d = existing.docs[0]
+    const prev = d.data()
+    await updateDoc(doc(db, SOURCES, d.id), {
+      lastConvertedAt: serverTimestamp(),
+      count: (prev.count || 1) + 1,
+      title: title || prev.title || null
+    })
+    return d.id
+  }
+  const ref = await addDoc(collection(db, SOURCES), {
+    url: url,
+    host: hostOf(url),
+    title: title || null,
+    count: 1,
+    createdAt: serverTimestamp(),
+    lastConvertedAt: serverTimestamp()
+  })
+  return ref.id
+}
+
+export async function listSourceUrls() {
+  if (!db) return []
+  const q = query(collection(db, SOURCES), orderBy('lastConvertedAt', 'desc'))
+  const snap = await getDocs(q)
+  const out = []
+  snap.forEach(function (d) {
+    const data = d.data()
+    data.id = d.id
+    out.push(data)
+  })
+  return out
+}
+
+export async function deleteSourceUrl(id) {
+  if (!db) throw new Error('Firebase not configured')
+  await deleteDoc(doc(db, SOURCES, id))
+}
 
 // Upload the source MP3 to Storage, then write the song doc (MIDI stays in
 // Firestore, the audio lives in Storage as a URL). If the audio upload fails
@@ -73,6 +128,7 @@ export async function saveSong(song, mp3Blob) {
     midiBase64: song.midiBase64,
     mp3Url: mp3Url,
     mp3Path: mp3Path,
+    sourceUrl: song.sourceUrl || null,
     folder: song.folder || null,
     createdAt: serverTimestamp()
   })
@@ -90,6 +146,29 @@ export async function listSongs() {
     out.push(data)
   })
   return out
+}
+
+function norm(s) {
+  return (s || '').trim().toLowerCase()
+}
+
+// True when an existing library song is the "same" as one being saved:
+// identical source link (strong match) or identical title (case-insensitive).
+export function isSameSong(existing, title, sourceUrl) {
+  if (sourceUrl && existing.sourceUrl && existing.sourceUrl === sourceUrl) {
+    return true
+  }
+  return norm(title) !== '' && norm(existing.title) === norm(title)
+}
+
+// Return the first library song that duplicates the given title/source, or
+// null. Used to warn before adding a song that's already saved.
+export async function findExistingSong(title, sourceUrl) {
+  if (!db) return null
+  const songs = await listSongs()
+  return songs.find(function (s) {
+    return isSameSong(s, title, sourceUrl)
+  }) || null
 }
 
 export async function deleteSong(id, mp3Path) {

@@ -94,6 +94,18 @@ export async function verifyJob(id) {
   return data
 }
 
+// Persist the export sliders on the job so bulk USB-copy / library-move can
+// render each song as tuned. Best-effort — callers ignore failures.
+export async function saveJobSettings(id, settings) {
+  const res = await fetch(BASE + '/jobs/' + id + '/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings)
+  })
+  if (!res.ok) throw new Error('Settings save failed')
+  return res.json()
+}
+
 export async function resetEvents(id) {
   const res = await fetch(BASE + '/jobs/' + id + '/events/reset', {
     method: 'POST'

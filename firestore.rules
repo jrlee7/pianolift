@@ -9,5 +9,9 @@ service cloud.firestore {
     match /folders/{folderId} {
       allow read, write: if true;
     }
+    // History of converted source links so a video can be found again later.
+    match /sources/{sourceId} {
+      allow read, write: if true;
+    }
   }
 }

@@ -3,9 +3,9 @@ import NoteEditor from './NoteEditor.jsx'
 import {
   getEvents, midiUrl, audioUrl, eseqUrl, hfeUrl, fetchMidiBase64,
   getUsbStatus, saveToUsb, saveEvents, resetEvents,
-  getDrives, exportToDrive, trimJob
+  getDrives, exportToDrive, trimJob, saveJobSettings
 } from '../api.js'
-import { saveSong } from '../firebase.js'
+import { saveSong, findExistingSong } from '../firebase.js'
 import { createPreviewPlayer, createNotePlayer } from '../previewSynth.js'
 
 const DEFAULTS = {
@@ -23,7 +23,9 @@ function tagIds(ev) {
 
 export default function ResultView({ job, firebaseReady, onArchived }) {
   const [events, setEvents] = useState(null)
-  const [settings, setSettings] = useState(DEFAULTS)
+  // Seed from the job's saved sliders so a re-opened song shows its tuning.
+  const [settings, setSettings] = useState(
+    job.settings ? { ...DEFAULTS, ...job.settings } : DEFAULTS)
   const [playhead, setPlayhead] = useState(0)
   const [saving, setSaving] = useState(false)
   const [previewing, setPreviewing] = useState(false)
@@ -45,6 +47,7 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
   const accompRef = useRef(null)
   const playerRef = useRef(null)
   const usbRootRef = useRef(null)
+  const settingsMounted = useRef(false)
 
   const encDelay = (job.encoderDelayMs || 0) / 1000
   // drive picked in the select, else the only/first drive present
@@ -64,6 +67,20 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
       if (playerRef.current) playerRef.current.stop()
     }
   }, [job.id])
+
+  // Debounced persist of the export sliders so bulk USB-copy / library-move
+  // render this song as tuned. Skip the initial mount (no change yet), then
+  // save 600ms after the last slider move. Best-effort — ignore failures.
+  useEffect(function () {
+    if (!settingsMounted.current) {
+      settingsMounted.current = true
+      return
+    }
+    const t = setTimeout(function () {
+      saveJobSettings(job.id, settings).catch(function () { /* best-effort */ })
+    }, 600)
+    return function () { clearTimeout(t) }
+  }, [settings, job.id])
 
   function handleEdit(next) {
     setEvents(next)
@@ -371,6 +388,18 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
     if (dirty && !window.confirm(
       'You have unsaved edits. Move to library using the last SAVED version? ' +
       'Hit Cancel, then "Save edits" first to include them.')) return
+    // Warn before adding a song that's already in the library (matched by
+    // source link or title). Best-effort — a lookup failure must not block a
+    // legitimate save.
+    try {
+      const dup = await findExistingSong(job.name, job.sourceUrl)
+      if (dup && !window.confirm(
+        '“' + dup.title + '” is already in your library' +
+        (dup.createdAt && dup.createdAt.toDate
+          ? ' (added ' + dup.createdAt.toDate().toLocaleDateString() + ')'
+          : '') +
+        '. Add another copy anyway?')) return
+    } catch (e) { /* dup check best-effort */ }
     setSaving(true)
     try {
       const b64 = await fetchMidiBase64(job.id, settings)
@@ -397,7 +426,8 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
         noteCount: events ? events.notes.length : job.noteCount,
         pedalCount: events ? events.pedals.length : job.pedalCount,
         settings: settings,
-        midiBase64: b64
+        midiBase64: b64,
+        sourceUrl: job.sourceUrl || null
       }, mp3Blob)
       if (mp3Blob && !r.mp3Uploaded) {
         alert('Saved the MIDI, but the source audio upload failed: ' +

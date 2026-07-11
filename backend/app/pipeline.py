@@ -136,6 +136,34 @@ def detect_dead_space(audio_path):
     return round(start, 3), round(end, 3)
 
 
+def has_real_accompaniment(no_piano_wav, piano_wav):
+    """True when the piano-removed stem holds actual content (vocals/other
+    instruments), not just separation bleed.
+
+    A song that's really piano-only still runs through the separator when the
+    user doesn't tick "piano-only"; its no_piano stem then comes out
+    near-silent (residual bleed only). We treat that as no accompaniment so a
+    silent MP3 never gets encoded, saved to the library, or copied to the USB.
+
+    Scale-invariant: compares the accompaniment's RMS to the piano stem's, so
+    it works on quiet and loud masters alike. The stem is bleed if it's below
+    an absolute silence floor (~-46 dBFS) or under ~5% of the piano's energy.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    def rms(path):
+        data, _ = sf.read(path, dtype="float32")
+        mono = data.mean(axis=1) if data.ndim > 1 else data
+        if len(mono) == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(mono))))
+
+    acc = rms(no_piano_wav)
+    piano = rms(piano_wav)
+    return acc > 0.005 and acc > 0.05 * piano
+
+
 def encode_accompaniment(no_piano_wav, job_dir, progress_cb,
                          trim_start=0.0, trim_end=None):
     """Encode the piano-less stem to MP3 — this is what plays through the
@@ -277,9 +305,15 @@ def run_job(job_dir, audio_path, progress_cb, piano_only=False):
             raise RuntimeError("Separator finished but no_piano stem not found")
 
         trim_start, trim_end = detect_dead_space(audio_path)
-        accompaniment, encoder_delay_ms = encode_accompaniment(
-            no_piano_wav, job_dir, progress_cb,
-            trim_start=trim_start, trim_end=trim_end)
+        # A near-silent no_piano stem means the song is really piano-only:
+        # skip the accompaniment MP3 entirely (nothing to play through the
+        # ENSPIRE speakers, nothing worth uploading to the cloud library).
+        if has_real_accompaniment(no_piano_wav, piano_wav):
+            accompaniment, encoder_delay_ms = encode_accompaniment(
+                no_piano_wav, job_dir, progress_cb,
+                trim_start=trim_start, trim_end=trim_end)
+        else:
+            accompaniment, encoder_delay_ms = None, 0.0
 
     # piano_only inputs ARE the mix, so there is nothing to cross-check.
     notes, pedals, mix_notes = transcribe(
