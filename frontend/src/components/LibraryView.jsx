@@ -116,7 +116,7 @@ export default function LibraryView({ onEdit }) {
     }
     setImportingId(song.id)
     try {
-      const job = await importFromLibrary(song.title, song.midiBase64)
+      const job = await importFromLibrary(song.title, song.midiBase64, song.settings)
       // Moving back to Convert: drop the library copy so the song lives in one
       // place only (no duplicates). Its stored MP3 goes too — editor imports are
       // MIDI-only anyway. Delete before navigating so it runs while mounted.

@@ -16,6 +16,7 @@ import queue as queue_mod
 import re
 import shutil
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -78,10 +79,36 @@ def _load_jobs_from_disk():
             if job.get("status") == "processing":
                 job["status"] = "error"
                 job["error"] = "Server restarted during processing. Re-upload."
+            # Jobs from before creation-time tracking: job.json's mtime keeps
+            # the sort stable across restarts. Persisted on the next rewrite.
+            if "createdAt" not in job:
+                job["createdAt"] = os.path.getmtime(meta_path)
             jobs[entry] = job
 
 
+def _cleanup_leftover_stems():
+    """One-time sweep for jobs converted before the pipeline deleted the
+    separator's 5 individual accompaniment stems (~250MB of dead wavs per
+    job). Keep the piano stem + no_piano.wav, drop the rest. Only touches
+    finished jobs with a known piano stem, so an in-flight conversion on a
+    second server sharing this jobs dir can't lose files mid-run."""
+    for job_id, job in jobs.items():
+        if job.get("status") != "done" or not job.get("pianoStem"):
+            continue
+        sep_dir = os.path.join(_job_dir(job_id), "separated")
+        if not os.path.isdir(sep_dir):
+            continue
+        keep = {"no_piano.wav", os.path.basename(job["pianoStem"])}
+        for f in os.listdir(sep_dir):
+            if f.lower().endswith(".wav") and f not in keep:
+                try:
+                    os.remove(os.path.join(sep_dir, f))
+                except OSError:
+                    pass
+
+
 _load_jobs_from_disk()
+_cleanup_leftover_stems()
 
 
 def _input_path(job_id):
@@ -143,12 +170,13 @@ def _process(job_id, kind, source, piano_only=False):
                     job["stage"] = msg[1]
                     job["progress"] = msg[2]
             continue
-        if tag == "meta":  # URL job resolved its title + input filename
+        if tag == "meta":  # resolved input filename (+ title for URL jobs)
             with jobs_lock:
                 job = jobs.get(job_id)
                 if job is not None:
                     job["inputFile"] = msg[1]
-                    job["name"] = _safe_name(msg[2])
+                    if msg[2]:  # None = file job re-decoded, keep its name
+                        job["name"] = _safe_name(msg[2])
                     _persist(job_id)
             continue
         outcome = msg
@@ -201,7 +229,10 @@ async def create_job(file: UploadFile = File(...), piano_only: bool = Form(False
     job_dir = _job_dir(job_id)
     os.makedirs(job_dir, exist_ok=True)
     ext = os.path.splitext(name)[1].lower()
-    if ext not in (".mp3", ".wav", ".m4a", ".flac", ".ogg"):
+    # Video containers welcome too — the worker strips the video stream and
+    # decodes the audio to PCM before the pipeline runs (ensure_wav_input).
+    if ext not in (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".opus",
+                   ".wma", ".mp4", ".m4v", ".mkv", ".mov", ".webm"):
         ext = ".mp3"
     dest = os.path.join(job_dir, "input" + ext)
     with open(dest, "wb") as f:
@@ -215,6 +246,7 @@ async def create_job(file: UploadFile = File(...), piano_only: bool = Form(False
         "error": None,
         "pianoOnly": piano_only,
         "inputFile": "input" + ext,
+        "createdAt": time.time(),
     }
     with jobs_lock:
         jobs[job_id] = job
@@ -243,6 +275,7 @@ def create_job_from_url(payload: dict = Body(...)):
         "error": None,
         "pianoOnly": piano_only,
         "sourceUrl": url,
+        "createdAt": time.time(),
     }
     with jobs_lock:
         jobs[job_id] = job
@@ -277,8 +310,40 @@ def create_job_from_midi(payload: dict = Body(...)):
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(400, "could not parse MIDI: " + str(e))
 
+    # Library MIDI stores *mapped* velocities (map_velocity was applied at
+    # render time). Re-exporting would map them again, compressing the
+    # dynamic range on every library round trip. Invert the mapping the
+    # song was rendered with (its saved settings, pipeline defaults when
+    # missing) to recover raw model velocities; the export sliders below
+    # re-apply the same curve, so the round trip is lossless (mod rounding).
+    settings = payload.get("settings") or {}
+    try:
+        vel_min = float(settings.get("velMin", 20))
+        vel_max = float(settings.get("velMax", 112))
+        gamma = float(settings.get("gamma", 1.0))
+    except (TypeError, ValueError):
+        vel_min, vel_max, gamma = 20.0, 112.0, 1.0
+    if vel_max > vel_min and gamma > 0:
+        for n in notes:
+            norm = (n["velocity"] - vel_min) / (vel_max - vel_min)
+            norm = min(1.0, max(0.0, norm))
+            n["velocity"] = max(1, min(127, int(round(
+                127.0 * norm ** (1.0 / gamma)))))
+
     with open(os.path.join(job_dir, "events.json"), "w") as f:
         json.dump({"notes": notes, "pedals": pedals}, f)
+
+    # Seed the job's export sliders with the velocity curve the song was
+    # archived with, so the default re-export reproduces it exactly.
+    # offset/release stay 0: those were already baked into the stored
+    # MIDI's event times and must not be applied twice.
+    job_settings = {
+        "velMin": settings.get("velMin", 20),
+        "velMax": settings.get("velMax", 112),
+        "gamma": settings.get("gamma", 1.0),
+        "offsetMs": 0,
+        "releaseMs": 0,
+    }
 
     job = {
         "id": job_id,
@@ -296,6 +361,8 @@ def create_job_from_midi(payload: dict = Body(...)):
         "trimStartSec": 0.0,
         "trimEndSec": None,
         "fromLibrary": True,
+        "settings": job_settings,
+        "createdAt": time.time(),
     }
     with jobs_lock:
         jobs[job_id] = job
@@ -305,8 +372,11 @@ def create_job_from_midi(payload: dict = Body(...)):
 
 @app.get("/api/jobs")
 def list_jobs():
+    # Oldest first (ids are random hex, useless for ordering); the frontend
+    # reverses, so the newest conversion lands on top of the list.
     with jobs_lock:
-        items = sorted(jobs.values(), key=lambda j: j["id"])
+        items = sorted(jobs.values(),
+                       key=lambda j: (j.get("createdAt") or 0, j["id"]))
     return items
 
 

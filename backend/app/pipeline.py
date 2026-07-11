@@ -119,7 +119,47 @@ def separate_piano(audio_path, job_dir, progress_cb):
     no_piano_wav = os.path.join(os.path.dirname(piano_wav), "no_piano.wav")
     sf.write(no_piano_wav, mix, sr)
 
+    # The 5 individual stems (~50MB each) are never read again once summed:
+    # every later step (trim re-encode, verify, playback) uses only the
+    # piano stem and no_piano.wav. Deleting them here cuts a job's disk
+    # footprint by more than half.
+    for f in accompaniment_stems:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
     return piano_wav
+
+
+# Containers libsndfile reads directly. Anything else (m4a/aac audio, video
+# files) must be decoded to PCM first: detect_dead_space and the piano-only
+# path use soundfile, which has no AAC/MP4 support — an .m4a upload used to
+# crash only *after* minutes of separation.
+_SOUNDFILE_EXTS = (".wav", ".flac", ".mp3", ".ogg")
+
+
+def ensure_wav_input(audio_path, job_dir, progress_cb):
+    """Return a path every pipeline stage can read: the file itself when
+    soundfile handles the container, else a one-time ffmpeg decode to
+    input.wav (44.1 kHz stereo PCM; -vn strips video streams). The original
+    container is deleted after a successful decode."""
+    import subprocess
+
+    if os.path.splitext(audio_path)[1].lower() in _SOUNDFILE_EXTS:
+        return audio_path
+    _ensure_ffmpeg(progress_cb)
+    wav_path = os.path.join(job_dir, "input.wav")
+    proc = subprocess.run(
+        [FFMPEG_EXE, "-y", "-i", audio_path, "-vn",
+         "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", wav_path],
+        capture_output=True)
+    if proc.returncode != 0 or not os.path.exists(wav_path):
+        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError("audio decode failed: " +
+                           (tail[-1] if tail else "ffmpeg error"))
+    os.remove(audio_path)
+    return wav_path
 
 
 def detect_dead_space(audio_path):
@@ -252,15 +292,17 @@ def _events_from_result(result):
 
 
 def _peak_normalize(audio):
-    """Lift a quiet stem to ~-0.4 dBFS peak. Both transcribers trained on
-    full-level MAESTRO recordings; a piano mixed low in the source comes out
-    of the separator quiet, and soft notes then sit below the models' onset
-    sensitivity. Never attenuates a hot stem by more than to 0.95."""
+    """Lift a quiet stem to ~-0.4 dBFS peak (and pull a hot one down to the
+    same level). Both transcribers trained on full-level MAESTRO recordings;
+    a piano mixed low in the source comes out of the separator quiet, and
+    soft notes then sit below the models' onset sensitivity. Gain is capped
+    at +18 dB so a near-silent stem (wrong "piano-only" tick, instrumental
+    with no piano) doesn't get its noise floor blasted into fake notes."""
     import numpy as np
 
     peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
     if peak > 0:
-        return audio * (0.95 / max(peak, 0.95))
+        return audio * min(0.95 / peak, 8.0)
     return audio
 
 

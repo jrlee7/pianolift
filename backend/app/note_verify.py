@@ -84,6 +84,17 @@ ALT_MATCH_WINDOW_SEC = 0.05
 # pedal that fast, and the Disklavier certainly can't.
 PEDAL_GAP_MERGE_SEC = 0.05
 
+# Bass fundamentals are weak on real pianos (string inharmonicity +
+# soundboard rolloff): below ~C3 most of a note's energy sits in harmonics
+# 2-3, so measuring only the fundamental CQT bin under-scores real bass
+# notes (false ghost risk) and over-trims their offsets. For those pitches
+# the note's envelope is the elementwise max of the fundamental bin and the
+# +12/+19-semitone bins (harmonics 2 and 3). Only below BASS_PITCH_MAX:
+# higher up fundamentals are strong, and the harmonic bins would inherit
+# energy from other notes actually sounding there.
+BASS_PITCH_MAX = 48            # C3
+_HARMONIC_OFFSETS = (12, 19)   # +1 octave, +1 octave and a fifth
+
 
 def _cqt_mag(piano_wav):
     import librosa
@@ -94,34 +105,50 @@ def _cqt_mag(piano_wav):
     return mag
 
 
+def _pitch_envelope(mag, pitch, cache):
+    """Time envelope for a pitch: its fundamental bin, max-combined with the
+    harmonic-2/3 bins for bass pitches (see BASS_PITCH_MAX). Cached per pitch
+    with its own 20th-percentile quiet level (survives dense passages where
+    the median would be inflated by real playing)."""
+    hit = cache.get(pitch)
+    if hit is not None:
+        return hit
+    b = min(N_BINS - 1, max(0, pitch - 21))
+    rows = [b]
+    if pitch < BASS_PITCH_MAX:
+        rows += [b + h for h in _HARMONIC_OFFSETS if b + h < N_BINS]
+    env = mag[b] if len(rows) == 1 else np.max(mag[rows], axis=0)
+    floor = float(np.percentile(env, 20)) + 1e-9
+    cache[pitch] = (env, floor)
+    return env, floor
+
+
 def _note_features(mag, notes):
-    """Per note: (score, rise, span envelope slice bounds)."""
+    """Per note: (score, rise, pitch envelope, span frame bounds)."""
     n_frames = mag.shape[1]
-    # A bin's own quiet level; 20th percentile survives dense passages
-    # where the median would be inflated by real playing.
-    floor = np.percentile(mag, 20, axis=1) + 1e-9
+    cache = {}
 
     feats = []
     for n in notes:
-        b = min(N_BINS - 1, max(0, n["pitch"] - 21))
+        env, floor = _pitch_envelope(mag, n["pitch"], cache)
         f0 = min(n_frames - 1, max(0, int(round(n["onset"] * SR / HOP))))
         f1 = min(n_frames - 1, max(f0, int(round(n["offset"] * SR / HOP))))
-        span = mag[b, f0:f1 + 1]
+        span = env[f0:f1 + 1]
         peak = float(span.max()) if span.size else 0.0
-        score = peak / floor[b]
-        pre = mag[b, max(0, f0 - _ATTACK_FRAMES):f0]
-        post = mag[b, f0:f0 + _ATTACK_FRAMES]
+        score = peak / floor
+        pre = env[max(0, f0 - _ATTACK_FRAMES):f0]
+        post = env[f0:f0 + _ATTACK_FRAMES]
         pre_e = float(pre.mean()) if pre.size else 0.0
         post_e = float(post.mean()) if post.size else 0.0
         rise = post_e / (pre_e + 1e-9)
-        feats.append((score, rise, b, f0, f1))
+        feats.append((score, rise, env, f0, f1))
     return feats
 
 
-def _trim_offset(mag, note, b, f0, f1):
-    """Move the offset back to where the bin last held OFFSET_KEEP_RATIO of
-    the note's own peak. Never extends."""
-    span = mag[b, f0:f1 + 1]
+def _trim_offset(env, note, f0, f1):
+    """Move the offset back to where the pitch envelope last held
+    OFFSET_KEEP_RATIO of the note's own peak. Never extends."""
+    span = env[f0:f1 + 1]
     if span.size == 0:
         return note["offset"]
     peak = span.max()
@@ -180,13 +207,40 @@ def _merge_alt(notes, alt_notes, evidence_only):
     evidence_only=True (the retroactive clean-up path, where `notes` may
     carry user edits) suppresses both — Transkun then only *confirms*
     existing notes, never retimes them or adds new ones.
+
+    Velocity calibration: agreed notes take Transkun's velocity, so a
+    ByteDance-only note keeping its raw velocity would leave one song
+    mixing two engines' (slightly different) dynamics scales. The matched
+    pairs give the mapping for free — fit ByteDance→Transkun linearly and
+    push bd-only velocities through it. Skipped when there are too few
+    pairs, no velocity spread, or the fit comes out implausible.
     """
     matches = _match_indices(notes, alt_notes, ALT_MATCH_WINDOW_SEC)
+
+    cal = None
+    if not evidence_only:
+        pairs = [(n["velocity"], alt_notes[m]["velocity"])
+                 for n, m in zip(notes, matches) if m is not None]
+        if len(pairs) >= 8:
+            bd = np.array([p[0] for p in pairs], dtype=float)
+            tk = np.array([p[1] for p in pairs], dtype=float)
+            if float(bd.std()) > 3.0:
+                slope, intercept = np.polyfit(bd, tk, 1)
+                if 0.3 <= slope <= 3.0:
+                    cal = (float(slope), float(intercept))
+
+    def bd_vel(v):
+        if cal is None:
+            return v
+        return max(1, min(127, int(round(cal[0] * v + cal[1]))))
+
     merged, evidence = [], []
     matched_alt = set()
     for n, m in zip(notes, matches):
         if m is None:
-            merged.append(dict(n))
+            out = dict(n)
+            out["velocity"] = bd_vel(n["velocity"])
+            merged.append(out)
             evidence.append("bd")
             continue
         matched_alt.add(m)
@@ -207,7 +261,7 @@ def _merge_alt(notes, alt_notes, evidence_only):
     return [merged[i] for i in order], [evidence[i] for i in order]
 
 
-def _refine_pedals(pedals, alt_pedals, notes, stats):
+def _refine_pedals(pedals, alt_pedals, notes, stats, add_alt=False):
     """Verify sustain-pedal segments instead of passing them through.
 
     * silence rule -- a pedal segment overlapping no note interval at all
@@ -216,10 +270,14 @@ def _refine_pedals(pedals, alt_pedals, notes, stats):
       segment neither engine agrees on AND containing no note onset is
       dropped (a real "catch the chord" pedal always covers ringing notes
       whose intervals overlap it, and near-always a fresh onset).
+    * alt recall (add_alt=True) -- a segment only Transkun heard joins as a
+      candidate under the same silence rule; ByteDance's pedal detector
+      misses some catches Transkun's gets. Off in evidence-only mode (deep
+      clean-up of possibly user-edited events must not inject segments).
     * flutter merge -- lifts shorter than PEDAL_GAP_MERGE_SEC between two
       segments can't be played on the physical pedal; merged into one.
     """
-    if not pedals:
+    if not pedals and not (add_alt and alt_pedals):
         return pedals
 
     spans = [(n["onset"], n["offset"]) for n in notes]
@@ -245,6 +303,17 @@ def _refine_pedals(pedals, alt_pedals, notes, stats):
             stats["pedalsDropped"] += 1
             continue
         kept.append(dict(p))
+
+    if add_alt and alt_pedals:
+        def bd_overlap(a):
+            return any(p["onset"] < a["offset"] and p["offset"] > a["onset"]
+                       for p in kept)
+
+        for a in alt_pedals:
+            if not bd_overlap(a) and overlaps_note(a):
+                kept.append({"onset": round(float(a["onset"]), 4),
+                             "offset": round(float(a["offset"]), 4)})
+                stats["pedalsAdded"] += 1
 
     merged = []
     for p in sorted(kept, key=lambda p: p["onset"]):
@@ -275,7 +344,7 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
     Returns (notes, pedals, stats).
     """
     stats = {"ghosts": 0, "trimmed": 0, "deduped": 0, "unconfirmed": 0,
-             "altOnly": 0, "pedalsDropped": 0}
+             "altOnly": 0, "pedalsDropped": 0, "pedalsAdded": 0}
     if not notes and not alt_notes:
         return notes, pedals, stats
 
@@ -292,7 +361,7 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
     progress_cb("verifying", 60)
 
     kept = []
-    for i, (n, (score, rise, b, f0, f1)) in enumerate(zip(notes, feats)):
+    for i, (n, (score, rise, env, f0, f1)) in enumerate(zip(notes, feats)):
         if (n["offset"] - n["onset"] < MICRO_DUR_SEC
                 and score < MICRO_SCORE_MAX):
             stats["ghosts"] += 1
@@ -311,7 +380,7 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
         if is_ghost:
             stats["ghosts"] += 1
             continue
-        new_off = _trim_offset(mag, n, b, f0, f1)
+        new_off = _trim_offset(env, n, f0, f1)
         if new_off < n["offset"]:
             stats["trimmed"] += 1
             n = dict(n, offset=new_off)
@@ -342,6 +411,8 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
             prev["offset"] = max(limit, prev["onset"] + MIN_NOTE_SEC)
 
     deduped.sort(key=lambda n: n["onset"])
-    pedals = _refine_pedals(pedals, alt_pedals, deduped, stats)
+    pedals = _refine_pedals(
+        pedals, alt_pedals, deduped, stats,
+        add_alt=alt_pedals is not None and not alt_evidence_only)
     progress_cb("verifying", 100)
     return deduped, pedals, stats

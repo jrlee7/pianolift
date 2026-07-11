@@ -36,6 +36,8 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
   const [driveSel, setDriveSel] = useState('')
   const [exporting, setExporting] = useState(false)
   const [exportResult, setExportResult] = useState(null)
+  const [savingPair, setSavingPair] = useState(false)
+  const [pairResult, setPairResult] = useState(null)
   const [dirty, setDirty] = useState(false)
   const [savingEdits, setSavingEdits] = useState(false)
   const [trimStart, setTrimStart] = useState(job.trimStartSec || 0)
@@ -43,6 +45,10 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
     job.trimEndSec == null ? null : job.trimEndSec)
   const [trimming, setTrimming] = useState(false)
   const [audioVer, setAudioVer] = useState(0)
+  // A/B loop (seconds on the piano-roll timeline). Active when both set and
+  // B > A: playback snaps back to A whenever the playhead reaches B.
+  const [loopA, setLoopA] = useState(null)
+  const [loopB, setLoopB] = useState(null)
   const stemRef = useRef(null)
   const accompRef = useRef(null)
   const playerRef = useRef(null)
@@ -194,6 +200,13 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
     return function () { cancelAnimationFrame(raf) }
   }, [events, trimStart])
 
+  // A/B loop enforcement: whichever clock is driving the playhead (synth,
+  // stem or accompaniment), reaching B seeks everything back to A.
+  useEffect(function () {
+    if (loopA == null || loopB == null || loopB <= loopA) return
+    if (playhead >= loopB) handleSeek(loopA)
+  }, [playhead, loopA, loopB])
+
   // Poll for drives every 5s so buttons appear the moment a stick is
   // plugged in. The cheap /drives listing runs every tick; the expensive
   // Gotek slot scan only runs when the stick first shows up (or changes).
@@ -288,6 +301,28 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
       alert('Save to drive failed: ' + e.message)
     } finally {
       setExporting(false)
+    }
+  }
+
+  // One-button USB save: write the .mid AND the accompaniment .mp3 into the
+  // same folder (the detected removable drive root) so they travel together to
+  // the ENSPIRE. Piano-only jobs have no accompaniment — just the .mid.
+  async function handleSavePairToDrive(destRoot) {
+    setSavingPair(true)
+    setPairResult(null)
+    try {
+      const written = []
+      const midi = await exportToDrive(job.id, 'midi', destRoot, settings)
+      written.push(midi.filename)
+      if (job.accompaniment) {
+        const mp3 = await exportToDrive(job.id, 'mp3', destRoot, settings)
+        written.push(mp3.filename)
+      }
+      setPairResult({ files: written, dest: destRoot })
+    } catch (e) {
+      alert('Save to USB failed: ' + e.message)
+    } finally {
+      setSavingPair(false)
     }
   }
 
@@ -513,7 +548,17 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
             onApplyTrim={handleApplyTrim} trimming={trimming}
             hasAccompaniment={!!job.accompaniment}
             onPlay={job.accompaniment ? playBoth : playPiano}
-            onRestart={handleRestart} previewing={previewing} />
+            onRestart={handleRestart} previewing={previewing}
+            loopA={loopA} loopB={loopB}
+            onSetLoopA={function () {
+              setLoopA(playhead)
+              if (loopB != null && loopB <= playhead) setLoopB(null)
+            }}
+            onSetLoopB={function () {
+              if (loopA != null && playhead > loopA) setLoopB(playhead)
+              else setLoopB(playhead > 0 ? playhead : null)
+            }}
+            onClearLoop={function () { setLoopA(null); setLoopB(null) }} />
         : <div className="meta">Loading note data…</div>}
 
       {dirty && (
@@ -648,6 +693,14 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
                 (usbResult ? 'saved: ' + usbResult.slot : usb.nextFreeSlot) + ')'}
           </button>
         )}
+        {selDrive && (
+          <button className="primary" disabled={savingPair}
+            onClick={function () { handleSavePairToDrive(selDrive.root) }}>
+            {savingPair
+              ? 'Saving to USB…'
+              : '💾 Save .mid + .mp3 to USB (' + selDrive.root + ')'}
+          </button>
+        )}
         {firebaseReady && (
           <button className="primary" onClick={handleSave} disabled={saving}>
             {saving ? 'Moving…' : '☁ Move to library'}
@@ -713,6 +766,15 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
         <div className="notice" style={{ borderColor: 'var(--green)' }}>
           ✓ Saved <strong>{exportResult.filename}</strong>
           {exportResult.path ? ' to ' + exportResult.path : ''}
+        </div>
+      )}
+
+      {pairResult && (
+        <div className="notice" style={{ borderColor: 'var(--green)' }}>
+          ✓ Saved <strong>{pairResult.files.join(' + ')}</strong> to{' '}
+          {pairResult.dest} — flushed to the stick, safe to unplug. Play the
+          .mid on the ENSPIRE and start the .mp3 together; both share the same
+          timeline.
         </div>
       )}
 

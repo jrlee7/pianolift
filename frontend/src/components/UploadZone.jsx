@@ -27,10 +27,15 @@ export default function UploadZone({ onFiles, onUrl }) {
     const files = []
     for (let i = 0; i < fileList.length; i++) {
       const f = fileList[i]
-      if (/\.(mp3|wav|m4a|flac|ogg)$/i.test(f.name)) files.push(f)
+      // video containers OK too — the backend strips the video stream and
+      // converts the audio track
+      if (/\.(mp3|wav|m4a|flac|ogg|aac|opus|wma|mp4|m4v|mkv|mov|webm)$/i.test(f.name)) {
+        files.push(f)
+      }
     }
     if (files.length === 0) {
-      alert('Drop an audio file (mp3, wav, m4a, flac, ogg)')
+      alert('Drop an audio or video file (mp3, wav, m4a, flac, ogg, aac, ' +
+        'opus, wma, mp4, mkv, mov, webm)')
       return
     }
     onFiles(files, pianoOnly)
@@ -49,12 +54,12 @@ export default function UploadZone({ onFiles, onUrl }) {
           pick(e.dataTransfer.files)
         }}
       >
-        <div className="big">Drop an MP3 here</div>
+        <div className="big">Drop an audio or video file here</div>
         <div>or click to browse — piano extraction takes a few minutes per song</div>
         <input
           ref={inputRef}
           type="file"
-          accept=".mp3,.wav,.m4a,.flac,.ogg,audio/*"
+          accept=".mp3,.wav,.m4a,.flac,.ogg,.aac,.opus,.wma,.mp4,.m4v,.mkv,.mov,.webm,audio/*,video/*"
           multiple
           hidden
           onChange={function (e) {

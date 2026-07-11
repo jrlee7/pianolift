@@ -41,6 +41,7 @@ export default function App() {
   const [selected, setSelected] = useState(function () { return new Set() })
   const [batch, setBatch] = useState(null) // null | { done, total, verb }
   const [batchResult, setBatchResult] = useState(null)
+  const [search, setSearch] = useState('')
 
   const refresh = useCallback(async function () {
     try {
@@ -135,6 +136,13 @@ export default function App() {
   }
 
   const doneJobs = jobs.filter(function (j) { return j.status === 'done' })
+
+  // Newest first (backend sorts oldest-first by creation time); the search
+  // box narrows by name, case-insensitive.
+  const shownJobs = jobs.slice().reverse().filter(function (j) {
+    return !search ||
+      (j.name || '').toLowerCase().includes(search.toLowerCase())
+  })
 
   function toggleSelect(id) {
     setSelected(function (prev) {
@@ -369,7 +377,17 @@ export default function App() {
               </button>
             </div>
           )}
-          {jobs.slice().reverse().map(function (job) {
+          {jobs.length > 3 && (
+            <input
+              type="text"
+              className="url-input"
+              style={{ width: '100%', margin: '10px 0 4px', boxSizing: 'border-box' }}
+              placeholder="🔍 Search songs by name…"
+              value={search}
+              onChange={function (e) { setSearch(e.target.value) }}
+            />
+          )}
+          {shownJobs.map(function (job) {
             const isOpen = openJobId === job.id
             return (
               <div key={job.id} className={isOpen ? 'job-open' : ''}>

@@ -21,12 +21,16 @@ export async function submitUrl(url, pianoOnly) {
 }
 
 // Re-open a library song in the editor: the backend decodes its baked MIDI
-// back into editable events and returns a finished, MIDI-only job.
-export async function importFromLibrary(name, midiBase64) {
+// back into editable events and returns a finished, MIDI-only job. settings
+// (the sliders the song was archived with) let the backend invert the
+// velocity mapping so re-exports don't compress the dynamic range.
+export async function importFromLibrary(name, midiBase64, settings) {
   const res = await fetch(BASE + '/jobs/from-library', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: name, midiBase64: midiBase64 })
+    body: JSON.stringify({
+      name: name, midiBase64: midiBase64, settings: settings || null
+    })
   })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail || 'Import failed')

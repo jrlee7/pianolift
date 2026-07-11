@@ -35,7 +35,12 @@ def run_job_process(job_dir, kind, source, piano_only, q):
             q.put(("meta", os.path.basename(wav_path), title))
             audio_path = wav_path
         else:
-            audio_path = source
+            # m4a/aac and video containers decode to PCM once here;
+            # soundfile-readable formats pass straight through.
+            audio_path = pipeline.ensure_wav_input(source, job_dir, cb)
+            if audio_path != source:
+                # New input filename, no title change (None keeps the name).
+                q.put(("meta", os.path.basename(audio_path), None))
 
         result = pipeline.run_job(job_dir, audio_path, cb, piano_only=piano_only)
         q.put(("done", result))

@@ -129,7 +129,8 @@ function mergePedals(pedals) {
 export default function NoteEditor({
   events, onChange, onSave, onReset, dirty, saving, playheadSec, onSeek,
   trimStart, trimEnd, onApplyTrim, trimming, hasAccompaniment,
-  onPlay, onRestart, previewing
+  onPlay, onRestart, previewing,
+  loopA, loopB, onSetLoopA, onSetLoopB, onClearLoop
 }) {
   const [pxPerSec, setPxPerSec] = useState(40)
   const [tool, setTool] = useState('select')
@@ -262,6 +263,110 @@ export default function NoteEditor({
         : n)
     }
     commit(notes, null)
+  }
+
+  // Multiply selected velocities (±10% buttons) — keeps the passage's
+  // relative dynamics, unlike the absolute slider.
+  function scaleSelectedVelocity(factor) {
+    if (sel.notes.size === 0) return
+    pushUndo()
+    const ev = eventsRef.current
+    const notes = []
+    for (let i = 0; i < ev.notes.length; i++) {
+      const n = ev.notes[i]
+      notes.push(sel.notes.has(n._id)
+        ? {
+            _id: n._id, onset: n.onset, offset: n.offset, pitch: n.pitch,
+            velocity: Math.max(1, Math.min(127, Math.round(n.velocity * factor)))
+          }
+        : n)
+    }
+    commit(notes, null)
+  }
+
+  function transposeSelected(dp) {
+    if (sel.notes.size === 0) return
+    pushUndo()
+    const ev = eventsRef.current
+    const notes = []
+    let heard = null
+    for (let i = 0; i < ev.notes.length; i++) {
+      const n = ev.notes[i]
+      if (sel.notes.has(n._id)) {
+        const p = clampPitch(n.pitch + dp)
+        if (heard === null) heard = { pitch: p, velocity: n.velocity }
+        notes.push({
+          _id: n._id, onset: n.onset, offset: n.offset,
+          pitch: p, velocity: n.velocity
+        })
+      } else {
+        notes.push(n)
+      }
+    }
+    commit(notes, null)
+    if (heard) audition(heard.pitch, heard.velocity)
+  }
+
+  // ---------- chord tightening ----------
+
+  // Notes struck together but transcribed a few ms apart sound arpeggiated
+  // on a real action. Cluster onsets within TIGHTEN_WINDOW and snap each
+  // cluster to its median onset (durations preserved). Works on the
+  // selection if there is one, else the whole song.
+  const TIGHTEN_WINDOW = 0.025
+
+  function tightenChords() {
+    const ev = eventsRef.current
+    const target = sel.notes.size > 0 ? sel.notes : null
+    const pool = []
+    for (let i = 0; i < ev.notes.length; i++) {
+      const n = ev.notes[i]
+      if (!target || target.has(n._id)) pool.push(n)
+    }
+    pool.sort(byOnset)
+
+    const newOnset = {} // _id -> snapped onset
+    let moved = 0
+    let i = 0
+    while (i < pool.length) {
+      let j = i + 1
+      while (j < pool.length && pool[j].onset - pool[i].onset <= TIGHTEN_WINDOW) j++
+      if (j - i > 1) {
+        const cluster = pool.slice(i, j)
+        const onsets = cluster.map(function (n) { return n.onset }).sort(function (a, b) { return a - b })
+        const med = onsets[Math.floor(onsets.length / 2)]
+        for (let k = 0; k < cluster.length; k++) {
+          if (Math.abs(cluster[k].onset - med) > 1e-4) {
+            newOnset[cluster[k]._id] = med
+            moved++
+          }
+        }
+      }
+      i = j
+    }
+
+    if (moved === 0) {
+      setCapMsg('Chords already tight — no onsets moved.')
+      return
+    }
+    pushUndo()
+    const notes = []
+    for (let k = 0; k < ev.notes.length; k++) {
+      const n = ev.notes[k]
+      const t = newOnset[n._id]
+      if (t === undefined) {
+        notes.push(n)
+      } else {
+        const shift = t - n.onset
+        notes.push({
+          _id: n._id, onset: t, offset: n.offset + shift,
+          pitch: n.pitch, velocity: n.velocity
+        })
+      }
+    }
+    commit(notes, null)
+    setCapMsg('Tightened ' + moved + ' note onset' + (moved === 1 ? '' : 's') +
+      ' into their chords — Ctrl+Z to undo, Save edits to keep.')
   }
 
   // ---------- ghost notes ----------
@@ -862,6 +967,23 @@ export default function NoteEditor({
       }
     }
 
+    // A/B loop band
+    if (loopA != null && loopB != null && loopB > loopA) {
+      const yB = yOf(loopB)
+      const yA = yOf(loopA)
+      ctx.fillStyle = 'rgba(122,162,247,0.08)'
+      ctx.fillRect(0, yB, STAGE_W, Math.max(1, yA - yB))
+      ctx.strokeStyle = '#7aa2f7'
+      ctx.setLineDash([5, 4])
+      ctx.beginPath()
+      ctx.moveTo(0, yA + 0.5)
+      ctx.lineTo(STAGE_W, yA + 0.5)
+      ctx.moveTo(0, yB + 0.5)
+      ctx.lineTo(STAGE_W, yB + 0.5)
+      ctx.stroke()
+      ctx.setLineDash([])
+    }
+
     // marquee
     if (marquee) {
       const mx = Math.min(marquee.x0, marquee.x1)
@@ -875,7 +997,7 @@ export default function NoteEditor({
       ctx.strokeRect(mx + 0.5, my + 0.5, mw, mh)
       ctx.setLineDash([])
     }
-  }, [events, contentH, duration, pxPerSec, sel, marquee])
+  }, [events, contentH, duration, pxPerSec, sel, marquee, loopA, loopB])
 
   // ---------- render bottom keyboard ----------
 
@@ -1159,6 +1281,30 @@ export default function NoteEditor({
               </button>
             )}
 
+            {onSetLoopA && (
+              <>
+                <div className="editor-side-title">Loop</div>
+                <div className="editor-side-row">
+                  <button className="tool"
+                    title="Loop start = current bar position"
+                    onClick={onSetLoopA}>A = bar</button>
+                  <button className="tool"
+                    title="Loop end = current bar position"
+                    onClick={onSetLoopB}>B = bar</button>
+                </div>
+                {loopA != null && loopB != null && loopB > loopA ? (
+                  <button className="tool" onClick={onClearLoop}
+                    title="Stop looping this region">
+                    ✕ {formatTime(Math.round(loopA))}–{formatTime(Math.round(loopB))}
+                  </button>
+                ) : (loopA != null || loopB != null) ? (
+                  <span className="editor-side-hint">
+                    {loopA != null ? 'A set — now set B past it.' : 'B set — now set A before it.'}
+                  </span>
+                ) : null}
+              </>
+            )}
+
             <div className="editor-side-title">Clean up</div>
             <button className="tool" onClick={findGhosts}
               title="Select faint/short ghost notes for review, then Delete">
@@ -1167,6 +1313,10 @@ export default function NoteEditor({
             <button className="tool" onClick={capLongNotes}
               title="Shorten notes held longer than a real string can ring">
               ⭰ Cap long notes
+            </button>
+            <button className="tool" onClick={tightenChords}
+              title="Snap onsets within 25ms into one chord strike (selection, or the whole song)">
+              ⫤ Tighten chords
             </button>
             <button className="tool" onClick={selectAll}
               title="Select every note">
@@ -1177,6 +1327,30 @@ export default function NoteEditor({
               title="Delete the selected notes / pedals (Del)">
               🗑 Delete{selCount > 0 ? ' (' + selCount + ')' : ''}
             </button>
+
+            {sel.notes.size > 0 && (
+              <>
+                <div className="editor-side-title">Selection</div>
+                <div className="editor-side-row">
+                  <button className="tool" title="Transpose down a semitone"
+                    onClick={function () { transposeSelected(-1) }}>♭ −1</button>
+                  <button className="tool" title="Transpose up a semitone"
+                    onClick={function () { transposeSelected(1) }}>♯ +1</button>
+                </div>
+                <div className="editor-side-row">
+                  <button className="tool" title="Transpose down an octave"
+                    onClick={function () { transposeSelected(-12) }}>−8va</button>
+                  <button className="tool" title="Transpose up an octave"
+                    onClick={function () { transposeSelected(12) }}>+8va</button>
+                </div>
+                <div className="editor-side-row">
+                  <button className="tool" title="Selected notes 10% softer"
+                    onClick={function () { scaleSelectedVelocity(0.9) }}>▽ softer</button>
+                  <button className="tool" title="Selected notes 10% louder"
+                    onClick={function () { scaleSelectedVelocity(1.1) }}>△ louder</button>
+                </div>
+              </>
+            )}
 
             <div className="editor-side-title">History</div>
             <div className="editor-side-row">

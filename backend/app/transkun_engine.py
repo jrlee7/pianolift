@@ -59,8 +59,9 @@ def transcribe(wav_path):
     if data.ndim == 1:
         data = data[:, None]
     peak = float(np.max(np.abs(data))) if len(data) else 0.0
-    if peak > 0:  # same headroom normalization the ByteDance pass gets
-        data = data * (0.95 / max(peak, 0.95))
+    if peak > 0:  # same normalization the ByteDance pass gets: peak to
+        # ~-0.4 dBFS, gain capped at +18 dB (see pipeline._peak_normalize)
+        data = data * min(0.95 / peak, 8.0)
     if sr != model.fs:
         import soxr
         data = soxr.resample(data, sr, model.fs)
