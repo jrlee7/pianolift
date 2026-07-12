@@ -4,7 +4,9 @@ import { writeFile } from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import isDev from 'electron-is-dev'
+import electronUpdater from 'electron-updater'
 
+const { autoUpdater } = electronUpdater
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // Native folder browser + file write for "Save to USB" (the renderer's
@@ -103,7 +105,29 @@ app.on('ready', () => {
   session.defaultSession.setPermissionCheckHandler(() => true)
   startBackend()
   createWindow()
+  if (!isDev) checkForUpdates()
 })
+
+// Auto-update: on launch (production only) check the public releases feed and,
+// once a newer version has downloaded, prompt to restart & install. The feed is
+// configured by the "publish" block in package.json (github jrlee7/pianolift-releases);
+// updates trigger only when package.json "version" is bumped for a new release.
+function checkForUpdates() {
+  autoUpdater.on('update-downloaded', (info) => {
+    dialog.showMessageBox(mainWindow, {
+      type: 'info',
+      buttons: ['Restart now', 'Later'],
+      defaultId: 0,
+      title: 'Update ready',
+      message: 'PianoForge ' + info.version + ' has been downloaded.',
+      detail: 'Restart to install the update.'
+    }).then((res) => { if (res.response === 0) autoUpdater.quitAndInstall() })
+  })
+  autoUpdater.on('error', (err) => {
+    console.error('Auto-update error:', err ? (err.stack || err).toString() : 'unknown')
+  })
+  autoUpdater.checkForUpdates().catch((e) => console.error('checkForUpdates failed:', e))
+}
 
 app.on('window-all-closed', () => {
   if (backendProcess) {
