@@ -31,11 +31,17 @@
     "files": [
       "dist/**/*",
       "main.js",
-      "preload.cjs",
-      "../backend.exe"
+      "preload.cjs"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend.exe",
+        "to": "backend.exe"
+      }
     ],
     "directories": {
-      "buildResources": "assets"
+      "buildResources": "assets",
+      "output": "release"
     },
     "win": {
       "target": [

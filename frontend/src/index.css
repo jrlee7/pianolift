@@ -331,8 +331,8 @@ audio { width: 100%; height: 34px; }
 }
 .lib-title:hover { color: var(--accent); }
 .lib-rename { width: 100%; font-size: 14px; padding: 6px 10px; }
-.lib-card-actions { display: flex; gap: 8px; align-items: center; }
-.lib-card-actions .primary { flex: 1; }
+.lib-card-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.lib-card-actions .primary { flex: 1 1 100%; }
 .lib-audio audio { width: 100%; height: 34px; }
 .lib-mp3-dl { display: inline-flex; }
 .lib-select {
