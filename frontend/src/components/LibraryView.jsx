@@ -3,7 +3,7 @@ import {
   firebaseReady, listSongs, deleteSong, renameSong, downloadMidiBase64,
   listFolders, createFolder, deleteFolder, setSongFolder
 } from '../firebase.js'
-import { importFromLibrary } from '../api.js'
+import { importFromLibrary, buildDiskFromLibrary } from '../api.js'
 
 function millis(song) {
   return song.createdAt && song.createdAt.toMillis ? song.createdAt.toMillis() : 0
@@ -11,7 +11,14 @@ function millis(song) {
 
 // Strip characters Windows/FAT (USB stick) filesystems reject.
 function fsSafe(name) {
-  const cleaned = (name || '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[ .]+$/, '')
+  // Windows-illegal chars, plus '&' (the Enspire's USB song indexer silently
+  // skips any file whose name contains it), then cap length — the Enspire also
+  // drops very long names from the list. Trim trailing space/dot after slicing.
+  const cleaned = (name || '')
+    .replace(/[<>:"/\\|?*\x00-\x1f&]/g, '_')
+    .replace(/[ .]+$/, '')
+    .slice(0, 60)
+    .replace(/[ .]+$/, '')
   return cleaned || 'song'
 }
 
@@ -29,7 +36,7 @@ async function writeInto(dir, filename, data) {
   await w.close()
 }
 
-export default function LibraryView({ onEdit }) {
+export default function LibraryView({ onEdit, onWatch }) {
   const [songs, setSongs] = useState([])
   const [importingId, setImportingId] = useState(null)
   const [folders, setFolders] = useState([])
@@ -227,17 +234,36 @@ export default function LibraryView({ onEdit }) {
   async function handleCopyToUsb() {
     const chosen = songs.filter(function (s) { return selected.has(s.id) })
     if (!chosen.length) return
-    if (!window.showDirectoryPicker) {
-      alert('Your browser can\'t pick a folder. Use Chrome/Edge or the desktop app.')
-      return
+    // Desktop shell: native OS folder browser + Node write. Browser: File
+    // System Access API. `native.write(name, data)` takes a Blob or Uint8Array.
+    async function toBytes(data) {
+      return data instanceof Blob ? new Uint8Array(await data.arrayBuffer()) : data
     }
-    let dir
-    try {
-      dir = await window.showDirectoryPicker({ mode: 'readwrite' })
-    } catch (e) {
-      if (e && e.name === 'AbortError') return // user cancelled the picker
-      alert('Could not open folder: ' + e.message)
-      return
+    let native
+    if (window.desktop) {
+      let dirPath
+      try {
+        dirPath = await window.desktop.pickFolder()
+      } catch (e) {
+        alert('Could not open folder: ' + e.message)
+        return
+      }
+      if (!dirPath) return // user cancelled
+      native = { write: async (name, data) => window.desktop.writeFile(dirPath, name, await toBytes(data)) }
+    } else {
+      if (!window.showDirectoryPicker) {
+        alert('Your browser can\'t pick a folder. Use Chrome/Edge or the desktop app.')
+        return
+      }
+      let dir
+      try {
+        dir = await window.showDirectoryPicker({ mode: 'readwrite' })
+      } catch (e) {
+        if (e && e.name === 'AbortError') return // user cancelled the picker
+        alert('Could not open folder: ' + e.message)
+        return
+      }
+      native = { write: (name, data) => writeInto(dir, name, data) }
     }
     setCopyResult(null)
     setCopying({ done: 0, total: chosen.length })
@@ -247,12 +273,12 @@ export default function LibraryView({ onEdit }) {
       const base = fsSafe(song.title)
       try {
         if (song.midiBase64) {
-          await writeInto(dir, base + '.mid', b64ToBytes(song.midiBase64))
+          await native.write(base + '.mid', b64ToBytes(song.midiBase64))
         }
         if (song.mp3Url) {
           const res = await fetch(song.mp3Url)
           if (!res.ok) throw new Error('MP3 download failed (' + res.status + ')')
-          await writeInto(dir, base + ' (no piano).mp3', await res.blob())
+          await native.write(base + ' (no piano).mp3', await res.blob())
         }
       } catch (e) {
         errors.push(song.title + ' — ' + (e.message || String(e)))
@@ -263,6 +289,95 @@ export default function LibraryView({ onEdit }) {
     setCopying(null)
     setCopyResult({ ok: chosen.length - errors.length, total: chosen.length, errors: errors })
     clearSelection()
+  }
+
+  // Pack every selected library song onto ONE 1995-Disklavier floppy image
+  // (many songs per Gotek slot). Songs are stored as baked MIDI; the backend
+  // decodes each and renders E-SEQ. Writes to the next free slot by default, or
+  // a slot the user names — overwriting an occupied one on confirm.
+  async function handleBuildDisk() {
+    const chosen = songs.filter(function (s) { return selected.has(s.id) })
+    const withMidi = chosen.filter(function (s) { return s.midiBase64 })
+    if (!withMidi.length) {
+      alert('None of the selected songs have stored MIDI to put on a disk.')
+      return
+    }
+    const raw = window.prompt(
+      'Write ' + withMidi.length + ' song' + (withMidi.length === 1 ? '' : 's') +
+      ' onto ONE floppy slot.\n\n' +
+      'Gotek slot number to write, or leave blank for the next free slot:', '')
+    if (raw === null) return
+    const t = raw.trim()
+    let slot = null
+    if (t !== '') {
+      slot = parseInt(t, 10)
+      if (Number.isNaN(slot) || slot < 0 || slot > 999) {
+        alert('Slot must be a number 0–999 (or blank for the next free slot).')
+        return
+      }
+    }
+    const payload = withMidi.map(function (s) {
+      return { name: s.title, midiBase64: s.midiBase64, settings: s.settings }
+    })
+    setCopyResult(null)
+    setCopying({ done: 0, total: withMidi.length, disk: true })
+    try {
+      let res
+      try {
+        res = await buildDiskFromLibrary(payload, { slot: slot })
+      } catch (e) {
+        if (e.status === 409 &&
+          confirm('Slot ' + slot + ' already holds a song. Overwrite it?')) {
+          res = await buildDiskFromLibrary(payload, { slot: slot, overwrite: true })
+        } else {
+          throw e
+        }
+      }
+      setCopying(null)
+      setCopyResult({
+        ok: withMidi.length, total: withMidi.length, errors: [],
+        note: 'onto slot ' + res.slot + ' (' + res.filename + '). Power-cycle '
+          + 'the piano/emulator to re-index, then pick disk ' + res.slot + '.'
+      })
+      clearSelection()
+    } catch (e) {
+      setCopying(null)
+      setCopyResult({ ok: 0, total: withMidi.length, errors: [e.message || String(e)] })
+    }
+  }
+
+  // Same multi-song floppy image, downloaded as a .hfe file to place on the
+  // stick manually (no plugged-in Gotek required).
+  async function handleDownloadDisk() {
+    const chosen = songs.filter(function (s) { return selected.has(s.id) })
+    const withMidi = chosen.filter(function (s) { return s.midiBase64 })
+    if (!withMidi.length) {
+      alert('None of the selected songs have stored MIDI to put on a disk.')
+      return
+    }
+    const payload = withMidi.map(function (s) {
+      return { name: s.title, midiBase64: s.midiBase64, settings: s.settings }
+    })
+    setCopyResult(null)
+    setCopying({ done: 0, total: withMidi.length, disk: true })
+    try {
+      const blob = await buildDiskFromLibrary(payload, { download: true })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'PIANODISK.hfe'
+      a.click()
+      URL.revokeObjectURL(url)
+      setCopying(null)
+      setCopyResult({
+        ok: withMidi.length, total: withMidi.length, errors: [],
+        note: 'as PIANODISK.hfe — rename it DSKAxxxx.hfe on the stick to fill a slot.'
+      })
+      clearSelection()
+    } catch (e) {
+      setCopying(null)
+      setCopyResult({ ok: 0, total: withMidi.length, errors: [e.message || String(e)] })
+    }
   }
 
   async function handleDeleteFolder(folder) {
@@ -367,10 +482,26 @@ export default function LibraryView({ onEdit }) {
             disabled={selected.size === 0 || Boolean(copying)}
             onClick={handleCopyToUsb}
           >
-            {copying
+            {copying && !copying.disk
               ? 'Copying ' + copying.done + '/' + copying.total + '…'
               : '💾 Copy ' + (selected.size || '') + ' to USB folder…'}
           </button>
+          <button
+            className="primary"
+            disabled={selected.size === 0 || Boolean(copying)}
+            title="Pack every selected song onto ONE 1995-Disklavier floppy slot (Gotek). One slot then holds many songs."
+            onClick={handleBuildDisk}
+          >
+            {copying && copying.disk
+              ? 'Building disk…'
+              : '💿 Build 1 floppy (' + (selected.size || '') + ' songs)'}
+          </button>
+          <button
+            className="ghost"
+            disabled={selected.size === 0 || Boolean(copying)}
+            title="Download the combined floppy image (.hfe) to drop on the stick yourself — no plugged-in Gotek needed."
+            onClick={handleDownloadDisk}
+          >⬇ .hfe</button>
         </div>
       )}
 
@@ -378,8 +509,9 @@ export default function LibraryView({ onEdit }) {
         <div className="notice" style={{
           borderColor: copyResult.errors.length ? 'var(--red, #c0392b)' : 'var(--green)'
         }}>
-          ✓ Copied <strong>{copyResult.ok}/{copyResult.total}</strong> song
-          {copyResult.total === 1 ? '' : 's'} (.mid + accompaniment .mp3) to the folder.
+          ✓ {copyResult.note ? 'Wrote' : 'Copied'} <strong>{copyResult.ok}/{copyResult.total}</strong> song
+          {copyResult.total === 1 ? '' : 's'}
+          {copyResult.note ? ' ' + copyResult.note : ' (.mid + accompaniment .mp3) to the folder.'}
           {copyResult.errors.length > 0 && (
             <div style={{ marginTop: 6 }}>
               Failed: {copyResult.errors.join('; ')}
@@ -473,6 +605,13 @@ export default function LibraryView({ onEdit }) {
                     title="Download the accompaniment (piano removed) that plays with the MIDI">
                     <button className="ghost">⬇ .mp3</button>
                   </a>
+                )}
+                {onWatch && song.midiBase64 && (
+                  <button className="ghost"
+                    title="Watch the video while the Disklavier plays live (song stays in the library)"
+                    onClick={function () { onWatch(song) }}>
+                    🎬 Watch
+                  </button>
                 )}
                 <button className="ghost"
                   title="Re-open in the editor to cap sustain, edit notes, re-export"

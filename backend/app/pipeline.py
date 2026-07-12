@@ -54,7 +54,7 @@ def _ensure_checkpoint(progress_cb):
 # system ffmpeg by default, so fetch a static build ourselves, same as the
 # transcription checkpoint above.
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-FFMPEG_DIR = os.path.join(os.path.expanduser("~"), "pianolift_ffmpeg")
+FFMPEG_DIR = os.path.join(os.path.expanduser("~"), "pianoforge_ffmpeg")
 FFMPEG_EXE = os.path.join(FFMPEG_DIR, "ffmpeg.exe")
 
 
@@ -139,11 +139,12 @@ def separate_piano(audio_path, job_dir, progress_cb):
 _SOUNDFILE_EXTS = (".wav", ".flac", ".mp3", ".ogg")
 
 
-def ensure_wav_input(audio_path, job_dir, progress_cb):
+def ensure_wav_input(audio_path, job_dir, progress_cb, keep_original=False):
     """Return a path every pipeline stage can read: the file itself when
     soundfile handles the container, else a one-time ffmpeg decode to
     input.wav (44.1 kHz stereo PCM; -vn strips video streams). The original
-    container is deleted after a successful decode."""
+    container is deleted after a successful decode unless keep_original
+    (uploaded videos the Play tab streams later)."""
     import subprocess
 
     if os.path.splitext(audio_path)[1].lower() in _SOUNDFILE_EXTS:
@@ -158,7 +159,8 @@ def ensure_wav_input(audio_path, job_dir, progress_cb):
         tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
         raise RuntimeError("audio decode failed: " +
                            (tail[-1] if tail else "ffmpeg error"))
-    os.remove(audio_path)
+    if not keep_original:
+        os.remove(audio_path)
     return wav_path
 
 
@@ -438,3 +440,42 @@ def run_job(job_dir, audio_path, progress_cb, piano_only=False):
         "ghostCount": verify_stats["ghosts"],
         "trimmedCount": verify_stats["trimmed"],
     }
+
+
+def mux_backing_video(job_dir, video_name, progress_cb):
+    """Replace a kept video's audio with the piano-removed stem, so the Play
+    tab (video on the TV) plays the backing track while the real Disklavier
+    plays the piano — no need to mute the video's own piano.
+
+    The no_piano stem is full-length and on the original mix's timeline (both
+    it and the video derive from the same download), so audio lines up 1:1
+    with the picture and with the events the video-sync player schedules.
+
+    Returns the new video's basename ("video_bg.mp4") on success, else None
+    (piano-only jobs, missing stem, or a codec the mp4 container can't hold
+    by stream-copy — the caller keeps the original video in that case).
+    """
+    import subprocess
+
+    src = os.path.join(job_dir, video_name)
+    no_piano = os.path.join(job_dir, "separated", "no_piano.wav")
+    if not os.path.exists(src) or not os.path.exists(no_piano):
+        return None
+    _ensure_ffmpeg(progress_cb)
+    progress_cb("muxing video", 0)
+    out = os.path.join(job_dir, "video_bg.mp4")
+    # -c:v copy: never re-encode the picture (fast, lossless). URL downloads
+    # are H.264 mp4 (merge_output_format=mp4, height<=1080), which the mp4
+    # container copies cleanly; an uploaded VP9/AV1 file may not, so a copy
+    # failure just falls back to the original video below.
+    proc = subprocess.run(
+        [FFMPEG_EXE, "-y", "-i", src, "-i", no_piano,
+         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+         "-c:a", "aac", "-b:a", "256k", "-shortest", out],
+        capture_output=True)
+    if proc.returncode != 0 or not os.path.exists(out):
+        if os.path.exists(out):
+            os.remove(out)
+        return None
+    progress_cb("muxing video", 100)
+    return "video_bg.mp4"

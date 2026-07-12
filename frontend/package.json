@@ -1,5 +1,5 @@
 {
-  "name": "pianolift",
+  "name": "pianoforge",
   "private": true,
   "version": "0.1.0",
   "repository": "github:jrlee7/pianolift",
@@ -26,12 +26,12 @@
     "vite": "^6.3.5"
   },
   "build": {
-    "appId": "com.pianolift.app",
-    "productName": "PianoLift",
+    "appId": "com.pianoforge.app",
+    "productName": "PianoForge",
     "files": [
       "dist/**/*",
       "main.js",
-      "preload.js",
+      "preload.cjs",
       "../backend.exe"
     ],
     "directories": {

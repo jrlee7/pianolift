@@ -1,4 +1,4 @@
-"""PianoLift API server.
+"""PianoForge API server.
 
 Jobs live under backend/jobs/<id>/ :
   input.mp3      uploaded audio
@@ -15,15 +15,18 @@ import os
 import queue as queue_mod
 import re
 import shutil
+import tempfile
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException
+from fastapi import (FastAPI, UploadFile, File, Form, Body, HTTPException,
+                     Request)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import (pipeline, midi_writer, note_verify, eseq_writer, disk_writer,
                transkun_engine,
@@ -32,8 +35,13 @@ from . import (pipeline, midi_writer, note_verify, eseq_writer, disk_writer,
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
+# Videos outlive their conversion job here (too big for the cloud library):
+# "Move to library" relocates a job's kept video into this folder and the
+# Firebase song doc records only the filename.
+MEDIA_DIR = os.path.join(BASE_DIR, "media")
+os.makedirs(MEDIA_DIR, exist_ok=True)
 
-app = FastAPI(title="PianoLift")
+app = FastAPI(title="PianoForge")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -127,16 +135,17 @@ def _safe_name(title):
     return name[:120] or "untitled"
 
 
-def _process(job_id, kind, source, piano_only=False):
+def _process(job_id, kind, source, piano_only=False, include_video=False):
     """Worker-thread body: run the conversion in a killable child process and
     relay its progress/result into the in-memory job. `kind` is 'file' (source
-    is an audio path) or 'url' (source is a link the child downloads first)."""
+    is an audio path) or 'url' (source is a link the child downloads first).
+    include_video keeps the URL download's video for the Play tab."""
     job_dir = _job_dir(job_id)
     ctx = multiprocessing.get_context("spawn")
     q = ctx.Queue()
     proc = ctx.Process(
         target=job_runner.run_job_process,
-        args=(job_dir, kind, source, piano_only, q))
+        args=(job_dir, kind, source, piano_only, q, include_video))
 
     with jobs_lock:
         if job_id in cancelled:
@@ -177,6 +186,8 @@ def _process(job_id, kind, source, piano_only=False):
                     job["inputFile"] = msg[1]
                     if msg[2]:  # None = file job re-decoded, keep its name
                         job["name"] = _safe_name(msg[2])
+                    if len(msg) > 3 and msg[3]:  # kept video for the Play tab
+                        job["videoFile"] = msg[3]
                     _persist(job_id)
             continue
         outcome = msg
@@ -262,6 +273,7 @@ def create_job_from_url(payload: dict = Body(...)):
     separator/transcriber never see a second lossy encode."""
     url = (payload.get("url") or "").strip()
     piano_only = bool(payload.get("pianoOnly"))
+    include_video = bool(payload.get("includeVideo"))
     if not url.lower().startswith(("http://", "https://")):
         raise HTTPException(400, "paste a full link starting with http(s)://")
     job_id = uuid.uuid4().hex[:12]
@@ -280,7 +292,8 @@ def create_job_from_url(payload: dict = Body(...)):
     with jobs_lock:
         jobs[job_id] = job
         _persist(job_id)
-    futures[job_id] = executor.submit(_process, job_id, "url", url, piano_only)
+    futures[job_id] = executor.submit(
+        _process, job_id, "url", url, piano_only, include_video)
     return job
 
 
@@ -620,7 +633,9 @@ def save_settings(job_id: str, payload: dict = Body(...)):
     if job is None:
         raise HTTPException(404, "job not found")
     keys = ("velMin", "velMax", "gamma", "offsetMs",
-            "pedal", "releaseMs", "capSustain")
+            "pedal", "releaseMs", "capSustain",
+            # video-sync player: per-song piano/pedal timing offsets
+            "videoSyncMs", "pedalLagMs")
     settings = {k: payload[k] for k in keys if k in payload}
     with jobs_lock:
         job["settings"] = settings
@@ -777,6 +792,32 @@ def usb_status():
     }
 
 
+@app.get("/api/gotek/catalog")
+def gotek_catalog(fast: bool = True):
+    """Full contents of the emulator stick: every DSKAxxxx.hfe slot with the
+    songs on it (decoded from each disk's FAT/PIANODIR). Powers the Disk tab's
+    printable catalog. Blanks are listed too.
+
+    fast=True (default) fingerprints slots and only MFM-decodes the ones that
+    aren't the blank template, so a stick full of empty slots scans in a
+    fraction of the time. fast=false decodes every slot."""
+    root = usb.find_usb_drive()
+    if root is None:
+        return {"found": False}
+    slots = usb.scan_catalog(root, fast=fast)
+    used = sum(1 for s in slots if not s.get("blank"))
+    total_songs = sum(len(s.get("songs", [])) for s in slots)
+    return {
+        "found": True,
+        "drive": root,
+        "slots": slots,
+        "usedSlots": used,
+        "totalSlots": len(slots),
+        "totalSongs": total_songs,
+        "fast": fast,
+    }
+
+
 @app.get("/api/drives")
 def drives_status():
     """Removable drives currently plugged in, plus whether the Gotek stick
@@ -862,6 +903,202 @@ def save_job_to_usb(job_id: str, vel_min: int = 20, vel_max: int = 112,
         "slot": slot,
         "filename": "DSKA%04d.hfe" % slot,
     }
+
+
+# ---------------------------------------------------------------- multi-song disk
+# One Gotek slot = one .hfe = one 720K floppy. A floppy holds many E-SEQ songs,
+# so these endpoints pack several converted jobs (or several library songs) onto
+# a single slot instead of one song per slot.
+
+_DISK_DEFAULTS = {"velMin": 20, "velMax": 112, "gamma": 1.0,
+                  "offsetMs": 0, "pedal": True, "releaseMs": 0,
+                  "capSustain": True}
+
+
+def _norm_disk_settings(raw):
+    """Merge a job/library settings dict over the export defaults."""
+    s = dict(_DISK_DEFAULTS)
+    if isinstance(raw, dict):
+        for k in _DISK_DEFAULTS:
+            if raw.get(k) is not None:
+                s[k] = raw[k]
+    return s
+
+
+def _disk_dos_bases(names):
+    """Unique 8-char DOS base per song: a 2-digit play-order prefix plus up to
+    6 alphanumeric chars from the title. The prefix orders the piano's
+    song-select menu and guarantees uniqueness — the 1995 firmware refuses a
+    disk with two identical 8.3 names."""
+    out = []
+    for i, nm in enumerate(names):
+        core = eseq_writer._sanitize_83(nm or "SONG").rstrip() or "SONG"
+        out.append(("%02d" % ((i + 1) % 100)) + core[:6])
+    return out
+
+
+def _eseq_bytes(notes, pedals, title, dos_base, s):
+    """Render one E-SEQ .FIL to a temp file and return its bytes. dos_base is
+    baked into the .FIL header so it matches the disk's directory entry."""
+    fd, tmp = tempfile.mkstemp(suffix=".fil")
+    os.close(fd)
+    try:
+        eseq_writer.write_eseq(
+            notes, pedals, tmp, title=title,
+            vel_min=int(s["velMin"]), vel_max=int(s["velMax"]),
+            gamma=float(s["gamma"]), offset_ms=float(s["offsetMs"]),
+            include_pedal=bool(s["pedal"]), dos_name=dos_base,
+            release_ms=int(s["releaseMs"]), cap_sustain=bool(s["capSustain"]))
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _decode_library_midi(raw, settings):
+    """Decode a library song's baked MIDI into events, inverting the velocity
+    curve it was archived with so re-rendering re-applies the same curve
+    losslessly (mirrors POST /jobs/from-library)."""
+    fd, tmp = tempfile.mkstemp(suffix=".mid")
+    os.close(fd)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        notes, pedals = midi_writer.read_midi(tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    st = settings or {}
+    try:
+        vmin = float(st.get("velMin", 20))
+        vmax = float(st.get("velMax", 112))
+        g = float(st.get("gamma", 1.0))
+    except (TypeError, ValueError):
+        vmin, vmax, g = 20.0, 112.0, 1.0
+    if vmax > vmin and g > 0:
+        for n in notes:
+            norm = (n["velocity"] - vmin) / (vmax - vmin)
+            norm = min(1.0, max(0.0, norm))
+            n["velocity"] = max(1, min(127, int(round(
+                127.0 * norm ** (1.0 / g)))))
+    return notes, pedals
+
+
+def _finish_disk(hfe, payload):
+    """Deliver a built multi-song .hfe: stream it back when download is
+    requested, otherwise write it to the stick (next free slot by default, or a
+    caller-chosen slot — overwriting an occupied one only when overwrite=true)."""
+    if payload.get("download"):
+        return StreamingResponse(
+            BytesIO(hfe), media_type="application/octet-stream",
+            headers={"Content-Disposition":
+                     'attachment; filename="PIANODISK.hfe"'})
+    slot = payload.get("slot")
+    if slot is not None:
+        try:
+            slot = int(slot)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "slot must be an integer")
+    try:
+        if slot is not None:
+            if not payload.get("overwrite"):
+                root = usb.find_usb_drive()
+                if root is None:
+                    raise FileNotFoundError(
+                        "No Gotek/Nalbantov USB stick found. Plug it in and "
+                        "try again.")
+                path = os.path.join(root, "DSKA%04d.hfe" % slot)
+                if os.path.exists(path) and not usb.is_blank_slot(path):
+                    raise HTTPException(
+                        409, "slot %d already holds a song; resend with "
+                        "overwrite to replace it" % slot)
+            root, used = usb.save_to_slot(hfe, slot)
+        else:
+            root, used = usb.save_to_next_free(hfe)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except (RuntimeError, OSError, ValueError) as e:
+        raise HTTPException(500, str(e))
+    return {"drive": root, "slot": used, "filename": "DSKA%04d.hfe" % used}
+
+
+@app.post("/api/disk/build")
+def build_disk_from_jobs(payload: dict = Body(...)):
+    """Pack several converted jobs onto ONE floppy image (many songs per Gotek
+    slot). Each job renders with its own saved export settings.
+    Body: {jobIds:[...], slot?:int, overwrite?:bool, download?:bool}."""
+    job_ids = payload.get("jobIds")
+    if not isinstance(job_ids, list) or not job_ids:
+        raise HTTPException(400, "jobIds must be a non-empty list")
+    prepared = []  # (job, notes, pedals, settings)
+    titles = []
+    for jid in job_ids:
+        job = jobs.get(jid)
+        if job is None:
+            raise HTTPException(404, "job not found: " + str(jid))
+        events_path = os.path.join(_job_dir(jid), "events.json")
+        if not os.path.exists(events_path):
+            raise HTTPException(404, "events not ready for job " + str(jid))
+        with open(events_path) as f:
+            events = json.load(f)
+        notes, pedals = _trim_tail(job, events)
+        prepared.append((job, notes, pedals,
+                         _norm_disk_settings(job.get("settings"))))
+        titles.append(job.get("name") or "Song")
+    bases = _disk_dos_bases(titles)
+    songs = []
+    for (job, notes, pedals, s), base in zip(prepared, bases):
+        eff = dict(s)
+        eff["offsetMs"] = (float(s["offsetMs"]) + job.get("encoderDelayMs", 0.0)
+                           - job.get("trimStartSec", 0.0) * 1000.0)
+        songs.append((_eseq_bytes(notes, pedals, job.get("name") or "",
+                                  base, eff), base))
+    try:
+        hfe = disk_writer.build_disk_hfe_multi(songs)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _finish_disk(hfe, payload)
+
+
+@app.post("/api/disk/build-midi")
+def build_disk_from_midi(payload: dict = Body(...)):
+    """Pack several library songs (stored as baked MIDI) onto one floppy image.
+    Body: {songs:[{name, midiBase64, settings}], slot?, overwrite?, download?}."""
+    items = payload.get("songs")
+    if not isinstance(items, list) or not items:
+        raise HTTPException(400, "songs must be a non-empty list")
+    titles = [it.get("name") or "Song" for it in items]
+    bases = _disk_dos_bases(titles)
+    built = []
+    for it, base in zip(items, bases):
+        name = it.get("name") or "song"
+        try:
+            raw = base64.b64decode(it.get("midiBase64") or "", validate=True)
+        except (ValueError, TypeError):
+            raise HTTPException(400, "invalid midiBase64 for " + name)
+        if not raw:
+            raise HTTPException(400, "empty MIDI for " + name)
+        try:
+            notes, pedals = _decode_library_midi(raw, it.get("settings"))
+        except Exception as e:
+            raise HTTPException(400, "could not parse MIDI for %s: %s"
+                                % (name, e))
+        s = _norm_disk_settings(it.get("settings"))
+        # Offsets/tail were baked into the stored MIDI's event times; don't
+        # apply them a second time on export.
+        s["offsetMs"] = 0
+        s["releaseMs"] = 0
+        built.append((_eseq_bytes(notes, pedals, name, base, s), base))
+    try:
+        hfe = disk_writer.build_disk_hfe_multi(built)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _finish_disk(hfe, payload)
 
 
 def _trim_events_window(events, abs_start, abs_end):
@@ -1017,6 +1254,136 @@ def get_accompaniment(job_id: str):
     return FileResponse(
         path, media_type="audio/mpeg",
         filename=job["name"] + " (no piano).mp3")
+
+
+_VIDEO_MEDIA_TYPES = {
+    ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
+    ".mkv": "video/x-matroska", ".mov": "video/quicktime",
+}
+
+
+def _video_media_type(path):
+    return _VIDEO_MEDIA_TYPES.get(
+        os.path.splitext(path)[1].lower(), "video/mp4")
+
+
+def _serve_video(path, request):
+    """Stream a video file honoring HTTP Range requests. Starlette's
+    FileResponse ignores Range; without 206 responses the <video> element
+    can't seek beyond what it has already buffered."""
+    size = os.path.getsize(path)
+    media = _video_media_type(path)
+    rng = request.headers.get("range")
+    m = re.match(r"bytes=(\d*)-(\d*)$", rng or "")
+    if not m or (not m.group(1) and not m.group(2)):
+        return FileResponse(
+            path, media_type=media, headers={"Accept-Ranges": "bytes"})
+    if m.group(1):
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else size - 1
+    else:  # suffix form: bytes=-N (last N bytes)
+        start = max(0, size - int(m.group(2)))
+        end = size - 1
+    end = min(end, size - 1)
+    if start > end or start >= size:
+        raise HTTPException(416, "range out of bounds")
+
+    def stream():
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = f.read(min(512 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(stream(), status_code=206, media_type=media, headers={
+        "Content-Range": "bytes %d-%d/%d" % (start, end, size),
+        "Content-Length": str(end - start + 1),
+        "Accept-Ranges": "bytes",
+    })
+
+
+@app.get("/api/jobs/{job_id}/video")
+def get_job_video(job_id: str, request: Request):
+    """The video kept with this conversion (URL fetch with 'include video',
+    or an uploaded video file), for the Play tab."""
+    job = jobs.get(job_id)
+    if job is None or not job.get("videoFile"):
+        raise HTTPException(404, "no video kept for this song")
+    path = os.path.join(_job_dir(job_id), job["videoFile"])
+    if not os.path.exists(path):
+        raise HTTPException(404, "video file missing")
+    return _serve_video(path, request)
+
+
+@app.get("/api/media/{name}")
+def get_media(name: str, request: Request):
+    """Serve an archived video from the local media folder (library songs)."""
+    if "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(400, "bad name")
+    path = os.path.join(MEDIA_DIR, name)
+    if not os.path.exists(path):
+        raise HTTPException(404, "not found")
+    return _serve_video(path, request)
+
+
+@app.post("/api/jobs/{job_id}/archive-video")
+def archive_video(job_id: str):
+    """Move the job's kept video into the local media folder so it survives
+    the job's deletion when the song moves to the (cloud) library — video
+    files are far too big for Firebase, so they live on this computer and
+    the library entry stores just the filename."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    video_rel = job.get("videoFile")
+    if not video_rel:
+        raise HTTPException(404, "no video kept for this song")
+    src = os.path.join(_job_dir(job_id), video_rel)
+    if not os.path.exists(src):
+        raise HTTPException(404, "video file missing")
+    ext = os.path.splitext(video_rel)[1].lower()
+    base = _fs_safe_name(job["name"])
+    name = base + ext
+    n = 2
+    while os.path.exists(os.path.join(MEDIA_DIR, name)):
+        name = "%s (%d)%s" % (base, n, ext)
+        n += 1
+    shutil.move(src, os.path.join(MEDIA_DIR, name))
+    with jobs_lock:
+        job.pop("videoFile", None)
+        _persist(job_id)
+    return {"file": name}
+
+
+@app.post("/api/midi/decode")
+def decode_midi(payload: dict = Body(...)):
+    """Decode a base64 MIDI blob into note/pedal events — the video-sync
+    player uses this to play library songs (stored as baked MIDI) without
+    creating a throwaway job. Velocities come back as stored (already
+    velocity-mapped at render time), so the player must not re-map them."""
+    try:
+        raw = base64.b64decode(payload.get("midiBase64") or "", validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "invalid midiBase64")
+    if not raw:
+        raise HTTPException(400, "empty MIDI payload")
+    tmp = os.path.join(JOBS_DIR, "_decode_%s.mid" % uuid.uuid4().hex[:8])
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        notes, pedals = midi_writer.read_midi(tmp)
+    except Exception as e:
+        raise HTTPException(400, "could not parse MIDI: " + str(e))
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return {"notes": notes, "pedals": pedals}
 
 
 @app.get("/api/health")

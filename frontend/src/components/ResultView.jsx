@@ -3,7 +3,7 @@ import NoteEditor from './NoteEditor.jsx'
 import {
   getEvents, midiUrl, audioUrl, eseqUrl, hfeUrl, fetchMidiBase64,
   getUsbStatus, saveToUsb, saveEvents, resetEvents,
-  getDrives, exportToDrive, trimJob, saveJobSettings
+  getDrives, exportToDrive, trimJob, saveJobSettings, archiveVideo
 } from '../api.js'
 import { saveSong, findExistingSong } from '../firebase.js'
 import { createPreviewPlayer, createNotePlayer } from '../previewSynth.js'
@@ -21,7 +21,7 @@ function tagIds(ev) {
   return ev
 }
 
-export default function ResultView({ job, firebaseReady, onArchived }) {
+export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo }) {
   const [events, setEvents] = useState(null)
   // Seed from the job's saved sliders so a re-opened song shows its tuning.
   const [settings, setSettings] = useState(
@@ -456,13 +456,23 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
           /* audio fetch failed — still archive the MIDI below */
         }
       }
+      // Park the kept video in the backend's local media folder before the
+      // job (and its files) get deleted; the song stores just the filename.
+      let localVideo = null
+      if (job.videoFile) {
+        try {
+          localVideo = (await archiveVideo(job.id)).file
+        } catch (e) { /* best-effort — song still moves without its video */ }
+      }
       const r = await saveSong({
         title: job.name,
         noteCount: events ? events.notes.length : job.noteCount,
         pedalCount: events ? events.pedals.length : job.pedalCount,
         settings: settings,
         midiBase64: b64,
-        sourceUrl: job.sourceUrl || null
+        sourceUrl: job.sourceUrl || null,
+        localVideo: localVideo,
+        videoIsBacking: job.videoFile === 'video_bg.mp4'
       }, mp3Blob)
       if (mp3Blob && !r.mp3Uploaded) {
         alert('Saved the MIDI, but the source audio upload failed: ' +
@@ -670,6 +680,13 @@ export default function ResultView({ job, firebaseReady, onArchived }) {
       </details>
 
       <div className="actions">
+        {onPlayVideo && (
+          <button className="primary"
+            title="Watch the source video while the Disklavier plays live over USB-MIDI"
+            onClick={function () { onPlayVideo(job.id) }}>
+            🎬 Play with video
+          </button>
+        )}
         <a href={midiUrl(job.id, settings)} download={job.name + '.mid'}>
           <button className="primary">⬇ Download .mid for ENSPIRE</button>
         </a>

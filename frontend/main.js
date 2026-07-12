@@ -1,10 +1,25 @@
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, session } from 'electron'
 import { spawn } from 'child_process'
+import { writeFile } from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import isDev from 'electron-is-dev'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+// Native folder browser + file write for "Save to USB" (the renderer's
+// window.showDirectoryPicker is not dependable inside the packaged shell).
+ipcMain.handle('pick-folder', async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choose the folder on your Enspire USB',
+    properties: ['openDirectory', 'createDirectory']
+  })
+  return res.canceled || !res.filePaths.length ? null : res.filePaths[0]
+})
+
+ipcMain.handle('write-file', async (_e, dir, name, bytes) => {
+  await writeFile(path.join(dir, name), Buffer.from(bytes))
+})
 
 let mainWindow
 let backendProcess
@@ -13,10 +28,11 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
+    icon: path.join(__dirname, 'assets/icon.png'),
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
-      preload: path.join(__dirname, 'preload.js')
+      preload: path.join(__dirname, 'preload.cjs')
     }
   })
 
@@ -77,6 +93,14 @@ function startBackend() {
 }
 
 app.on('ready', () => {
+  // Web MIDI (the video-sync player streaming to the Disklavier's USB TO
+  // HOST port) needs the 'midi' permission. Electron grants requests by
+  // default, but be explicit so a future Electron default-flip can't
+  // silently kill live playback.
+  session.defaultSession.setPermissionRequestHandler((wc, permission, cb) => {
+    cb(true)
+  })
+  session.defaultSession.setPermissionCheckHandler(() => true)
   startBackend()
   createWindow()
 })

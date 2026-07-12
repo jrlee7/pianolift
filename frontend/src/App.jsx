@@ -4,12 +4,14 @@ import JobCard from './components/JobCard.jsx'
 import ResultView from './components/ResultView.jsx'
 import LibraryView from './components/LibraryView.jsx'
 import SourcesView from './components/SourcesView.jsx'
+import PlayerView from './components/PlayerView.jsx'
+import GotekView from './components/GotekView.jsx'
 import {
   listJobs, uploadMp3, submitUrl, deleteJob, verifyJob,
-  midiUrl, audioUrl, fetchMidiBase64
+  midiUrl, audioUrl, fetchMidiBase64, archiveVideo, buildDiskFromJobs
 } from './api.js'
 import {
-  firebaseReady, saveSong, saveSourceUrl, listSongs, isSameSong
+  firebaseReady, saveSong, saveSourceUrl, listSongs, isSameSong, findExistingSong
 } from './firebase.js'
 
 // Slider settings used for bulk export/move. Per-song tuning happens in the
@@ -21,7 +23,14 @@ const DEFAULTS = {
 
 // Strip characters Windows/FAT (USB stick) filesystems reject.
 function fsSafe(name) {
-  const cleaned = (name || '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[ .]+$/, '')
+  // Windows-illegal chars, plus '&' (the Enspire's USB song indexer silently
+  // skips any file whose name contains it), then cap length — the Enspire also
+  // drops very long names from the list. Trim trailing space/dot after slicing.
+  const cleaned = (name || '')
+    .replace(/[<>:"/\\|?*\x00-\x1f&]/g, '_')
+    .replace(/[ .]+$/, '')
+    .slice(0, 60)
+    .replace(/[ .]+$/, '')
   return cleaned || 'song'
 }
 
@@ -42,6 +51,9 @@ export default function App() {
   const [batch, setBatch] = useState(null) // null | { done, total, verb }
   const [batchResult, setBatchResult] = useState(null)
   const [search, setSearch] = useState('')
+  // Play tab target: {jobId} (Convert song) or {libSong} (library song).
+  // A fresh object per click so PlayerView re-targets even for the same song.
+  const [playerInit, setPlayerInit] = useState(null)
 
   const refresh = useCallback(async function () {
     try {
@@ -72,9 +84,18 @@ export default function App() {
     refresh()
   }
 
-  async function handleUrl(url, pianoOnly) {
+  async function handleUrl(url, pianoOnly, includeVideo) {
+    if (firebaseReady) {
+      try {
+        const dup = await findExistingSong(null, url)
+        if (dup && !confirm(
+          '"' + (dup.title || 'This song') + '" is already in your library. '
+          + 'Convert it again anyway?'
+        )) return
+      } catch (e) { /* best-effort — a lookup failure must not block converting */ }
+    }
     try {
-      await submitUrl(url, pianoOnly)
+      await submitUrl(url, pianoOnly, includeVideo)
       // Keep a history of every converted link so the source video can be
       // found again later (see the Links tab). Best-effort — a Firebase blip
       // must not block the conversion that already started.
@@ -122,6 +143,19 @@ export default function App() {
     setOpenJobId(jobId)
     await refresh()
   }, [refresh])
+
+  // Open the video-sync player targeting a Convert-tab job.
+  const handlePlayJob = useCallback(function (jobId) {
+    setPlayerInit({ jobId: jobId })
+    setTab('play')
+  }, [])
+
+  // Open the player on a library song (played straight from its baked MIDI —
+  // the library copy stays put, no import).
+  const handleWatchFromLibrary = useCallback(function (song) {
+    setPlayerInit({ libSong: song })
+    setTab('play')
+  }, [])
 
   // Save-to-library succeeded: the song now lives in the cloud library, so
   // drop the finished job off the Convert tab and collapse the editor.
@@ -179,17 +213,36 @@ export default function App() {
   async function handleCopyToUsb() {
     const chosen = chosenJobs()
     if (!chosen.length) return
-    if (!window.showDirectoryPicker) {
-      alert('Your browser can\'t pick a folder. Use Chrome/Edge or the desktop app.')
-      return
-    }
-    let dir
-    try {
-      dir = await window.showDirectoryPicker({ mode: 'readwrite' })
-    } catch (e) {
-      if (e && e.name === 'AbortError') return // user cancelled the picker
-      alert('Could not open folder: ' + e.message)
-      return
+    // Desktop shell: native OS folder browser + Node file write. Browser:
+    // File System Access API. `native` unifies both behind write(name, blob).
+    let native
+    if (window.desktop) {
+      let dirPath
+      try {
+        dirPath = await window.desktop.pickFolder()
+      } catch (e) {
+        alert('Could not open folder: ' + e.message)
+        return
+      }
+      if (!dirPath) return // user cancelled
+      native = {
+        write: async (name, blob) =>
+          window.desktop.writeFile(dirPath, name, new Uint8Array(await blob.arrayBuffer()))
+      }
+    } else {
+      if (!window.showDirectoryPicker) {
+        alert('Your browser can\'t pick a folder. Use Chrome/Edge or the desktop app.')
+        return
+      }
+      let dir
+      try {
+        dir = await window.showDirectoryPicker({ mode: 'readwrite' })
+      } catch (e) {
+        if (e && e.name === 'AbortError') return // user cancelled the picker
+        alert('Could not open folder: ' + e.message)
+        return
+      }
+      native = { write: (name, blob) => writeInto(dir, name, blob) }
     }
     setBatchResult(null)
     setBatch({ done: 0, total: chosen.length, verb: 'Copying' })
@@ -200,11 +253,11 @@ export default function App() {
       try {
         const midiRes = await fetch(midiUrl(job.id, jobSettings(job)))
         if (!midiRes.ok) throw new Error('MIDI render failed (' + midiRes.status + ')')
-        await writeInto(dir, base + '.mid', await midiRes.blob())
+        await native.write(base + '.mid', await midiRes.blob())
         if (job.accompaniment) {
           const mp3Res = await fetch(audioUrl(job.id, 'accompaniment'))
           if (!mp3Res.ok) throw new Error('MP3 fetch failed (' + mp3Res.status + ')')
-          await writeInto(dir, base + ' (no piano).mp3', await mp3Res.blob())
+          await native.write(base + ' (no piano).mp3', await mp3Res.blob())
         }
       } catch (e) {
         errors.push(job.name + ' — ' + (e.message || String(e)))
@@ -266,13 +319,24 @@ export default function App() {
             if (res.ok) mp3Blob = await res.blob()
           } catch (e) { /* archive MIDI-only if audio fetch fails */ }
         }
+        // Videos are too big for the cloud: park the file in the backend's
+        // local media folder (it would die with the job otherwise) and store
+        // only its filename on the song.
+        let localVideo = null
+        if (job.videoFile) {
+          try {
+            localVideo = (await archiveVideo(job.id)).file
+          } catch (e) { /* video archive best-effort — song still moves */ }
+        }
         await saveSong({
           title: job.name,
           noteCount: job.noteCount,
           pedalCount: job.pedalCount,
           settings: jobSettings(job),
           midiBase64: b64,
-          sourceUrl: job.sourceUrl || null
+          sourceUrl: job.sourceUrl || null,
+          localVideo: localVideo,
+          videoIsBacking: job.videoFile === 'video_bg.mp4'
         }, mp3Blob)
         await deleteJob(job.id)
         if (openJobId === job.id) setOpenJobId(null)
@@ -288,12 +352,92 @@ export default function App() {
     refresh()
   }
 
+  // Pack every selected finished song onto ONE floppy image (many songs per
+  // Gotek slot, instead of one song per slot). Writes to the next free slot by
+  // default, or a slot the user names — overwriting an occupied one on confirm.
+  async function handleBuildDisk() {
+    const chosen = chosenJobs()
+    if (!chosen.length) return
+    const raw = window.prompt(
+      'Write ' + chosen.length + ' song' + (chosen.length === 1 ? '' : 's') +
+      ' onto ONE floppy slot.\n\n' +
+      'Gotek slot number to write, or leave blank for the next free slot:', '')
+    if (raw === null) return // cancelled
+    const t = raw.trim()
+    let slot = null
+    if (t !== '') {
+      slot = parseInt(t, 10)
+      if (Number.isNaN(slot) || slot < 0 || slot > 999) {
+        alert('Slot must be a number 0–999 (or blank for the next free slot).')
+        return
+      }
+    }
+    const ids = chosen.map(function (j) { return j.id })
+    setBatchResult(null)
+    setBatch({ done: 0, total: chosen.length, verb: 'Building' })
+    try {
+      let res
+      try {
+        res = await buildDiskFromJobs(ids, { slot: slot })
+      } catch (e) {
+        if (e.status === 409 &&
+          confirm('Slot ' + slot + ' already holds a song. Overwrite it?')) {
+          res = await buildDiskFromJobs(ids, { slot: slot, overwrite: true })
+        } else {
+          throw e
+        }
+      }
+      setBatch(null)
+      setBatchResult({
+        verb: 'Wrote', ok: chosen.length, total: chosen.length, errors: [],
+        note: 'onto slot ' + res.slot + ' (' + res.filename + '). '
+          + 'Power-cycle the piano/emulator so it re-indexes, then pick disk '
+          + res.slot + ' — all ' + chosen.length + ' songs are on it.'
+      })
+      clearSelection()
+    } catch (e) {
+      setBatch(null)
+      setBatchResult({
+        verb: 'Wrote', ok: 0, total: chosen.length,
+        errors: [e.message || String(e)]
+      })
+    }
+  }
+
+  // Same multi-song floppy image, but hand back the .hfe file to save/drop on
+  // the stick manually (no plugged-in Gotek required).
+  async function handleDownloadDisk() {
+    const chosen = chosenJobs()
+    if (!chosen.length) return
+    const ids = chosen.map(function (j) { return j.id })
+    setBatchResult(null)
+    setBatch({ done: 0, total: chosen.length, verb: 'Building' })
+    try {
+      const blob = await buildDiskFromJobs(ids, { download: true })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'PIANODISK.hfe'
+      a.click()
+      URL.revokeObjectURL(url)
+      setBatch(null)
+      setBatchResult({
+        verb: 'Built', ok: chosen.length, total: chosen.length, errors: [],
+        note: 'as PIANODISK.hfe — rename it DSKAxxxx.hfe on the stick to fill a slot.'
+      })
+      clearSelection()
+    } catch (e) {
+      setBatch(null)
+      setBatchResult({
+        verb: 'Built', ok: 0, total: chosen.length,
+        errors: [e.message || String(e)]
+      })
+    }
+  }
+
   return (
     <div>
-      <h1>Piano<span className="accent">Lift</span> 🎹</h1>
-      <p className="tagline">
-        MP3 → piano stem → Disklavier ENSPIRE MIDI with dynamics + pedal
-      </p>
+      <h1><img src="/pianoforge.png" alt="PianoForge" className="logo" /></h1>
 
       <div className="tabs">
         <button
@@ -304,6 +448,14 @@ export default function App() {
           className={tab === 'library' ? 'active' : ''}
           onClick={function () { setTab('library') }}
         >Library</button>
+        <button
+          className={tab === 'play' ? 'active' : ''}
+          onClick={function () { setTab('play') }}
+        >Play</button>
+        <button
+          className={tab === 'disk' ? 'active' : ''}
+          onClick={function () { setTab('disk') }}
+        >Disk</button>
         <button
           className={tab === 'links' ? 'active' : ''}
           onClick={function () { setTab('links') }}
@@ -338,6 +490,22 @@ export default function App() {
                   ? 'Copying ' + batch.done + '/' + batch.total + '…'
                   : '💾 Copy ' + (selected.size || '') + ' to USB folder…'}
               </button>
+              <button
+                className="primary"
+                disabled={selected.size === 0 || Boolean(batch)}
+                title="Pack every selected song onto ONE 1995-Disklavier floppy slot (Gotek). One slot then holds many songs."
+                onClick={handleBuildDisk}
+              >
+                {batch && batch.verb === 'Building'
+                  ? 'Building disk…'
+                  : '💿 Build 1 floppy (' + (selected.size || '') + ' songs)'}
+              </button>
+              <button
+                className="ghost"
+                disabled={selected.size === 0 || Boolean(batch)}
+                title="Download the combined floppy image (.hfe) to drop on the stick yourself — no plugged-in Gotek needed."
+                onClick={handleDownloadDisk}
+              >⬇ .hfe</button>
               {firebaseReady && (
                 <button
                   className="primary"
@@ -357,7 +525,8 @@ export default function App() {
               borderColor: batchResult.errors.length ? 'var(--red, #c0392b)' : 'var(--green)'
             }}>
               ✓ {batchResult.verb} <strong>{batchResult.ok}/{batchResult.total}</strong> song
-              {batchResult.total === 1 ? '' : 's'}.
+              {batchResult.total === 1 ? '' : 's'}
+              {batchResult.note ? ' ' + batchResult.note : '.'}
               {batchResult.errors.length > 0 && (
                 <div style={{ marginTop: 6 }}>
                   Failed: {batchResult.errors.join('; ')}
@@ -407,6 +576,7 @@ export default function App() {
                     job={job}
                     firebaseReady={firebaseReady}
                     onArchived={handleArchived}
+                    onPlayVideo={handlePlayJob}
                   />
                 )}
               </div>
@@ -415,7 +585,16 @@ export default function App() {
         </div>
       )}
 
-      {tab === 'library' && <LibraryView onEdit={handleEditFromLibrary} />}
+      {tab === 'library' && (
+        <LibraryView
+          onEdit={handleEditFromLibrary}
+          onWatch={handleWatchFromLibrary}
+        />
+      )}
+
+      {tab === 'play' && <PlayerView jobs={jobs} initial={playerInit} />}
+
+      {tab === 'disk' && <GotekView />}
 
       {tab === 'links' && <SourcesView />}
     </div>

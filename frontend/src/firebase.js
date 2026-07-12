@@ -129,6 +129,11 @@ export async function saveSong(song, mp3Blob) {
     mp3Url: mp3Url,
     mp3Path: mp3Path,
     sourceUrl: song.sourceUrl || null,
+    // filename in the backend's local media folder (videos are too big for
+    // the cloud) — the Play tab streams it from this computer
+    localVideo: song.localVideo || null,
+    // that video's audio is the piano-removed backing track (leave unmuted)
+    videoIsBacking: Boolean(song.videoIsBacking),
     folder: song.folder || null,
     createdAt: serverTimestamp()
   })

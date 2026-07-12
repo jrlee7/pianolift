@@ -1,4 +1,4 @@
-# PianoLift 🎹
+# PianoForge 🎹
 
 Turn an MP3 into a Yamaha Disklavier ENSPIRE performance: extract the piano part,
 transcribe it to MIDI with **dynamics (velocities)** and **sustain pedal (CC64)**,

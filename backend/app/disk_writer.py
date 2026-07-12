@@ -71,8 +71,25 @@ def build_pianodir(entries):
 
 # ---------------------------------------------------------------- FAT12
 
+# Usable data clusters on a 720K FAT12 disk once the reserved sector, both
+# FATs and the fixed-size root directory are subtracted. A cluster is
+# SPC * BPS = 1024 bytes, so this is the real per-disk song-payload ceiling.
+DATA_CLUSTERS = (TOTAL_SECTORS - 1 - N_FATS * FAT_SECTORS
+                 - (ROOT_ENTRIES * 32) // BPS) // SPC
+
+
 def build_fat12(files):
     """files: [(dos11_name, data_bytes)]. Returns 737280-byte image."""
+    if len(files) > ROOT_ENTRIES:
+        raise ValueError(
+            "too many files for one disk (%d, max %d root entries)"
+            % (len(files), ROOT_ENTRIES))
+    need = sum(max(1, (len(d) + SPC * BPS - 1) // (SPC * BPS))
+               for _n, d in files)
+    if need > DATA_CLUSTERS:
+        raise ValueError(
+            "files exceed 720K disk capacity (%d of %d clusters used)"
+            % (need, DATA_CLUSTERS))
     img = bytearray(TOTAL_SECTORS * BPS)
     img[0:512] = BOOT_SECTOR
 
@@ -227,13 +244,38 @@ def img_to_hfe(img):
 
 # ---------------------------------------------------------------- top level
 
-def build_disk_hfe(fil_bytes, dos_base):
-    """fil_bytes: complete E-SEQ .FIL. dos_base: 8-char DOS name.
-    Returns .hfe image bytes."""
-    dos11 = (dos_base.upper()[:8].ljust(8) + "FIL")
-    pianodir = build_pianodir([(dos11, fil_bytes[:0x77])])
-    img = build_fat12([
-        ("PIANODIRFIL", pianodir),
-        (dos11, fil_bytes),
-    ])
+# PIANODIR.FIL is a fixed 6144-byte catalog: 16-byte header + 80 bytes per
+# song. That caps how many songs the piano's song-select menu can index.
+PIANODIR_MAX_SONGS = (6144 - 16) // 80  # 76
+
+
+def build_disk_hfe_multi(songs):
+    """songs: [(fil_bytes, dos_base)] in play order. Each dos_base must be a
+    unique 8-char DOS base (the piano rejects duplicate names, and each song's
+    own .FIL header at 0x27 must already carry the same name). Returns one
+    .hfe image holding every song plus the PIANODIR.FIL catalog."""
+    if not songs:
+        raise ValueError("no songs to write")
+    if len(songs) > PIANODIR_MAX_SONGS:
+        raise ValueError(
+            "too many songs for one disk (%d, max %d in the PIANODIR catalog)"
+            % (len(songs), PIANODIR_MAX_SONGS))
+    dir_entries = []
+    files = []
+    seen = set()
+    for fil_bytes, dos_base in songs:
+        dos11 = (dos_base.upper()[:8].ljust(8) + "FIL")
+        if dos11 in seen:
+            raise ValueError("duplicate disk song name: " + dos11)
+        seen.add(dos11)
+        dir_entries.append((dos11, fil_bytes[:0x77]))
+        files.append((dos11, fil_bytes))
+    pianodir = build_pianodir(dir_entries)
+    img = build_fat12([("PIANODIRFIL", pianodir)] + files)
     return img_to_hfe(img)
+
+
+def build_disk_hfe(fil_bytes, dos_base):
+    """Single-song disk. fil_bytes: complete E-SEQ .FIL; dos_base: 8-char DOS
+    name. Returns .hfe image bytes."""
+    return build_disk_hfe_multi([(fil_bytes, dos_base)])

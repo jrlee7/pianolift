@@ -5,6 +5,10 @@ WAV instead of MP3: the platform stream (usually Opus or AAC) is already
 lossy; decoding straight to PCM avoids a second lossy generation that would
 smear the transients the transcription model keys on, and sidesteps MP3
 encoder start-delay on the input entirely.
+
+include_video=True additionally keeps the full video (muxed mp4) in the job
+dir for the video-sync Play tab — the WAV is decoded from that same download,
+so audio and video can never come from different renditions/timelines.
 """
 
 import os
@@ -13,9 +17,10 @@ import subprocess
 from . import pipeline
 
 
-def download_audio(url, job_dir, progress_cb):
-    """Download the best audio stream for `url` into job_dir and decode it
-    to input.wav (44.1 kHz stereo PCM). Returns (wav_path, title)."""
+def download_audio(url, job_dir, progress_cb, include_video=False):
+    """Download `url` into job_dir and decode audio to input.wav (44.1 kHz
+    stereo PCM). Returns (wav_path, title, video_name) — video_name is the
+    kept video file's basename (include_video=True), else None."""
     import yt_dlp  # lazy: heavy import, keeps server startup fast
 
     pipeline._ensure_ffmpeg(lambda stage, pct: None)
@@ -41,6 +46,13 @@ def download_audio(url, job_dir, progress_cb):
         # skipped). Needs yt-dlp[default] for the bundled EJS solver.
         "js_runtimes": {"node": {}, "deno": {}},
     }
+    if include_video:
+        # Best video+audio muxed into mp4 (Chromium-playable, incl. vp9).
+        # Cap at 1080p — the TV doesn't need 4K and the files quadruple.
+        opts["format"] = ("bestvideo[height<=1080]+bestaudio"
+                          "/best[height<=1080]/best")
+        opts["merge_output_format"] = "mp4"
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
     if info is None:
@@ -70,6 +82,13 @@ def download_audio(url, job_dir, progress_cb):
         tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
         raise RuntimeError("audio decode failed: " +
                            (tail[-1] if tail else "ffmpeg error"))
-    os.remove(source)
+
+    video_name = None
+    if include_video:
+        # Keep the download itself as the job's video, under a stable name.
+        video_name = "video" + os.path.splitext(source)[1].lower()
+        os.replace(source, os.path.join(job_dir, video_name))
+    else:
+        os.remove(source)
     progress_cb("downloading", 100)
-    return wav_path, title
+    return wav_path, title, video_name

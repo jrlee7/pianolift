@@ -6,6 +6,14 @@ export default function UploadZone({ onFiles, onUrl }) {
   const [pianoOnly, setPianoOnly] = useState(false)
   const [url, setUrl] = useState('')
   const [fetching, setFetching] = useState(false)
+  const [includeVideo, setIncludeVideo] = useState(function () {
+    return localStorage.getItem('pf_include_video') === '1'
+  })
+
+  function toggleIncludeVideo(on) {
+    setIncludeVideo(on)
+    localStorage.setItem('pf_include_video', on ? '1' : '0')
+  }
 
   async function submitUrl() {
     const u = url.trim()
@@ -16,7 +24,7 @@ export default function UploadZone({ onFiles, onUrl }) {
     }
     setFetching(true)
     try {
-      await onUrl(u, pianoOnly)
+      await onUrl(u, pianoOnly, includeVideo)
       setUrl('')
     } finally {
       setFetching(false)
@@ -88,6 +96,14 @@ export default function UploadZone({ onFiles, onUrl }) {
           onChange={function (e) { setPianoOnly(e.target.checked) }} />
         <label htmlFor="pianoOnly" style={{ margin: 0 }}>
           This file is piano-only — skip separation (much faster)
+        </label>
+      </div>
+      <div className="check" style={{ marginTop: 6 }}>
+        <input id="includeVideo" type="checkbox" checked={includeVideo}
+          onChange={function (e) { toggleIncludeVideo(e.target.checked) }} />
+        <label htmlFor="includeVideo" style={{ margin: 0 }}>
+          🎬 Also save the video — watch it on the Play tab while the piano
+          plays along (stored on this computer, not the cloud)
         </label>
       </div>
     </div>

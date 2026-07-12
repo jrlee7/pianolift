@@ -11,6 +11,7 @@ song can never be overwritten.
 """
 
 import ctypes
+import hashlib
 import os
 import re
 import struct
@@ -32,15 +33,17 @@ def _crc16(data, crc=0xFFFF):
     return crc
 
 
-def _track0_sides(path):
-    """Return (side0_bytes, side1_bytes) MFM bitstream of track 0."""
+def _track_sides(path, track):
+    """Return (side0_bytes, side1_bytes) MFM bitstream of a given track."""
     with open(path, "rb") as f:
         data = f.read(1024)
         if data[:8] != b"HXCPICFE":
             return None, None
         tl_off = (data[18] | (data[19] << 8)) * 512
-        f.seek(tl_off)
+        f.seek(tl_off + track * 4)
         entry = f.read(4)
+        if len(entry) < 4:
+            return None, None
         off_blocks = entry[0] | (entry[1] << 8)
         tlen = entry[2] | (entry[3] << 8)
         f.seek(off_blocks * 512)
@@ -51,6 +54,11 @@ def _track0_sides(path):
         side0 += raw[blk:blk + 256]
         side1 += raw[blk + 256:blk + 512]
     return bytes(side0), bytes(side1)
+
+
+def _track0_sides(path):
+    """Return (side0_bytes, side1_bytes) MFM bitstream of track 0."""
+    return _track_sides(path, 0)
 
 
 def _decode_side(buf):
@@ -147,10 +155,185 @@ def is_blank_slot(path):
         return False
 
 
+def _read_lbas(path):
+    """Decode tracks 0 and 1 into an {LBA: 512 bytes} map. That covers the
+    whole FAT12 metadata region (boot/FATs/root at LBA 0..13) and the start of
+    the data area (LBA 14+), which is where PIANODIR.FIL — always the first,
+    contiguous file — lives. Enough to enumerate a slot's songs without
+    decoding all 80 tracks. LBA = track*18 + side*9 + (sector-1)."""
+    out = {}
+    for track in (0, 1):
+        s0, s1 = _track_sides(path, track)
+        if s0 is None:
+            return None
+        d0 = _decode_side(s0)
+        d1 = _decode_side(s1)
+        base = track * 18
+        for sec, blk in d0.items():
+            out[base + (sec - 1)] = blk
+        for sec, blk in d1.items():
+            out[base + 9 + (sec - 1)] = blk
+    return out
+
+
+def _fat12_next(fat, cluster):
+    off = (cluster * 3) // 2
+    if off + 1 >= len(fat):
+        return 0xFFF
+    if cluster % 2:
+        return (fat[off] >> 4) | (fat[off + 1] << 4)
+    return fat[off] | ((fat[off + 1] & 0x0F) << 8)
+
+
+def _parse_pianodir(buf):
+    """PIANODIR.FIL -> [{name, title}] in play order. 16-byte header then
+    80-byte entries: 11-byte 8.3 name, and the song's 32-char title at 0x57."""
+    songs = []
+    i = 16
+    while i + 80 <= len(buf):
+        e = buf[i:i + 80]
+        name = e[0:11]
+        if name[0] in (0x00, 0xE5) or name.strip(b"\x00 ") == b"":
+            break
+        dos = name.decode("latin1").rstrip()
+        title = e[48:80].decode("latin1").rstrip(" \x00").strip()
+        songs.append({"name": dos, "title": title or dos})
+        i += 80
+    return songs
+
+
+def read_slot_catalog(path):
+    """List the songs on one slot image as [{name, title}] in play order.
+    Reads the PIANODIR.FIL catalog (nice titles); if a disk has none, falls
+    back to the raw .FIL directory names. Returns None if undecodable, []
+    for a formatted-but-empty disk."""
+    try:
+        lbas = _read_lbas(path)
+    except OSError:
+        return None
+    if lbas is None:
+        return None
+    fat = b"".join(lbas.get(l, b"\x00" * 512) for l in (1, 2, 3))
+    root = b"".join(lbas.get(l, b"\x00" * 512) for l in range(7, 14))
+
+    fil_names = []
+    pianodir = None
+    for i in range(0, len(root), 32):
+        first = root[i]
+        if first == 0x00:
+            break
+        if first == 0xE5:
+            continue
+        attr = root[i + 11]
+        if attr == 0x0F or attr & 0x08:
+            continue  # LFN / volume label
+        name = root[i:i + 11]
+        start = root[i + 26] | (root[i + 27] << 8)
+        size = int.from_bytes(root[i + 28:i + 32], "little")
+        if name.upper() == b"PIANODIRFIL":
+            pianodir = (start, size)
+        else:
+            fil_names.append(name.decode("latin1").rstrip())
+
+    songs = []
+    if pianodir and pianodir[1]:
+        data = bytearray()
+        cluster = pianodir[0]
+        guard = 0
+        while 2 <= cluster < 0xFF0 and len(data) < pianodir[1] and guard < 16:
+            lba = 14 + (cluster - 2) * 2  # data area, 2 sectors/cluster
+            data += lbas.get(lba, b"\x00" * 512)
+            data += lbas.get(lba + 1, b"\x00" * 512)
+            cluster = _fat12_next(fat, cluster)
+            guard += 1
+        songs = _parse_pianodir(bytes(data[:pianodir[1]]))
+
+    if not songs:
+        songs = [{"name": n, "title": n} for n in fil_names]
+    return songs
+
+
+# Bytes hashed per slot in fast mode. The FAT metadata (boot/FATs/root) and
+# PIANODIR.FIL live inside the first two tracks, well under this, so a blank
+# disk's signature differs from any disk carrying songs.
+_FAST_SIG_BYTES = 200 * 1024
+
+
+def _slot_signature(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.md5(f.read(_FAST_SIG_BYTES)).digest()
+    except OSError:
+        return None
+
+
+def _blank_signature(root, nums):
+    """In fast mode, most slots on a factory/user stick are identical blank
+    images. Find that majority signature and confirm one representative really
+    is blank (guards a stick that's mostly copies of one song). Returns the
+    signature to treat as blank, or None to fall back to full decoding."""
+    from collections import Counter
+    sigs = {}
+    for s in nums:
+        sig = _slot_signature(os.path.join(root, "DSKA%04d.hfe" % s))
+        if sig is not None:
+            sigs[s] = sig
+    if not sigs:
+        return {}, None
+    sig, count = Counter(sigs.values()).most_common(1)[0]
+    if count < 2:
+        return sigs, None  # no clear majority -> decode everything
+    rep = next(s for s, v in sigs.items() if v == sig)
+    if not is_blank_slot(os.path.join(root, "DSKA%04d.hfe" % rep)):
+        return sigs, None  # majority isn't actually blank -> decode everything
+    return sigs, sig
+
+
+def scan_catalog(root, fast=True):
+    """Every DSKAxxxx.hfe slot on the stick, in slot order, with the songs on
+    each. Blank slots are included (songs: []) so a printed catalog shows the
+    gaps too.
+
+    fast=True (default): fingerprint every slot cheaply and skip the ~100ms
+    MFM decode for the ones matching the confirmed-blank template — only slots
+    that carry data get decoded. fast=False decodes every slot."""
+    nums = sorted(int(m.group(1)) for m in
+                  (SLOT_RE.match(n) for n in os.listdir(root)) if m)
+    sigs, blank_sig = ({}, None)
+    if fast:
+        sigs, blank_sig = _blank_signature(root, nums)
+    slots = []
+    for s in nums:
+        path = os.path.join(root, "DSKA%04d.hfe" % s)
+        entry = {"slot": s, "filename": "DSKA%04d.hfe" % s}
+        try:
+            if blank_sig is not None and sigs.get(s) == blank_sig:
+                entry["blank"] = True
+                entry["songs"] = []
+            elif is_blank_slot(path):
+                entry["blank"] = True
+                entry["songs"] = []
+            else:
+                songs = read_slot_catalog(path)
+                if songs is None:
+                    entry["blank"] = False
+                    entry["songs"] = []
+                    entry["error"] = "unreadable"
+                else:
+                    entry["blank"] = len(songs) == 0
+                    entry["songs"] = songs
+        except OSError:
+            entry["blank"] = False
+            entry["songs"] = []
+            entry["error"] = "read error"
+        slots.append(entry)
+    return slots
+
+
 def find_usb_drive():
     """Locate the emulator stick: a drive root holding many DSKAxxxx.hfe.
-    PIANOLIFT_USB_DIR overrides detection (testing / unusual setups)."""
-    override = os.environ.get("PIANOLIFT_USB_DIR")
+    PIANOFORGE_USB_DIR overrides detection (testing / unusual setups)."""
+    override = os.environ.get("PIANOFORGE_USB_DIR")
     if override:
         if os.path.isdir(override):
             return override
@@ -242,6 +425,22 @@ def save_to_next_free(hfe_bytes, scan_from=14):
     if not free:
         raise RuntimeError("No blank slots left on the stick.")
     slot = free[0]
+    path = os.path.join(root, "DSKA%04d.hfe" % slot)
+    write_flushed(path, hfe_bytes)
+    return root, slot
+
+
+def save_to_slot(hfe_bytes, slot):
+    """Write hfe_bytes into a specific slot, OVERWRITING whatever is there.
+    Used when the user deliberately targets an occupied slot. Returns
+    (drive, slot)."""
+    if not isinstance(slot, int) or slot < 0 or slot > 999:
+        raise ValueError("slot must be an integer 0-999")
+    root = find_usb_drive()
+    if root is None:
+        raise FileNotFoundError(
+            "No Gotek/Nalbantov USB stick found (no drive with DSKAxxxx.hfe "
+            "slot files). Plug in the stick and try again.")
     path = os.path.join(root, "DSKA%04d.hfe" % slot)
     write_flushed(path, hfe_bytes)
     return root, slot

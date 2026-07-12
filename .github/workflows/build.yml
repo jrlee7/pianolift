@@ -52,7 +52,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PianoLift-Windows
+          name: PianoForge-Windows
           path: |
             frontend/dist/
             backend.exe

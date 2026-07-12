@@ -8,14 +8,15 @@ function midiToFreq(pitch) {
 }
 
 // Physical audible-ring ceiling by pitch — mirrors midi_writer.max_sustain_sec
-// so the preview key-hold matches the exported files.
-function maxSustainSec(pitch) {
+// so the preview key-hold matches the exported files. Exported: the video-sync
+// MIDI player applies the same cap so live playback matches exports too.
+export function maxSustainSec(pitch) {
   const p = Math.min(108, Math.max(21, pitch))
   const frac = (p - 21) / (108 - 21)
   return 30 * Math.pow(1 / 30, frac)
 }
 
-function mapVelocity(raw, velMin, velMax, gamma) {
+export function mapVelocity(raw, velMin, velMax, gamma) {
   let norm = raw / 127
   if (norm < 0) norm = 0
   if (norm > 1) norm = 1

@@ -9,11 +9,13 @@ export async function uploadMp3(file, pianoOnly) {
   return res.json()
 }
 
-export async function submitUrl(url, pianoOnly) {
+export async function submitUrl(url, pianoOnly, includeVideo) {
   const res = await fetch(BASE + '/jobs/url', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url: url, pianoOnly: pianoOnly })
+    body: JSON.stringify({
+      url: url, pianoOnly: pianoOnly, includeVideo: Boolean(includeVideo)
+    })
   })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail || 'Fetch failed')
@@ -188,6 +190,14 @@ export async function exportToDrive(id, kind, dest, settings) {
   return data
 }
 
+// Full contents of the Gotek stick: every slot with the songs on it. Backend
+// decodes each disk's FAT/PIANODIR, so a big stick takes a few seconds.
+export async function getGotekCatalog() {
+  const res = await fetch(BASE + '/gotek/catalog')
+  if (!res.ok) throw new Error('Gotek scan failed (' + res.status + ')')
+  return res.json()
+}
+
 export async function getUsbStatus() {
   const res = await fetch(BASE + '/usb')
   if (!res.ok) throw new Error('USB status failed')
@@ -223,6 +233,95 @@ export function eseqUrl(id, settings) {
     cap_sustain: settings.capSustain ? 'true' : 'false'
   })
   return BASE + '/jobs/' + id + '/eseq?' + params.toString()
+}
+
+// Video kept with a conversion (URL fetch with "include video" or an
+// uploaded video file), streamed with Range support so seeking works.
+export function jobVideoUrl(id) {
+  return BASE + '/jobs/' + id + '/video'
+}
+
+// Archived video in the backend's local media folder (library songs).
+export function mediaVideoUrl(name) {
+  return BASE + '/media/' + encodeURIComponent(name)
+}
+
+// Move a job's kept video into the local media folder before the job is
+// deleted (move-to-library). Returns { file } — store it on the song doc.
+export async function archiveVideo(id) {
+  const res = await fetch(BASE + '/jobs/' + id + '/archive-video', {
+    method: 'POST'
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail || 'Video archive failed')
+  return data
+}
+
+// Decode a library song's baked MIDI into note/pedal events for the
+// video-sync player — no throwaway job, the library copy stays put.
+export async function decodeMidi(midiBase64) {
+  const res = await fetch(BASE + '/midi/decode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ midiBase64: midiBase64 })
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail || 'MIDI decode failed')
+  return data
+}
+
+// --- Multi-song floppy disk (many songs per Gotek slot) -------------------
+// One slot = one .hfe = one 720K floppy. These pack several songs onto it.
+// `opts`: { slot, overwrite, download }. Save actions return JSON
+// { drive, slot, filename }; a 409 (slot occupied) throws an Error whose
+// .status is 409 so the caller can offer to overwrite.
+
+async function postDisk(path, body) {
+  const res = await fetch(BASE + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  })
+  return res
+}
+
+async function saveDiskResult(res) {
+  const data = await res.json().catch(function () { return {} })
+  if (!res.ok) {
+    const err = new Error(data.detail || 'Disk build failed')
+    err.status = res.status
+    throw err
+  }
+  return data
+}
+
+// Build one floppy from converted jobs. jobIds render in the given order
+// (song 01, 02, …). Pass { download: true } to get the .hfe as a Blob.
+export async function buildDiskFromJobs(jobIds, opts) {
+  const o = opts || {}
+  const res = await postDisk('/disk/build', {
+    jobIds: jobIds, slot: o.slot != null ? o.slot : null,
+    overwrite: Boolean(o.overwrite), download: Boolean(o.download)
+  })
+  if (o.download) {
+    if (!res.ok) throw await saveDiskResult(res)
+    return res.blob()
+  }
+  return saveDiskResult(res)
+}
+
+// Build one floppy from library songs. `songs`: [{ name, midiBase64, settings }].
+export async function buildDiskFromLibrary(songs, opts) {
+  const o = opts || {}
+  const res = await postDisk('/disk/build-midi', {
+    songs: songs, slot: o.slot != null ? o.slot : null,
+    overwrite: Boolean(o.overwrite), download: Boolean(o.download)
+  })
+  if (o.download) {
+    if (!res.ok) throw await saveDiskResult(res)
+    return res.blob()
+  }
+  return saveDiskResult(res)
 }
 
 export async function fetchMidiBase64(id, settings) {
