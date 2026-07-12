@@ -482,3 +482,66 @@ audio { width: 100%; height: 34px; }
 .player-group input[type="range"] { flex: 1; min-width: 90px; }
 .player-help { margin-top: 12px; }
 .tap-btn { font-size: 16px; padding: 8px 18px; }
+
+/* ---- Auth / accounts / activation ---- */
+.auth-wrap {
+  min-height: 80vh; display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.auth-card { width: 100%; max-width: 380px; text-align: center; margin-top: 0; }
+.auth-logo { width: 200px; max-width: 70%; height: auto; margin: 4px auto 10px; display: block; }
+.auth-title { margin: 0 0 4px; font-size: 20px; }
+.auth-sub { margin: 0 0 18px; }
+.auth-input { width: 100%; box-sizing: border-box; margin-bottom: 10px; }
+.auth-submit { width: 100%; margin-top: 2px; }
+.google-btn {
+  width: 100%; display: flex; align-items: center; justify-content: center; gap: 10px;
+  background: #fff; color: #1f1f1f; border: 1px solid #dadce0; border-radius: 8px;
+  padding: 10px 14px; font-size: 14px; font-weight: 600; cursor: pointer;
+}
+.google-btn:hover { background: #f7f8f8; }
+.google-btn:disabled { opacity: 0.6; cursor: default; }
+.google-g {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 50%; background: #4285f4; color: #fff;
+  font-weight: 700; font-size: 12px;
+}
+.auth-or {
+  display: flex; align-items: center; text-align: center; color: var(--muted);
+  font-size: 12px; margin: 16px 0;
+}
+.auth-or::before, .auth-or::after {
+  content: ''; flex: 1; border-bottom: 1px solid var(--border);
+}
+.auth-or span { padding: 0 10px; }
+.auth-msg { margin-top: 12px; text-align: left; }
+.auth-switch { margin-top: 16px; font-size: 13px; color: var(--muted); }
+.linklike {
+  background: none; border: none; color: var(--accent); cursor: pointer;
+  padding: 0; font: inherit; text-decoration: underline;
+}
+
+.account-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin: -4px 0 14px; font-size: 13px; color: var(--muted);
+}
+.acct-email { font-weight: 600; color: var(--text); }
+.acct-badge {
+  padding: 3px 10px; border-radius: 999px; background: var(--panel-2);
+  border: 1px solid var(--border);
+}
+.acct-badge.activated, .acct-badge.family { color: var(--green); border-color: var(--green); }
+.acct-signout { margin-left: auto; }
+
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6);
+  display: flex; align-items: center; justify-content: center; z-index: 100; padding: 20px;
+}
+.modal-card { width: 100%; max-width: 420px; margin-top: 0; }
+.modal-title { margin: 0 0 6px; font-size: 18px; }
+.activation-input {
+  width: 100%; box-sizing: border-box; margin: 14px 0 4px;
+  font-family: ui-monospace, Menlo, Consolas, monospace; letter-spacing: 1px;
+  text-align: center; font-size: 15px;
+}
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }

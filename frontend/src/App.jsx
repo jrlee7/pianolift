@@ -1,18 +1,23 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import UploadZone from './components/UploadZone.jsx'
 import JobCard from './components/JobCard.jsx'
 import ResultView from './components/ResultView.jsx'
 import LibraryView from './components/LibraryView.jsx'
+import LocalLibraryView from './components/LocalLibraryView.jsx'
 import SourcesView from './components/SourcesView.jsx'
 import PlayerView from './components/PlayerView.jsx'
 import GotekView from './components/GotekView.jsx'
+import AuthView from './components/AuthView.jsx'
+import ActivationModal from './components/ActivationModal.jsx'
 import {
   listJobs, uploadMp3, submitUrl, deleteJob, verifyJob,
   midiUrl, audioUrl, fetchMidiBase64, archiveVideo, buildDiskFromJobs
 } from './api.js'
 import {
-  firebaseReady, saveSong, saveSourceUrl, listSongs, isSameSong, findExistingSong
+  firebaseReady, saveSong, saveSourceUrl, listSongs, isSameSong, findExistingSong,
+  onAuth, getAccount, isFamilyUser, signOut, recordConversion
 } from './firebase.js'
+import { localSave } from './localLibrary.js'
 
 // Slider settings used for bulk export/move. Per-song tuning happens in the
 // open editor; batch actions render with the pipeline defaults.
@@ -55,6 +60,43 @@ export default function App() {
   // A fresh object per click so PlayerView re-targets even for the same song.
   const [playerInit, setPlayerInit] = useState(null)
 
+  // ---- Accounts & the 5-song free tier ----
+  const [user, setUser] = useState(null)
+  const [account, setAccount] = useState(null) // { family, activated, conversions, remaining }
+  const [authChecked, setAuthChecked] = useState(!firebaseReady) // no Firebase → no gate
+  const [showActivation, setShowActivation] = useState(false)
+  const accountRef = useRef(null)
+  useEffect(function () { accountRef.current = account }, [account])
+
+  useEffect(function () {
+    if (!firebaseReady) return undefined
+    return onAuth(async function (u) {
+      setUser(u)
+      setAuthChecked(true)
+      try { setAccount(u ? await getAccount(u) : null) } catch (e) { setAccount(null) }
+    })
+  }, [])
+
+  const isFamily = account ? account.family : false
+
+  // A conversion may proceed when there's no gate (Firebase off), the account is
+  // family/activated, or a free credit remains — consuming one in that case.
+  function consumeCredit() {
+    if (!firebaseReady) return true
+    const a = accountRef.current
+    if (!a || a.family || a.activated) return true
+    if (a.remaining <= 0) { setShowActivation(true); return false }
+    const next = { ...a, conversions: a.conversions + 1, remaining: a.remaining - 1 }
+    accountRef.current = next
+    setAccount(next)
+    recordConversion(user).catch(function () { /* best-effort counter */ })
+    return true
+  }
+
+  async function reloadAccount() {
+    if (user) { try { setAccount(await getAccount(user)) } catch (e) { /* keep */ } }
+  }
+
   const refresh = useCallback(async function () {
     try {
       const items = await listJobs()
@@ -75,6 +117,7 @@ export default function App() {
 
   async function handleFiles(files, pianoOnly) {
     for (let i = 0; i < files.length; i++) {
+      if (!consumeCredit()) break // free tier exhausted → activation modal
       try {
         await uploadMp3(files[i], pianoOnly)
       } catch (e) {
@@ -85,6 +128,7 @@ export default function App() {
   }
 
   async function handleUrl(url, pianoOnly, includeVideo) {
+    if (!consumeCredit()) return // free tier exhausted → activation modal
     if (firebaseReady) {
       try {
         const dup = await findExistingSong(null, url)
@@ -280,7 +324,7 @@ export default function App() {
     // user add them again or skip just those. A lookup failure skips the check
     // rather than blocking the move.
     let toMove = chosen
-    try {
+    if (isFamily) try {
       const existing = await listSongs()
       const dups = chosen.filter(function (j) {
         return existing.some(function (s) { return isSameSong(s, j.name, j.sourceUrl) })
@@ -311,7 +355,7 @@ export default function App() {
     for (const job of toMove) {
       try {
         const b64 = await fetchMidiBase64(job.id, jobSettings(job))
-        if (b64.length > 900000) throw new Error('MIDI too large for cloud (>900KB)')
+        if (isFamily && b64.length > 900000) throw new Error('MIDI too large for cloud (>900KB)')
         let mp3Blob = null
         if (job.accompaniment) {
           try {
@@ -328,7 +372,7 @@ export default function App() {
             localVideo = (await archiveVideo(job.id)).file
           } catch (e) { /* video archive best-effort — song still moves */ }
         }
-        await saveSong({
+        const songMeta = {
           title: job.name,
           noteCount: job.noteCount,
           pedalCount: job.pedalCount,
@@ -337,7 +381,10 @@ export default function App() {
           sourceUrl: job.sourceUrl || null,
           localVideo: localVideo,
           videoIsBacking: job.videoFile === 'video_bg.mp4'
-        }, mp3Blob)
+        }
+        // Family → shared cloud library; customers → on-device local library.
+        if (isFamily) await saveSong(songMeta, mp3Blob)
+        else await localSave(songMeta, mp3Blob)
         await deleteJob(job.id)
         if (openJobId === job.id) setOpenJobId(null)
       } catch (e) {
@@ -435,9 +482,31 @@ export default function App() {
     }
   }
 
+  // Auth gate: with Firebase on, require sign-in before the app is usable.
+  if (firebaseReady && !authChecked) {
+    return <div className="auth-wrap"><div className="meta">Loading…</div></div>
+  }
+  if (firebaseReady && !user) {
+    return <AuthView />
+  }
+
   return (
     <div>
       <h1><img src="/pianoforge.png" alt="PianoForge" className="logo" /></h1>
+
+      {firebaseReady && user && (
+        <div className="account-bar">
+          <span className="acct-email">{user.email}</span>
+          {account && account.family && <span className="acct-badge family">Family · unlimited</span>}
+          {account && !account.family && (account.activated
+            ? <span className="acct-badge activated">Activated · unlimited</span>
+            : <span className="acct-badge">
+                {account.remaining} free conversion{account.remaining === 1 ? '' : 's'} left
+                <button className="linklike" onClick={function () { setShowActivation(true) }}> · Activate</button>
+              </span>)}
+          <button className="ghost acct-signout" onClick={function () { signOut() }}>Sign out</button>
+        </div>
+      )}
 
       <div className="tabs">
         <button
@@ -514,7 +583,7 @@ export default function App() {
                 >
                   {batch && batch.verb === 'Moving'
                     ? 'Moving ' + batch.done + '/' + batch.total + '…'
-                    : '☁ Move ' + (selected.size || '') + ' to library'}
+                    : (isFamily ? '☁ Move ' : '📁 Move ') + (selected.size || '') + ' to library'}
                 </button>
               )}
             </div>
@@ -586,10 +655,9 @@ export default function App() {
       )}
 
       {tab === 'library' && (
-        <LibraryView
-          onEdit={handleEditFromLibrary}
-          onWatch={handleWatchFromLibrary}
-        />
+        isFamily
+          ? <LibraryView onEdit={handleEditFromLibrary} onWatch={handleWatchFromLibrary} />
+          : <LocalLibraryView onWatch={handleWatchFromLibrary} />
       )}
 
       {tab === 'play' && <PlayerView jobs={jobs} initial={playerInit} />}
@@ -597,6 +665,14 @@ export default function App() {
       {tab === 'disk' && <GotekView />}
 
       {tab === 'links' && <SourcesView />}
+
+      {showActivation && (
+        <ActivationModal
+          reason="limit"
+          onActivated={function () { setShowActivation(false); reloadAccount() }}
+          onClose={function () { setShowActivation(false) }}
+        />
+      )}
     </div>
   )
 }

@@ -1,8 +1,10 @@
-import { app, BrowserWindow, ipcMain, dialog, session } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, session, shell } from 'electron'
 import { spawn } from 'child_process'
-import { writeFile } from 'fs/promises'
+import { writeFile, mkdir, readdir, readFile, rm } from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import http from 'node:http'
+import crypto from 'node:crypto'
 import isDev from 'electron-is-dev'
 import electronUpdater from 'electron-updater'
 
@@ -21,6 +23,148 @@ ipcMain.handle('pick-folder', async () => {
 
 ipcMain.handle('write-file', async (_e, dir, name, bytes) => {
   await writeFile(path.join(dir, name), Buffer.from(bytes))
+})
+
+// ---------------------------------------------------------------------------
+// Google sign-in (desktop): system-browser OAuth with a loopback redirect +
+// PKCE. Firebase's popup sign-in is unreliable in Electron (Google rejects
+// embedded/webview flows), so the renderer calls this, gets a Google id_token
+// back, and finishes with signInWithCredential. Requires a Google Cloud
+// "Desktop app" OAuth client — set PF_GOOGLE_CLIENT_ID / PF_GOOGLE_CLIENT_SECRET
+// at build time (a desktop client's secret is not confidential per the OAuth
+// installed-app spec; PKCE is the real protection).
+// ---------------------------------------------------------------------------
+const GOOGLE_CLIENT_ID = process.env.PF_GOOGLE_CLIENT_ID || 'YOUR_DESKTOP_CLIENT_ID.apps.googleusercontent.com'
+const GOOGLE_CLIENT_SECRET = process.env.PF_GOOGLE_CLIENT_SECRET || 'YOUR_DESKTOP_CLIENT_SECRET'
+
+function b64url(buf) {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+ipcMain.handle('google-oauth', async () => {
+  const verifier = b64url(crypto.randomBytes(32))
+  const challenge = b64url(crypto.createHash('sha256').update(verifier).digest())
+  const state = b64url(crypto.randomBytes(16))
+
+  // Loopback server on an ephemeral port catches Google's redirect.
+  const server = http.createServer()
+  const codeReceived = new Promise((resolve, reject) => {
+    server.on('request', (req, res) => {
+      const u = new URL(req.url, 'http://127.0.0.1')
+      res.writeHead(200, { 'Content-Type': 'text/html' })
+      res.end('<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;'
+        + 'text-align:center;padding-top:48px;background:#0f1115;color:#eee">'
+        + '<h2>PianoForge — signed in ✓</h2><p>You can close this tab and '
+        + 'return to the app.</p>')
+      const err = u.searchParams.get('error')
+      if (err) return reject(new Error('Google sign-in was denied (' + err + ')'))
+      if (u.searchParams.get('state') !== state) return reject(new Error('OAuth state mismatch'))
+      const code = u.searchParams.get('code')
+      if (code) resolve(code)
+    })
+    server.on('error', reject)
+  })
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  const redirectUri = 'http://127.0.0.1:' + server.address().port
+
+  const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    response_type: 'code',
+    redirect_uri: redirectUri,
+    scope: 'openid email profile',
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state: state,
+    prompt: 'select_account'
+  }).toString()
+  await shell.openExternal(authUrl)
+
+  let code
+  try {
+    code = await Promise.race([
+      codeReceived,
+      new Promise((_r, rej) => setTimeout(() => rej(new Error('Sign-in timed out')), 300000))
+    ])
+  } finally {
+    server.close()
+  }
+
+  const resp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code: code,
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code',
+      code_verifier: verifier
+    }).toString()
+  })
+  const tok = await resp.json()
+  if (!tok.id_token) {
+    throw new Error('Token exchange failed: ' + (tok.error_description || tok.error || 'no id_token'))
+  }
+  return tok.id_token
+})
+
+// ---------------------------------------------------------------------------
+// Local song library (paying customers). The cloud library is family-only, so
+// customers keep songs on their own machine under userData/library/<id>/:
+//   song.json   metadata + baked MIDI (base64)
+//   source.mp3  the accompaniment audio (optional)
+// ---------------------------------------------------------------------------
+function libDir() {
+  return path.join(app.getPath('userData'), 'library')
+}
+
+ipcMain.handle('lib-list', async () => {
+  let entries = []
+  try {
+    entries = await readdir(libDir(), { withFileTypes: true })
+  } catch (e) {
+    return [] // no library yet
+  }
+  const out = []
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue
+    try {
+      out.push(JSON.parse(await readFile(path.join(libDir(), ent.name, 'song.json'), 'utf8')))
+    } catch (e) { /* skip unreadable song */ }
+  }
+  out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+  return out
+})
+
+ipcMain.handle('lib-save', async (_e, meta, mp3Bytes) => {
+  const id = crypto.randomUUID()
+  const songDir = path.join(libDir(), id)
+  await mkdir(songDir, { recursive: true })
+  const hasMp3 = Boolean(mp3Bytes && mp3Bytes.length > 0)
+  const record = { ...meta, id: id, hasMp3: hasMp3, createdAt: Date.now() }
+  await writeFile(path.join(songDir, 'song.json'), JSON.stringify(record))
+  if (hasMp3) await writeFile(path.join(songDir, 'source.mp3'), Buffer.from(mp3Bytes))
+  return record
+})
+
+ipcMain.handle('lib-mp3', async (_e, id) => {
+  try {
+    return new Uint8Array(await readFile(path.join(libDir(), id, 'source.mp3')))
+  } catch (e) {
+    return null
+  }
+})
+
+ipcMain.handle('lib-rename', async (_e, id, title) => {
+  const p = path.join(libDir(), id, 'song.json')
+  const meta = JSON.parse(await readFile(p, 'utf8'))
+  meta.title = title
+  await writeFile(p, JSON.stringify(meta))
+  return meta
+})
+
+ipcMain.handle('lib-delete', async (_e, id) => {
+  await rm(path.join(libDir(), id), { recursive: true, force: true })
 })
 
 let mainWindow

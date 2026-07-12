@@ -1,11 +1,16 @@
 import { initializeApp } from 'firebase/app'
 import {
-  getFirestore, collection, addDoc, getDocs, deleteDoc, doc, updateDoc,
-  query, orderBy, where, serverTimestamp
+  getFirestore, collection, addDoc, getDocs, deleteDoc, doc, getDoc, setDoc,
+  updateDoc, runTransaction, increment, query, orderBy, where, serverTimestamp
 } from 'firebase/firestore'
 import {
   getStorage, ref as storageRef, uploadBytes, getDownloadURL, deleteObject
 } from 'firebase/storage'
+import {
+  getAuth, onAuthStateChanged, GoogleAuthProvider, signInWithPopup,
+  signInWithCredential, signInWithEmailAndPassword, createUserWithEmailAndPassword,
+  sendEmailVerification, signOut as fbSignOut
+} from 'firebase/auth'
 
 const config = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -20,12 +25,134 @@ export const firebaseReady = Boolean(config.apiKey && config.projectId)
 
 let db = null
 let storage = null
+let auth = null
 if (firebaseReady) {
   const app = initializeApp(config)
   db = getFirestore(app)
+  auth = getAuth(app)
   // Storage holds the source MP3s — too big for a Firestore doc (1 MiB cap).
   // Only usable if a storageBucket is set in the web config.
   if (config.storageBucket) storage = getStorage(app)
+}
+
+// ---------------------------------------------------------------------------
+// Accounts & licensing
+//
+// The single shared "family" account (you + Dad) gets unlimited conversions and
+// the cloud library. Everyone else is a paying customer: 5 free conversions,
+// then a single-use activation key unlocks unlimited. Enforcement is
+// server-verified via Firestore rules (single-use key claim, per-user state),
+// but because the ML runs locally a determined user can still patch the client
+// — this stops casual sharing, not a cracked build.
+// ---------------------------------------------------------------------------
+const FAMILY_EMAIL = 'justin.lee025@gmail.com'
+export const FREE_LIMIT = 5
+const USERS = 'users'
+const LICENSES = 'licenses'
+
+export function authReady() { return Boolean(auth) }
+
+// Subscribe to sign-in state. Returns an unsubscribe fn.
+export function onAuth(cb) {
+  if (!auth) { cb(null); return function () {} }
+  return onAuthStateChanged(auth, cb)
+}
+
+export function currentUser() { return auth ? auth.currentUser : null }
+
+export async function signInWithGoogle() {
+  if (!auth) throw new Error('Firebase not configured')
+  // Packaged desktop app: system-browser OAuth via the main process (the popup
+  // is unreliable in Electron). Browser/dev: fall back to Firebase's popup.
+  if (typeof window !== 'undefined' && window.desktop && window.desktop.googleSignIn) {
+    const idToken = await window.desktop.googleSignIn()
+    const res = await signInWithCredential(auth, GoogleAuthProvider.credential(idToken))
+    return res.user
+  }
+  const res = await signInWithPopup(auth, new GoogleAuthProvider())
+  return res.user
+}
+
+export async function signInEmail(email, password) {
+  if (!auth) throw new Error('Firebase not configured')
+  const res = await signInWithEmailAndPassword(auth, email.trim(), password)
+  return res.user
+}
+
+export async function signUpEmail(email, password) {
+  if (!auth) throw new Error('Firebase not configured')
+  const res = await createUserWithEmailAndPassword(auth, email.trim(), password)
+  try { await sendEmailVerification(res.user) } catch (e) { /* non-fatal */ }
+  return res.user
+}
+
+export async function signOut() { if (auth) await fbSignOut(auth) }
+
+// The family account is identified by a verified email match — must line up
+// with isFamily() in firestore.rules / storage.rules.
+export function isFamilyUser(user) {
+  return Boolean(user && user.email === FAMILY_EMAIL && user.emailVerified)
+}
+
+// Snapshot of a user's entitlement. Family = unlimited; customers get their
+// server-side conversion counter + activation flag. Creates the user doc on
+// first call so the counter has somewhere to live.
+export async function getAccount(user) {
+  if (!user) return null
+  if (isFamilyUser(user)) {
+    return { family: true, activated: true, conversions: 0, remaining: Infinity }
+  }
+  const uref = doc(db, USERS, user.uid)
+  const snap = await getDoc(uref)
+  if (!snap.exists()) {
+    await setDoc(uref, { conversions: 0, activated: false, createdAt: serverTimestamp() })
+    return { family: false, activated: false, conversions: 0, remaining: FREE_LIMIT }
+  }
+  const d = snap.data()
+  const activated = Boolean(d.activated)
+  const conversions = d.conversions || 0
+  return {
+    family: false, activated: activated, conversions: conversions,
+    remaining: activated ? Infinity : Math.max(0, FREE_LIMIT - conversions)
+  }
+}
+
+// Count one conversion against the free tier (no-op for family / activated).
+export async function recordConversion(user) {
+  if (!user || isFamilyUser(user)) return
+  await setDoc(doc(db, USERS, user.uid), { conversions: increment(1) }, { merge: true })
+}
+
+async function sha256Hex(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str))
+  return Array.from(new Uint8Array(buf)).map(function (b) {
+    return b.toString(16).padStart(2, '0')
+  }).join('')
+}
+
+// Claim an activation key (single-use, enforced by rules), then flag the
+// account activated. Idempotent if the same user re-enters a key they already
+// own (covers a retry after a mid-activation failure).
+export async function activateKey(user, rawKey) {
+  if (!user) throw new Error('Sign in first')
+  const key = (rawKey || '').trim().toUpperCase()
+  if (!key) throw new Error('Enter an activation key')
+  const hash = await sha256Hex(key)
+  const lref = doc(db, LICENSES, hash)
+  await runTransaction(db, async function (tx) {
+    const snap = await tx.get(lref)
+    if (!snap.exists()) throw new Error('Invalid activation key')
+    const d = snap.data()
+    if (d.used && d.usedBy !== user.uid) {
+      throw new Error('This key has already been used')
+    }
+    if (!d.used) {
+      tx.update(lref, { used: true, usedBy: user.uid, usedAt: serverTimestamp() })
+    }
+  })
+  await setDoc(doc(db, USERS, user.uid),
+    { activated: true, licenseHash: hash }, { merge: true })
+  return true
 }
 
 function extFromType(type) {
