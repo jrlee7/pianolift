@@ -5,6 +5,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import http from 'node:http'
 import crypto from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import isDev from 'electron-is-dev'
 import electronUpdater from 'electron-updater'
 
@@ -34,12 +35,20 @@ ipcMain.handle('write-file', async (_e, dir, name, bytes) => {
 // at build time (a desktop client's secret is not confidential per the OAuth
 // installed-app spec; PKCE is the real protection).
 // ---------------------------------------------------------------------------
-const GOOGLE_CLIENT_ID = process.env.PF_GOOGLE_CLIENT_ID || 'YOUR_DESKTOP_CLIENT_ID.apps.googleusercontent.com'
-const GOOGLE_CLIENT_SECRET = process.env.PF_GOOGLE_CLIENT_SECRET || 'YOUR_DESKTOP_CLIENT_SECRET'
+// Desktop OAuth client for Google sign-in. The id/secret live in an untracked
+// frontend/oauth.config.json (gitignored — this repo is public) and get bundled
+// into the app at build time. A desktop client secret is non-confidential per
+// RFC 8252, but keeping it out of version control is still good hygiene. Missing
+// config → Google sign-in stays hidden and email/password still works.
+let GOOGLE_CLIENT_ID = ''
+let GOOGLE_CLIENT_SECRET = ''
+try {
+  const cfg = JSON.parse(readFileSync(path.join(__dirname, 'oauth.config.json'), 'utf8'))
+  GOOGLE_CLIENT_ID = cfg.clientId || ''
+  GOOGLE_CLIENT_SECRET = cfg.clientSecret || ''
+} catch (e) { /* no oauth config present */ }
 
-// Until a real Desktop OAuth client is baked in, hide Google sign-in so the
-// button isn't dead (email/password still works).
-const googleConfigured = !GOOGLE_CLIENT_ID.startsWith('YOUR_')
+const googleConfigured = Boolean(GOOGLE_CLIENT_ID)
 ipcMain.handle('app-config', () => ({ googleConfigured }))
 
 function b64url(buf) {

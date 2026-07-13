@@ -1,7 +1,7 @@
 {
   "name": "pianoforge",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "repository": "github:jrlee7/pianolift",
   "type": "module",
   "main": "main.js",
@@ -40,7 +40,8 @@
     "files": [
       "dist/**/*",
       "main.js",
-      "preload.cjs"
+      "preload.cjs",
+      "oauth.config.json"
     ],
     "extraResources": [
       {

@@ -11,3 +11,9 @@ backend/jobs/
 *.exe
 build/
 release/
+
+# activation keys — never commit plaintext keys
+licensing/
+
+# baked OAuth client secret — never commit (repo is public)
+oauth.config.json
