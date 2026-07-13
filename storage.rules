@@ -1,11 +1,13 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
-    // Personal single-family app: anyone holding the web config can read/write
-    // the source MP3s that back the song library. Do not store anything
-    // sensitive here. Mirrors the open posture of firestore.rules.
+    // Accompaniment MP3s back the CLOUD library, which is family-only. Customers
+    // keep audio in their local on-device library, so they never touch this.
+    // Keep this email in sync with isFamily() in firestore.rules.
     match /songs/{songId}/{fileName} {
-      allow read, write: if true;
+      allow read, write: if request.auth != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.email == 'justin.lee025@gmail.com';
     }
   }
 }

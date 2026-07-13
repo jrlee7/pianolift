@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld('desktop', {
   pickFolder: () => ipcRenderer.invoke('pick-folder'),
   // Write one file into a previously picked folder. `bytes` is a Uint8Array.
   writeFile: (dir, name, bytes) => ipcRenderer.invoke('write-file', dir, name, bytes),
+  // Runtime config (e.g. whether Google sign-in is configured for this build).
+  getConfig: () => ipcRenderer.invoke('app-config'),
   // Google sign-in via the system browser (loopback + PKCE). Resolves to a
   // Google id_token the renderer hands to Firebase signInWithCredential.
   googleSignIn: () => ipcRenderer.invoke('google-oauth'),

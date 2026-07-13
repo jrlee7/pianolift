@@ -37,6 +37,11 @@ ipcMain.handle('write-file', async (_e, dir, name, bytes) => {
 const GOOGLE_CLIENT_ID = process.env.PF_GOOGLE_CLIENT_ID || 'YOUR_DESKTOP_CLIENT_ID.apps.googleusercontent.com'
 const GOOGLE_CLIENT_SECRET = process.env.PF_GOOGLE_CLIENT_SECRET || 'YOUR_DESKTOP_CLIENT_SECRET'
 
+// Until a real Desktop OAuth client is baked in, hide Google sign-in so the
+// button isn't dead (email/password still works).
+const googleConfigured = !GOOGLE_CLIENT_ID.startsWith('YOUR_')
+ipcMain.handle('app-config', () => ({ googleConfigured }))
+
 function b64url(buf) {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }

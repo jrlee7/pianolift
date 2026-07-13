@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { signInEmail, signUpEmail, signInWithGoogle } from '../firebase.js'
 
 // Sign-in gate shown whenever no user is authenticated. Email/password is the
@@ -11,6 +11,16 @@ export default function AuthView() {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState(null)
   const [notice, setNotice] = useState(null)
+  // Browser dev: popup works, show Google. Packaged app: only if a Desktop
+  // OAuth client is baked in (else the button would be dead).
+  const [showGoogle, setShowGoogle] = useState(!(typeof window !== 'undefined' && window.desktop))
+  useEffect(function () {
+    if (typeof window !== 'undefined' && window.desktop && window.desktop.getConfig) {
+      window.desktop.getConfig()
+        .then(function (c) { setShowGoogle(Boolean(c && c.googleConfigured)) })
+        .catch(function () { setShowGoogle(false) })
+    }
+  }, [])
 
   async function submit(e) {
     e.preventDefault()
@@ -51,11 +61,14 @@ export default function AuthView() {
             : 'Welcome back.'}
         </p>
 
-        <button className="google-btn" onClick={google} disabled={busy}>
-          <span className="google-g">G</span> Continue with Google
-        </button>
-
-        <div className="auth-or"><span>or</span></div>
+        {showGoogle && (
+          <>
+            <button className="google-btn" onClick={google} disabled={busy}>
+              <span className="google-g">G</span> Continue with Google
+            </button>
+            <div className="auth-or"><span>or</span></div>
+          </>
+        )}
 
         <form onSubmit={submit}>
           <input

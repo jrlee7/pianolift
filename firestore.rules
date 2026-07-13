@@ -1,17 +1,55 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Personal single-family app: anyone holding the web config can
-    // read/write the song library. Do not store anything sensitive here.
-    match /songs/{songId} {
-      allow read, write: if true;
+
+    // The single shared "family" account (you + Dad, one login). The ONLY
+    // identity allowed into the cloud song library. Paying customers use a
+    // local, on-device library and never touch these collections.
+    // Google sign-in sets email_verified; email/password does not until
+    // verified, so the family account should sign in with Google.
+    function isFamily() {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.email == 'justin.lee025@gmail.com';
     }
-    match /folders/{folderId} {
-      allow read, write: if true;
+
+    // ---- Cloud library: family only ----
+    match /songs/{songId}     { allow read, write: if isFamily(); }
+    match /folders/{folderId} { allow read, write: if isFamily(); }
+    match /sources/{sourceId} { allow read, write: if isFamily(); }
+
+    // ---- Per-user account state: free-conversion counter + activation flag ----
+    // A signed-in user reads/writes only their own doc. They may set
+    // `activated: true` only by naming a license their uid has legitimately
+    // claimed (cross-checked against the licenses collection below).
+    match /users/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create, update: if request.auth != null
+        && request.auth.uid == uid
+        && (
+          request.resource.data.get('activated', false) != true
+          || (
+            request.resource.data.activated == true
+            && exists(/databases/$(database)/documents/licenses/$(request.resource.data.licenseHash))
+            && get(/databases/$(database)/documents/licenses/$(request.resource.data.licenseHash)).data.usedBy == request.auth.uid
+          )
+        );
     }
-    // History of converted source links so a video can be found again later.
-    match /sources/{sourceId} {
-      allow read, write: if true;
+
+    // ---- Activation keys (doc id = SHA-256 of the key) ----
+    // No listing (can't harvest). A signed-in user can read a single key doc
+    // only if they already know the key (hence its hash = id). A key can be
+    // claimed exactly once, stamped with the claimer's uid. Seeded server-side.
+    match /licenses/{keyHash} {
+      allow get:    if request.auth != null;
+      allow list:   if false;
+      allow create, delete: if false;
+      allow update: if request.auth != null
+        && resource.data.used == false
+        && request.resource.data.used == true
+        && request.resource.data.usedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['used', 'usedBy', 'usedAt']);
     }
   }
 }
