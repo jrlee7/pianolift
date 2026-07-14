@@ -2,6 +2,10 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
+  // Relative asset paths so the packaged app can load them over file:// from
+  // inside app.asar (default '/' breaks — absolute paths don't resolve → blank
+  // white screen). Dev server is unaffected.
+  base: './',
   plugins: [react()],
   build: {
     outDir: 'dist',
