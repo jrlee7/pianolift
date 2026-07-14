@@ -6,11 +6,14 @@ import { fileURLToPath } from 'url'
 import http from 'node:http'
 import crypto from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import isDev from 'electron-is-dev'
 import electronUpdater from 'electron-updater'
 
 const { autoUpdater } = electronUpdater
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+// Dev vs packaged: use Electron's own flag rather than the electron-is-dev
+// package — it's a devDependency and isn't bundled into the packaged asar
+// (importing it crashed the installed app with ERR_MODULE_NOT_FOUND).
+const isDev = !app.isPackaged
 
 // Native folder browser + file write for "Save to USB" (the renderer's
 // window.showDirectoryPicker is not dependable inside the packaged shell).
