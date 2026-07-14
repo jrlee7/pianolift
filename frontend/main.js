@@ -199,11 +199,14 @@ function createWindow() {
     }
   })
 
-  const startUrl = isDev
-    ? 'http://localhost:5173'
-    : `file://${path.join(__dirname, '../dist/index.html')}`
-
-  mainWindow.loadURL(startUrl)
+  if (isDev) {
+    mainWindow.loadURL('http://localhost:5173')
+  } else {
+    // dist/ is bundled next to main.js inside app.asar; loadFile resolves the
+    // asar + Windows path correctly (a file:// URL to ../dist was wrong — that
+    // points outside the asar and left a blank window).
+    mainWindow.loadFile(path.join(__dirname, 'dist', 'index.html'))
+  }
 
   if (isDev) {
     mainWindow.webContents.openDevTools()
