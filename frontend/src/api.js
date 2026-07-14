@@ -1,4 +1,8 @@
-const BASE = '/api'
+// Dev (vite server): '/api' is proxied to the backend on :8000. Packaged app
+// (loaded via file://, no proxy): hit the local backend directly.
+const BASE = (typeof location !== 'undefined' && location.protocol === 'file:')
+  ? 'http://127.0.0.1:8000/api'
+  : '/api'
 
 export async function uploadMp3(file, pianoOnly) {
   const form = new FormData()

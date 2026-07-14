@@ -195,7 +195,13 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
-      preload: path.join(__dirname, 'preload.cjs')
+      preload: path.join(__dirname, 'preload.cjs'),
+      // Packaged app loads over file:// and calls the local backend on :8000
+      // cross-origin, which the renderer's CORS/same-origin policy would block.
+      // Disable web-security only in the packaged build (dev uses the vite proxy,
+      // same-origin). Safe here: the renderer loads only our own bundled code +
+      // a localhost backend — never untrusted remote pages.
+      webSecurity: isDev
     }
   })
 
