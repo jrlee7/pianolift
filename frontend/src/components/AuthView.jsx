@@ -53,7 +53,7 @@ export default function AuthView() {
   return (
     <div className="auth-wrap">
       <div className="card auth-card">
-        <img src="/pianoforge.png" alt="PianoForge" className="auth-logo" />
+        <img src="./pianoforge.png" alt="PianoForge" className="auth-logo" />
         <h2 className="auth-title">{mode === 'signup' ? 'Create your account' : 'Sign in'}</h2>
         <p className="meta auth-sub">
           {mode === 'signup'

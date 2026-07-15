@@ -5,7 +5,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import http from 'node:http'
 import crypto from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { readFileSync, existsSync } from 'node:fs'
 import electronUpdater from 'electron-updater'
 
 const { autoUpdater } = electronUpdater
@@ -231,25 +231,18 @@ function startBackend() {
       stdio: 'inherit'
     })
   } else {
-    // In production, backend.exe is in the app resources directory
+    // In production, backend.exe ships via extraResources, landing directly
+    // in resources/ (process.resourcesPath) -- never inside app.asar.
+    // Previously this checked candidate paths with require('fs').accessSync,
+    // but main.js runs as an ES module (package.json "type": "module"), where
+    // bare `require` isn't defined; the ReferenceError was silently swallowed
+    // by the try/catch, so every candidate "failed" and the backend never
+    // spawned, no matter where backend.exe actually was.
     let exePath
     if (process.platform === 'win32') {
-      // Try current directory first, then parent
-      const candidates = [
-        path.join(process.resourcesPath, 'backend.exe'),
-        path.join(__dirname, '../backend.exe'),
-        path.join(__dirname, './backend.exe')
-      ]
-      exePath = candidates.find(p => {
-        try {
-          require('fs').accessSync(p)
-          return true
-        } catch {
-          return false
-        }
-      })
-      if (!exePath) {
-        console.error('backend.exe not found in:', candidates)
+      exePath = path.join(process.resourcesPath, 'backend.exe')
+      if (!existsSync(exePath)) {
+        console.error('backend.exe not found at:', exePath)
         return
       }
     }

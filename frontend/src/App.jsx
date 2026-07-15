@@ -492,7 +492,7 @@ export default function App() {
 
   return (
     <div>
-      <h1><img src="/pianoforge.png" alt="PianoForge" className="logo" /></h1>
+      <h1><img src="./pianoforge.png" alt="PianoForge" className="logo" /></h1>
 
       {firebaseReady && user && (
         <div className="account-bar">
