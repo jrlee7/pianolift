@@ -437,7 +437,7 @@ def run_job(job_dir, audio_path, progress_cb, piano_only=False):
         "trimEndSec": trim_end,
         "noteCount": len(notes),
         "pedalCount": len(pedals),
-        "ghostCount": verify_stats["ghosts"],
+        "ghostCount": verify_stats["ghosts"] + verify_stats["restrikes"],
         "trimmedCount": verify_stats["trimmed"],
     }
 

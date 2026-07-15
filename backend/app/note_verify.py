@@ -20,6 +20,20 @@ spectrogram of the stem:
   * re-onset declash -- a note's offset is clamped ahead of the next
     onset at the same pitch, so the Disklavier's physical key has time to
     come back up before it must re-strike.
+
+  * re-strike gate -- on reverb-heavy or heavily-pedaled recordings a
+    still-ringing pitch carries enough energy that the score/rise ghost
+    test alone can't tell a real re-strike from the tail of the previous
+    note: score stays high (there IS energy at that pitch) even though no
+    hammer struck. A single-engine, unconfirmed note with no attack
+    transient (low rise) AND no onset-strength support in the raw audio at
+    its claimed onset cannot be a new keystroke -- dropped, regardless of
+    its score. Measured on a reverb-heavy solo piano job: ByteDance
+    hallucinated 43% of its notes this way (Transkun only 1%); this gate
+    removed 315/315 of them in a 120s test clip with zero two-engine notes
+    lost. Each fake re-strike was also chopping the real held note via the
+    declash rule above, so this one gate fixes both "extra notes" and
+    "notes cut short" symptoms at once.
 """
 
 import numpy as np
@@ -49,6 +63,12 @@ REONSET_GAP_SEC = 0.03
 
 # Two onsets of one pitch closer than this are one keystroke double-fired.
 DEDUPE_WINDOW_SEC = 0.03
+
+# Re-strike gate: a note with no attack transient (rise below this) and no
+# onset-strength peak in the raw audio within this window of its claimed
+# onset isn't a new keystroke -- see module docstring.
+RESTRIKE_RISE_MIN = 2.0
+ONSET_SUPPORT_WINDOW_SEC = 0.10
 
 _ATTACK_FRAMES = 4      # ~93ms windows around the onset for the rise test
 
@@ -97,12 +117,32 @@ _HARMONIC_OFFSETS = (12, 19)   # +1 octave, +1 octave and a fifth
 
 
 def _cqt_mag(piano_wav):
+    """Constant-Q magnitude spectrogram plus broadband onset times, from a
+    single audio load of the stem (onset detection is cheap next to the
+    CQT, so folding it in here costs nothing extra)."""
     import librosa
 
     y, _ = librosa.load(piano_wav, sr=SR, mono=True)
     mag = np.abs(librosa.cqt(y, sr=SR, hop_length=HOP, fmin=FMIN,
                              n_bins=N_BINS, bins_per_octave=12))
-    return mag
+    onset_env = librosa.onset.onset_strength(y=y, sr=SR, hop_length=HOP)
+    onsets = librosa.onset.onset_detect(onset_envelope=onset_env, sr=SR,
+                                        hop_length=HOP, units="time",
+                                        backtrack=False)
+    return mag, sorted(onsets.tolist())
+
+
+def _onset_supported(sorted_onsets, t, window):
+    """Is there a broadband onset within `window` seconds of time `t`?"""
+    from bisect import bisect_left
+
+    if not sorted_onsets:
+        return False
+    i = bisect_left(sorted_onsets, t)
+    for j in (i - 1, i):
+        if 0 <= j < len(sorted_onsets) and abs(sorted_onsets[j] - t) <= window:
+            return True
+    return False
 
 
 def _pitch_envelope(mag, pitch, cache):
@@ -344,7 +384,8 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
     Returns (notes, pedals, stats).
     """
     stats = {"ghosts": 0, "trimmed": 0, "deduped": 0, "unconfirmed": 0,
-             "altOnly": 0, "pedalsDropped": 0, "pedalsAdded": 0}
+             "altOnly": 0, "pedalsDropped": 0, "pedalsAdded": 0,
+             "restrikes": 0}
     if not notes and not alt_notes:
         return notes, pedals, stats
 
@@ -354,7 +395,7 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
         stats["altOnly"] = sum(1 for e in evidence if e == "alt")
 
     progress_cb("verifying", 0)
-    mag = _cqt_mag(piano_wav)
+    mag, onset_times = _cqt_mag(piano_wav)
     progress_cb("verifying", 40)
     feats = _note_features(mag, notes)
     confirmed = _confirmed_mask(notes, mix_notes) if mix_notes else None
@@ -366,9 +407,9 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
                 and score < MICRO_SCORE_MAX):
             stats["ghosts"] += 1
             continue
-        if evidence is not None and evidence[i] == "both":
-            is_ghost = False
-        elif confirmed is not None and confirmed[i]:
+        protected = ((evidence is not None and evidence[i] == "both")
+                    or (confirmed is not None and confirmed[i]))
+        if protected:
             is_ghost = False
         elif evidence is None and confirmed is None:
             # No cross-evidence at all: the original conservative rule.
@@ -379,6 +420,11 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
             is_ghost = score < UNCONF_SCORE_MAX and rise < UNCONF_RISE_MAX
         if is_ghost:
             stats["ghosts"] += 1
+            continue
+        if (not protected and rise < RESTRIKE_RISE_MIN
+                and not _onset_supported(onset_times, n["onset"],
+                                         ONSET_SUPPORT_WINDOW_SEC)):
+            stats["restrikes"] += 1
             continue
         new_off = _trim_offset(env, n, f0, f1)
         if new_off < n["offset"]:

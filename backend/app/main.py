@@ -581,11 +581,12 @@ def verify_job(job_id: str, deep: bool = False):
     with jobs_lock:
         job["noteCount"] = len(notes)
         job["pedalCount"] = len(pedals)
-        job["ghostCount"] = stats["ghosts"]
+        job["ghostCount"] = stats["ghosts"] + stats["restrikes"]
         job["verified"] = True
         _persist(job_id)
     return {"noteCount": len(notes), "pedalCount": len(pedals),
-            "ghostCount": stats["ghosts"], "trimmedCount": stats["trimmed"]}
+            "ghostCount": stats["ghosts"], "trimmedCount": stats["trimmed"],
+            "restrikeCount": stats["restrikes"]}
 
 
 @app.post("/api/jobs/{job_id}/events/reset")
