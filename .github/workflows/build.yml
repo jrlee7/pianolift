@@ -36,12 +36,33 @@ jobs:
         working-directory: backend
 
       - name: Build backend (PyInstaller)
+        # build_exe.py is the single source of truth for the exe build:
+        # run_backend.py entry (freeze_support for spawn workers), --noconsole
+        # (closing a stray window must not kill the backend), collect-all for
+        # packages PyInstaller's static analysis misses. It drops backend.exe
+        # at the repo root, where electron-builder's extraResources expects it.
         run: |
           pip install pyinstaller
-          pyinstaller --onefile --console app/main.py --name backend
-          move dist\backend.exe ..\
+          python build_exe.py
         working-directory: backend
         shell: pwsh
+
+      - name: Write OAuth client config (from repo secret)
+        # frontend/oauth.config.json is gitignored (public repo), so a CI
+        # clone builds without it and Google sign-in stays hidden. The repo
+        # secret OAUTH_CONFIG_JSON holds the file's exact JSON content; write
+        # it before electron-builder packs the app. BOM-less UTF-8 — Node's
+        # JSON.parse rejects a BOM and the app would silently hide sign-in.
+        shell: pwsh
+        env:
+          OAUTH_CONFIG_JSON: ${{ secrets.OAUTH_CONFIG_JSON }}
+        run: |
+          if ($env:OAUTH_CONFIG_JSON) {
+            [IO.File]::WriteAllText("$PWD/frontend/oauth.config.json", $env:OAUTH_CONFIG_JSON, [Text.UTF8Encoding]::new($false))
+            Write-Host "oauth.config.json written"
+          } else {
+            Write-Host "OAUTH_CONFIG_JSON secret not set - building without Google sign-in"
+          }
 
       - name: Build Electron app
         run: npm run electron-build
@@ -54,6 +75,7 @@ jobs:
         with:
           name: PianoForge-Windows
           path: |
+            frontend/release/*.exe
             frontend/dist/
             backend.exe
 
