@@ -42,7 +42,7 @@ hidden = [
 args = [
     'run_backend.py',
     '--onefile',
-    '--console',
+    '--noconsole',
     '--name', 'backend',
     '--distpath', repo_root,          # backend.exe lands at repo root (electron-builder extraResources)
     '--workpath', os.path.join(backend_dir, 'build', 'work'),

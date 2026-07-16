@@ -248,7 +248,8 @@ function startBackend() {
     }
 
     backendProcess = spawn(exePath, {
-      stdio: 'inherit'
+      stdio: 'ignore',
+      windowsHide: true
     })
   }
 
