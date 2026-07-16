@@ -70,6 +70,14 @@ DEDUPE_WINDOW_SEC = 0.03
 RESTRIKE_RISE_MIN = 2.0
 ONSET_SUPPORT_WINDOW_SEC = 0.10
 
+# A real hammer strike adds energy: the pitch envelope rises through the
+# onset. A hallucinated re-strike is the decaying tail of the previous
+# note — energy through its claimed onset can only fall. Only kill when
+# the local envelope is NOT rising (post/pre below this ratio). Measured
+# on a reverb hymn: true tails median 0.93, real strikes median 4.8 —
+# 1.05 rescues every repeated-chord strike and keeps killing the tails.
+RESTRIKE_DECAY_MAX = 1.05
+
 _ATTACK_FRAMES = 4      # ~93ms windows around the onset for the rise test
 
 # Mix cross-check: a stem note counts as confirmed when the transcription
@@ -143,6 +151,15 @@ def _onset_supported(sorted_onsets, t, window):
         if 0 <= j < len(sorted_onsets) and abs(sorted_onsets[j] - t) <= window:
             return True
     return False
+
+
+def _local_rise(env, f0):
+    """Pitch-envelope energy direction through frame f0 (~±70ms)."""
+    pre = env[max(0, f0 - 3):f0]
+    post = env[f0 + 1:f0 + 4]
+    if pre.size == 0 or post.size == 0:
+        return 9.9  # edge of clip: no decay evidence, never gate-kill
+    return float(post.mean() / (pre.mean() + 1e-9))
 
 
 def _pitch_envelope(mag, pitch, cache):
@@ -240,9 +257,11 @@ def _merge_alt(notes, alt_notes, evidence_only):
 
     Returns (merged_notes, evidence) where evidence[i] is "both" when the
     two engines agree on the keystroke, "bd"/"alt" when only one saw it.
-    Agreed notes take Transkun's offset and velocity (its offsets mark key
-    release, measurably closer to truth than ByteDance's string-damp
-    times), and notes only Transkun heard join the list as candidates.
+    Agreed notes take Transkun's velocity only -- its offsets mark key
+    release but fire far too early on reverb-heavy material, collapsing
+    durations, so ByteDance's offset (already bounded by `_trim_offset`
+    against the spectral envelope) is kept instead. Notes only Transkun
+    heard join the list as candidates.
 
     evidence_only=True (the retroactive clean-up path, where `notes` may
     carry user edits) suppresses both — Transkun then only *confirms*
@@ -287,8 +306,6 @@ def _merge_alt(notes, alt_notes, evidence_only):
         a = alt_notes[m]
         out = dict(n)
         if not evidence_only:
-            out["offset"] = round(
-                max(a["offset"], n["onset"] + MIN_NOTE_SEC), 4)
             out["velocity"] = a["velocity"]
         merged.append(out)
         evidence.append("both")
@@ -422,6 +439,7 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
             stats["ghosts"] += 1
             continue
         if (not protected and rise < RESTRIKE_RISE_MIN
+                and _local_rise(env, f0) < RESTRIKE_DECAY_MAX
                 and not _onset_supported(onset_times, n["onset"],
                                          ONSET_SUPPORT_WINDOW_SEC)):
             stats["restrikes"] += 1
