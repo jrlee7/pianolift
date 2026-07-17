@@ -1,5 +1,19 @@
 # Accuracy fix plan — note extraction (Sweet Hour of Prayer failure)
 
+> **POSTMORTEM (2026-07-16): Fix B below was WRONG and is reverted.**
+> Fix A (keep ByteDance offsets, drop Transkun's) shipped and stands — it
+> is what fixed the collapsed durations. Fix B's decay-rescue was built on
+> a misreading: the 35 "rising through the onset" notes were not real
+> repeated-chord strikes, they were fake re-strikes inside the score's
+> *held* (tied whole-note) measures whose envelopes pulse upward from
+> pedal wash and neighboring moving voices. The user heard all of them as
+> extra notes on the Disklavier. The real repeated chords (measure 1's
+> 0.45s-grid eighth-note pulses, verified against the published score,
+> musicnotes MK0066954) were never in danger — every real strike carries
+> broadband onset support, which already exempts it from the gate.
+> `backend/tools/accuracy_check.py` now pins this: kept=248, restrikes=120,
+> median duration 0.425s, and four named hold-measure re-strikes must die.
+
 Executable plan for the next session. Every change is measured, mechanical,
 and validated by a script with hard acceptance numbers. Base branch: current
 `master` at `d99136a` (contains the Google OAuth fix — do NOT revert or touch

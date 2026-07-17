@@ -43,7 +43,6 @@ def main():
         if is_ghost:
             continue
         if (not protected and rise < nv.RESTRIKE_RISE_MIN
-                and nv._local_rise(env, f0) < nv.RESTRIKE_DECAY_MAX
                 and not nv._onset_supported(onset_times, n["onset"],
                                             nv.ONSET_SUPPORT_WINDOW_SEC)):
             restrikes += 1
@@ -56,9 +55,13 @@ def main():
 
     failures = []
 
+    # 386 merged; the gate must keep killing the hold-measure re-strikes
+    # (verified against the published score: held tied chords in measures
+    # 2/4/... must NOT re-strike) while keeping the real 0.45s-grid
+    # repeated chords (measures 1/3/... — protected by onset support).
     n_kept = len(kept)
-    if not (270 <= n_kept <= 300):
-        failures.append(f"kept notes {n_kept} not in [270, 300]")
+    if not (240 <= n_kept <= 260):
+        failures.append(f"kept notes {n_kept} not in [240, 260]")
 
     durations = [n["offset"] - n["onset"] for n in kept]
     median_dur = statistics.median(durations) if durations else 0.0
@@ -71,8 +74,8 @@ def main():
             failures.append(f"broadband onset at {t:.3f}s has no kept note within 80ms")
             break
 
-    if restrikes < 70:
-        failures.append(f"gate killed only {restrikes} notes, expected >= 70")
+    if restrikes < 110:
+        failures.append(f"gate killed only {restrikes} notes, expected >= 110")
 
     gate_vel_median = (statistics.median(gate_killed_velocities)
                         if gate_killed_velocities else 0.0)
@@ -80,6 +83,17 @@ def main():
         failures.append(
             f"gate-killed velocity median {gate_vel_median:.1f} >= 45 "
             "(gate is no longer killing only quiet tails)")
+
+    # Known fake re-strikes inside the score's held (tied whole-note)
+    # measures — heard as extra notes on the Disklavier when a 2026-07-15
+    # gate change wrongly rescued them. None may ever be kept again.
+    known_bad = [(84, 9.180), (79, 9.995), (76, 10.723), (77, 27.009)]
+    for pitch, onset in known_bad:
+        if any(k["pitch"] == pitch and abs(k["onset"] - onset) < 0.02
+               for k in kept):
+            failures.append(
+                f"hold-measure re-strike p{pitch}@{onset}s kept — the gate "
+                "must kill it (see RESTRIKE_RISE_MIN comment in note_verify)")
 
     print(f"merged={len(notes)} kept={n_kept} median_dur={median_dur:.3f}s "
           f"restrikes={restrikes} gate_kill_vel_median={gate_vel_median:.1f}")

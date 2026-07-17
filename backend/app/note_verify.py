@@ -70,13 +70,16 @@ DEDUPE_WINDOW_SEC = 0.03
 RESTRIKE_RISE_MIN = 2.0
 ONSET_SUPPORT_WINDOW_SEC = 0.10
 
-# A real hammer strike adds energy: the pitch envelope rises through the
-# onset. A hallucinated re-strike is the decaying tail of the previous
-# note — energy through its claimed onset can only fall. Only kill when
-# the local envelope is NOT rising (post/pre below this ratio). Measured
-# on a reverb hymn: true tails median 0.93, real strikes median 4.8 —
-# 1.05 rescues every repeated-chord strike and keeps killing the tails.
-RESTRIKE_DECAY_MAX = 1.05
+# Do NOT add a "local envelope rising → rescue from the gate" escape hatch
+# (tried 2026-07-15 as RESTRIKE_DECAY_MAX, reverted next day). On reverb-
+# heavy material the pedal wash and neighboring moving voices pulse a held
+# pitch's envelope upward with no hammer strike, so rescued notes were
+# precisely the fake re-strikes inside held (tied whole-note) measures —
+# the user heard every one on the Disklavier. Real repeated chords don't
+# need the rescue: their strikes carry broadband onset support, which
+# already exempts them from this gate (verified against the published
+# score of the Sweet Hour of Prayer benchmark: all 0.45s-grid repeated
+# chords kept, all hold-measure re-strikes killed).
 
 _ATTACK_FRAMES = 4      # ~93ms windows around the onset for the rise test
 
@@ -151,15 +154,6 @@ def _onset_supported(sorted_onsets, t, window):
         if 0 <= j < len(sorted_onsets) and abs(sorted_onsets[j] - t) <= window:
             return True
     return False
-
-
-def _local_rise(env, f0):
-    """Pitch-envelope energy direction through frame f0 (~±70ms)."""
-    pre = env[max(0, f0 - 3):f0]
-    post = env[f0 + 1:f0 + 4]
-    if pre.size == 0 or post.size == 0:
-        return 9.9  # edge of clip: no decay evidence, never gate-kill
-    return float(post.mean() / (pre.mean() + 1e-9))
 
 
 def _pitch_envelope(mag, pitch, cache):
@@ -439,7 +433,6 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
             stats["ghosts"] += 1
             continue
         if (not protected and rise < RESTRIKE_RISE_MIN
-                and _local_rise(env, f0) < RESTRIKE_DECAY_MAX
                 and not _onset_supported(onset_times, n["onset"],
                                          ONSET_SUPPORT_WINDOW_SEC)):
             stats["restrikes"] += 1
