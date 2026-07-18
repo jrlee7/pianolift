@@ -380,6 +380,34 @@ export default function LibraryView({ onEdit, onWatch }) {
     }
   }
 
+  // Bulk-delete every selected song from the library (Firestore doc + stored MP3).
+  async function handleBulkDelete() {
+    const chosen = songs.filter(function (s) { return selected.has(s.id) })
+    if (!chosen.length) return
+    if (!confirm('Delete ' + chosen.length + ' song' + (chosen.length === 1 ? '' : 's') +
+      ' from the library? Stored MP3s are deleted too. This can\'t be undone.')) return
+    setCopyResult(null)
+    setCopying({ done: 0, total: chosen.length, del: true })
+    const errors = []
+    let done = 0
+    for (const song of chosen) {
+      try {
+        await deleteSong(song.id, song.mp3Path)
+      } catch (e) {
+        errors.push(song.title + ' — ' + (e.message || String(e)))
+      }
+      done++
+      setCopying({ done: done, total: chosen.length, del: true })
+    }
+    setCopying(null)
+    setCopyResult({
+      verb: 'Deleted', ok: chosen.length - errors.length, total: chosen.length, errors: errors,
+      note: 'from the library.'
+    })
+    clearSelection()
+    refresh()
+  }
+
   async function handleDeleteFolder(folder) {
     const inFolder = songs.filter(function (s) { return s.folder === folder.name })
     if (!confirm(
@@ -482,7 +510,7 @@ export default function LibraryView({ onEdit, onWatch }) {
             disabled={selected.size === 0 || Boolean(copying)}
             onClick={handleCopyToUsb}
           >
-            {copying && !copying.disk
+            {copying && !copying.disk && !copying.del
               ? 'Copying ' + copying.done + '/' + copying.total + '…'
               : '💾 Copy ' + (selected.size || '') + ' to USB folder…'}
           </button>
@@ -502,6 +530,15 @@ export default function LibraryView({ onEdit, onWatch }) {
             title="Download the combined floppy image (.hfe) to drop on the stick yourself — no plugged-in Gotek needed."
             onClick={handleDownloadDisk}
           >⬇ .hfe</button>
+          <button
+            className="ghost danger"
+            disabled={selected.size === 0 || Boolean(copying)}
+            onClick={handleBulkDelete}
+          >
+            {copying && copying.del
+              ? 'Deleting ' + copying.done + '/' + copying.total + '…'
+              : '🗑 Delete ' + (selected.size || '') + ' song' + (selected.size === 1 ? '' : 's')}
+          </button>
         </div>
       )}
 
@@ -509,7 +546,7 @@ export default function LibraryView({ onEdit, onWatch }) {
         <div className="notice" style={{
           borderColor: copyResult.errors.length ? 'var(--red, #c0392b)' : 'var(--green)'
         }}>
-          ✓ {copyResult.note ? 'Wrote' : 'Copied'} <strong>{copyResult.ok}/{copyResult.total}</strong> song
+          ✓ {copyResult.verb || (copyResult.note ? 'Wrote' : 'Copied')} <strong>{copyResult.ok}/{copyResult.total}</strong> song
           {copyResult.total === 1 ? '' : 's'}
           {copyResult.note ? ' ' + copyResult.note : ' (.mid + accompaniment .mp3) to the folder.'}
           {copyResult.errors.length > 0 && (

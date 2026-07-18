@@ -490,6 +490,32 @@ export default function App() {
     }
   }
 
+  // Bulk-delete every selected finished song from the Convert list.
+  async function handleBulkDelete() {
+    const chosen = chosenJobs()
+    if (!chosen.length) return
+    if (!confirm('Delete ' + chosen.length + ' song' + (chosen.length === 1 ? '' : 's') +
+      '? This can\'t be undone.')) return
+    setBatchResult(null)
+    setBatch({ done: 0, total: chosen.length, verb: 'Deleting' })
+    const errors = []
+    let done = 0
+    for (const job of chosen) {
+      try {
+        await deleteJob(job.id)
+        if (openJobId === job.id) setOpenJobId(null)
+      } catch (e) {
+        errors.push(job.name + ' — ' + (e.message || String(e)))
+      }
+      done++
+      setBatch({ done: done, total: chosen.length, verb: 'Deleting' })
+    }
+    setBatch(null)
+    setBatchResult({ verb: 'Deleted', ok: chosen.length - errors.length, total: chosen.length, errors: errors })
+    clearSelection()
+    refresh()
+  }
+
   // Same multi-song floppy image, but hand back the .hfe file to save/drop on
   // the stick manually (no plugged-in Gotek required).
   async function handleDownloadDisk() {
@@ -629,6 +655,15 @@ export default function App() {
                     : (isFamily ? '☁ Move ' : '📁 Move ') + (selected.size || '') + ' to library'}
                 </button>
               )}
+              <button
+                className="ghost danger"
+                disabled={selected.size === 0 || Boolean(batch)}
+                onClick={handleBulkDelete}
+              >
+                {batch && batch.verb === 'Deleting'
+                  ? 'Deleting ' + batch.done + '/' + batch.total + '…'
+                  : '🗑 Delete ' + (selected.size || '') + ' song' + (selected.size === 1 ? '' : 's')}
+              </button>
             </div>
           )}
 
