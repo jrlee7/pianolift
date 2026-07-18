@@ -80,6 +80,7 @@ def separate_piano(audio_path, job_dir, progress_cb):
     that plays through the ENSPIRE speakers.
     """
     from audio_separator.separator import Separator
+    import logging
     import soundfile as sf
 
     progress_cb("separating", 0)
@@ -99,14 +100,33 @@ def separate_piano(audio_path, job_dir, progress_cb):
                      "batch_size": 1, "overlap": overlap, "pitch_shift": 0})
     progress_cb("separating", 5)  # first run downloads a ~700MB checkpoint
     separator.load_model(model_filename=SEPARATION_MODEL)
-    # separate() returns bare filenames, not joined with output_dir.
-    output_files = [os.path.join(sep_out, f) for f in separator.separate(audio_path)]
+
+    # audio_separator's Separator.separate() catches any exception per file
+    # internally and only logs it -- a genuine failure (OOM, a corrupt
+    # cached checkpoint, a disk error) looks identical to "produced nothing"
+    # unless we grab its suppressed log record ourselves.
+    class _CaptureErrors(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.ERROR)
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    capture = _CaptureErrors()
+    logging.getLogger().addHandler(capture)
+    try:
+        # separate() returns bare filenames, not joined with output_dir.
+        output_files = [os.path.join(sep_out, f) for f in separator.separate(audio_path)]
+    finally:
+        logging.getLogger().removeHandler(capture)
     progress_cb("separating", 100)
 
     piano_wav = next(
         (f for f in output_files if "piano" in os.path.basename(f).lower()), None)
     if piano_wav is None:
-        raise RuntimeError("Separator finished but piano stem not found")
+        detail = "; ".join(capture.messages) or "no error logged by the separator"
+        raise RuntimeError("Separator finished but piano stem not found (" + detail + ")")
 
     accompaniment_stems = [f for f in output_files if f != piano_wav]
     if not accompaniment_stems:
