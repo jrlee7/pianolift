@@ -588,7 +588,8 @@ def verify_job(job_id: str, deep: bool = False):
         _persist(job_id)
     return {"noteCount": len(notes), "pedalCount": len(pedals),
             "ghostCount": stats["ghosts"], "trimmedCount": stats["trimmed"],
-            "restrikeCount": stats["restrikes"]}
+            "restrikeCount": stats["restrikes"],
+            "rescuedCount": stats["pedalRescued"]}
 
 
 @app.post("/api/jobs/{job_id}/events/reset")

@@ -124,6 +124,17 @@ ALT_MATCH_WINDOW_SEC = 0.05
 # pedal that fast, and the Disklavier certainly can't.
 PEDAL_GAP_MERGE_SEC = 0.05
 
+# A note whose offset lands within this window of a sustain-pedal release
+# was usually ended by the damper falling, not the key coming up (legato
+# pedal change: strike bass, lift pedal ~100ms later, fingers hold the
+# keys). Candidates for the forward-extension rescue below.
+PEDAL_CLIP_WINDOW_SEC = 0.08
+# Rescue never extends past this (longest legato hold measured on the
+# Sweet Hour bench is ~2.1s; 4s is a generous safety cap).
+RESCUE_MAX_EXTEND_SEC = 4.0
+# Extensions smaller than this aren't audible across a pedal gap; skip.
+RESCUE_MIN_GAIN_SEC = 0.10
+
 # Bass fundamentals are weak on real pianos (string inharmonicity +
 # soundboard rolloff): below ~C3 most of a note's energy sits in harmonics
 # 2-3, so measuring only the fundamental CQT bin under-scores real bass
@@ -384,6 +395,71 @@ def _refine_pedals(pedals, alt_pedals, notes, stats, add_alt=False):
     return merged
 
 
+def _rescue_pedal_clipped(notes, pedals, mag, stats):
+    """Extend offsets of notes clipped at a sustain-pedal release.
+
+    ByteDance's offset marks sound-end: at a legato pedal change the damper
+    falling on the OLD harmony also chops the offset of a freshly struck,
+    finger-held note (video-truth bench: bass octave held 1.0s reported as
+    0.14s). If the pitch's envelope still holds >= OFFSET_KEEP_RATIO of the
+    note's own span peak after the release, the key was still down -- walk
+    the offset forward to where the envelope really dies. Mirror of
+    _trim_offset, which only ever shortens. Never touches onsets, never
+    adds notes (the reverted re-strike rescue failure mode can't occur),
+    never moves pedal events. Repeated chords self-cap via the next
+    same-pitch onset (bench 41.3s staccato chords: +0.04s max).
+    """
+    from bisect import bisect_left, bisect_right
+    if not notes or not pedals:
+        return
+    releases = sorted(p["offset"] for p in pedals)
+    by_pitch = {}
+    for n in notes:
+        by_pitch.setdefault(n["pitch"], []).append(n["onset"])
+    for lst in by_pitch.values():
+        lst.sort()
+    cache = {}
+    n_frames = mag.shape[1]
+    for n in notes:
+        off = n["offset"]
+        i = bisect_left(releases, off)
+        near = min(((abs(releases[j] - off), releases[j]) for j in (i - 1, i)
+                    if 0 <= j < len(releases)), default=None)
+        if near is None or near[0] > PEDAL_CLIP_WINDOW_SEC:
+            continue
+        env, floor = _pitch_envelope(mag, n["pitch"], cache)
+        f0 = min(n_frames - 1, max(0, int(round(n["onset"] * SR / HOP))))
+        f1 = min(n_frames - 1, max(f0, int(round(off * SR / HOP))))
+        span = env[f0:f1 + 1]
+        if span.size == 0:
+            continue
+        thresh = float(span.max()) * OFFSET_KEEP_RATIO
+        if thresh <= floor:
+            continue                 # too quiet to track credibly
+        onsets = by_pitch[n["pitch"]]
+        k = bisect_right(onsets, n["onset"])
+        cap_t = off + RESCUE_MAX_EXTEND_SEC
+        if k < len(onsets):
+            cap_t = min(cap_t, onsets[k] - REONSET_GAP_SEC)
+        # The ring cannot outlive the NEXT damper drop: whatever the next
+        # pedal segment catches, it damps at its own release. Envelope
+        # energy beyond that point is another note's harmonics (octave
+        # bleed pushed a C1 to the 4s cap on the bench without this).
+        j = bisect_right(releases, near[1])
+        if j < len(releases):
+            cap_t = min(cap_t, releases[j])
+        cap_f = min(n_frames - 1, int(round(cap_t * SR / HOP)))
+        f = f1
+        while f + 1 <= cap_f and env[f + 1] >= thresh:
+            f += 1
+        if f == f1:
+            continue
+        new_off = min((f + 1) * HOP / float(SR) + RELEASE_PAD_SEC, cap_t)
+        if new_off > off + RESCUE_MIN_GAIN_SEC:
+            n["offset"] = round(new_off, 4)
+            stats["pedalRescued"] += 1
+
+
 def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
            alt_notes=None, alt_pedals=None, alt_evidence_only=False):
     """Drop ghost notes, trim over-held offsets, dedupe double-fired
@@ -405,7 +481,7 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
     """
     stats = {"ghosts": 0, "trimmed": 0, "deduped": 0, "unconfirmed": 0,
              "altOnly": 0, "pedalsDropped": 0, "pedalsAdded": 0,
-             "restrikes": 0}
+             "restrikes": 0, "pedalRescued": 0}
     if not notes and not alt_notes:
         return notes, pedals, stats
 
@@ -504,5 +580,6 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
     pedals = _refine_pedals(
         pedals, alt_pedals, deduped, stats,
         add_alt=alt_pedals is not None and not alt_evidence_only)
+    _rescue_pedal_clipped(deduped, pedals, mag, stats)
     progress_cb("verifying", 100)
     return deduped, pedals, stats
