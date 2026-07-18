@@ -129,11 +129,25 @@ PEDAL_GAP_MERGE_SEC = 0.05
 # pedal change: strike bass, lift pedal ~100ms later, fingers hold the
 # keys). Candidates for the forward-extension rescue below.
 PEDAL_CLIP_WINDOW_SEC = 0.08
-# Rescue never extends past this (longest legato hold measured on the
-# Sweet Hour bench is ~2.1s; 4s is a generous safety cap).
+# A rescued note never grows past this TOTAL duration, measured from its
+# onset (longest legato hold on the Sweet Hour bench is ~2.1s; 4s is a
+# generous ceiling). Anchoring at the onset -- not the current offset --
+# makes repeat verify runs converge: anchored at the offset, each pass
+# re-extended an already-rescued note by up to another 4s (measured creep
+# 15.1 -> 18.8 on one bass note).
 RESCUE_MAX_EXTEND_SEC = 4.0
 # Extensions smaller than this aren't audible across a pedal gap; skip.
 RESCUE_MIN_GAIN_SEC = 0.10
+# A freely ringing string only decays. If the walked envelope climbs this
+# far above its running minimum since the walk began, the energy is another
+# note's attack bleeding into the bins -- end the extension there. 2.0x =
+# +6dB; natural ring jitter measured well under 3dB on the Sweet Hour job.
+# The guard stays disarmed for a grace period first: a fresh strike's
+# partials keep swelling for a few hundred ms after the (clipped) offset
+# (soundboard bloom / string beating), and without the grace that bloom
+# broke the walk 0.14s in (bench p36@13.2 came out 0.27s vs 1.0s truth).
+RESCUE_RISE_STOP_RATIO = 2.5
+RESCUE_RISE_GRACE_SEC = 0.40
 
 # Bass fundamentals are weak on real pianos (string inharmonicity +
 # soundboard rolloff): below ~C3 most of a note's energy sits in harmonics
@@ -408,6 +422,16 @@ def _rescue_pedal_clipped(notes, pedals, mag, stats):
     adds notes (the reverted re-strike rescue failure mode can't occur),
     never moves pedal events. Repeated chords self-cap via the next
     same-pitch onset (bench 41.3s staccato chords: +0.04s max).
+
+    Pedal releases only NOMINATE candidates -- they never truncate the
+    walk. A next-release cap was tried (2026-07-18) and reverted the same
+    day: BD's pedal detector flutters mid-hold on reverb material (Sweet
+    Hour 155.5-160.7s: six short segments whose gaps show no damp step in
+    the audio), so capping at the next claimed release re-cut the very
+    notes being rescued. The walk ends on the audio alone: envelope below
+    the keep threshold, a rise above the running minimum (a ring can only
+    decay -- a rise is another note's attack bleeding in), the next
+    same-pitch strike, or the hard length cap.
     """
     from bisect import bisect_left, bisect_right
     if not notes or not pedals:
@@ -438,19 +462,18 @@ def _rescue_pedal_clipped(notes, pedals, mag, stats):
             continue                 # too quiet to track credibly
         onsets = by_pitch[n["pitch"]]
         k = bisect_right(onsets, n["onset"])
-        cap_t = off + RESCUE_MAX_EXTEND_SEC
+        cap_t = n["onset"] + RESCUE_MAX_EXTEND_SEC
         if k < len(onsets):
             cap_t = min(cap_t, onsets[k] - REONSET_GAP_SEC)
-        # The ring cannot outlive the NEXT damper drop: whatever the next
-        # pedal segment catches, it damps at its own release. Envelope
-        # energy beyond that point is another note's harmonics (octave
-        # bleed pushed a C1 to the 4s cap on the bench without this).
-        j = bisect_right(releases, near[1])
-        if j < len(releases):
-            cap_t = min(cap_t, releases[j])
         cap_f = min(n_frames - 1, int(round(cap_t * SR / HOP)))
+        grace_f = f1 + int(round(RESCUE_RISE_GRACE_SEC * SR / HOP))
         f = f1
+        run_min = env[f1]
         while f + 1 <= cap_f and env[f + 1] >= thresh:
+            nxt = env[f + 1]
+            if f + 1 > grace_f and nxt > run_min * RESCUE_RISE_STOP_RATIO:
+                break            # fresh attack bleeding in, ring is over
+            run_min = min(run_min, nxt)
             f += 1
         if f == f1:
             continue
