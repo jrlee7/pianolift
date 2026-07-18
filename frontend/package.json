@@ -30,6 +30,7 @@
   "build": {
     "appId": "com.pianoforge.app",
     "productName": "PianoForge",
+    "npmRebuild": false,
     "publish": [
       {
         "provider": "github",

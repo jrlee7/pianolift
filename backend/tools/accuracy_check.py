@@ -1,92 +1,75 @@
 """Regression check for note_verify against the Sweet Hour of Prayer benchmark.
 
 Loads the frozen raw ByteDance+Transkun outputs for a 60s reverb-heavy hymn
-clip (no model re-run needed) and drives them through the real functions
-(_merge_alt, _cqt_mag, _note_features, the re-strike gate, _trim_offset) --
-the same logic refine() runs, but inlined so this script can also capture
-gate-killed notes' velocities, which refine()'s stats dict doesn't expose.
+clip (no model re-run needed), runs the REAL note_verify.refine(), and pins
+the outcome against the video-extracted ground truth
+(C:\\Users\\justi\\pianolift_bench\\sweethour\\video_truth.json — see
+tools/extract_video_truth.py; the source video's lit-key rendering is the
+arranger's actual note list, frame-accurate at 24fps).
+
+History (why these pins):
+  * v0.1.4 (2026-07-15): an envelope-rise "rescue" for gate kills shipped
+    and was reverted next day — it rescued exactly the fake re-strikes in
+    held measures. Do not reintroduce (see RESTRIKE_RISE_MIN comment).
+  * 2026-07-17: ground truth extracted from the source video itself
+    exposed the remaining failure class: BD-only notes with no attack
+    surviving via pitch-agnostic broadband onset support (31 kept fakes,
+    0 missed real notes). BD_ONLY_RISE_MIN + the strict BD-only micro rule
+    fixed it: P 0.875 -> 0.982, R stays 1.000, F1 0.933 -> 0.991.
+    (The previously-pinned counts kept=248 / median-dur checks were
+    replaced by direct truth-scored pins below. NOTE: an earlier
+    "truth.mid" downloaded alongside the source video scored F1 0.741
+    against the video — it is itself an audio transcription with fake
+    re-strikes, NOT ground truth; never validate against it.)
 
 Run: backend/.venv/Scripts/python.exe backend/tools/accuracy_check.py
 """
 import json
-import statistics
 import sys
 from pathlib import Path
 
 BENCH_DIR = Path(r"C:\Users\justi\pianolift_bench\sweethour")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app import note_verify as nv  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from app import note_verify as nv       # noqa: E402
+from score_vs_video import (            # noqa: E402
+    estimate_offset, match, prf, CROP_SEC)
 
 
 def main():
     raw = json.loads((BENCH_DIR / "raw60.json").read_text())
-    crop_wav = str(BENCH_DIR / "crop60.wav")
+    truth = json.loads((BENCH_DIR / "video_truth.json").read_text())["notes"]
+    truth = [t for t in truth if t["onset"] <= CROP_SEC]
 
-    notes, evidence = nv._merge_alt(raw["bd"], raw["tk"], evidence_only=False)
+    kept, _pedals, stats = nv.refine(
+        str(BENCH_DIR / "crop60.wav"), raw["bd"], raw["bd_ped"],
+        progress_cb=lambda *a: None,
+        alt_notes=raw["tk"], alt_pedals=raw["tk_ped"], alt_evidence_only=False)
 
-    mag, onset_times = nv._cqt_mag(crop_wav)
-    feats = nv._note_features(mag, notes)
-
-    kept = []
-    gate_killed_velocities = []
-    restrikes = 0
-    for i, (n, (score, rise, env, f0, f1)) in enumerate(zip(notes, feats)):
-        if (n["offset"] - n["onset"] < nv.MICRO_DUR_SEC
-                and score < nv.MICRO_SCORE_MAX):
-            continue
-        protected = evidence[i] == "both"
-        if protected:
-            is_ghost = False
-        else:
-            is_ghost = score < nv.UNCONF_SCORE_MAX and rise < nv.UNCONF_RISE_MAX
-        if is_ghost:
-            continue
-        if (not protected and rise < nv.RESTRIKE_RISE_MIN
-                and not nv._onset_supported(onset_times, n["onset"],
-                                            nv.ONSET_SUPPORT_WINDOW_SEC)):
-            restrikes += 1
-            gate_killed_velocities.append(n["velocity"])
-            continue
-        new_off = nv._trim_offset(env, n, f0, f1)
-        if new_off < n["offset"]:
-            n = dict(n, offset=new_off)
-        kept.append(n)
+    offset = estimate_offset(truth, kept)
+    pairs, un_t, un_e = match(truth, kept, offset)
+    p, r, f1 = prf(len(pairs), len(un_t), len(un_e))
 
     failures = []
 
-    # 386 merged; the gate must keep killing the hold-measure re-strikes
-    # (verified against the published score: held tied chords in measures
-    # 2/4/... must NOT re-strike) while keeping the real 0.45s-grid
-    # repeated chords (measures 1/3/... — protected by onset support).
-    n_kept = len(kept)
-    if not (240 <= n_kept <= 260):
-        failures.append(f"kept notes {n_kept} not in [240, 260]")
+    # Recall is sacred: the pipeline currently plays EVERY real note in the
+    # clip. Any change that loses one is a regression, full stop.
+    if len(un_t) > 0:
+        failures.append(f"{len(un_t)} real (video-verified) notes missed; "
+                        "recall must stay 1.000")
 
-    durations = [n["offset"] - n["onset"] for n in kept]
-    median_dur = statistics.median(durations) if durations else 0.0
-    if median_dur < 0.40:
-        failures.append(f"median kept duration {median_dur:.3f}s < 0.40s")
+    # Precision floor: at most 6 kept fakes in the 60s clip (current: 4).
+    if len(un_e) > 6:
+        failures.append(f"{len(un_e)} kept hallucinations > 6 allowed")
 
-    kept_onsets = sorted(n["onset"] for n in kept)
-    for t in onset_times:
-        if not nv._onset_supported(kept_onsets, t, 0.08):
-            failures.append(f"broadband onset at {t:.3f}s has no kept note within 80ms")
-            break
-
-    if restrikes < 110:
-        failures.append(f"gate killed only {restrikes} notes, expected >= 110")
-
-    gate_vel_median = (statistics.median(gate_killed_velocities)
-                        if gate_killed_velocities else 0.0)
-    if gate_vel_median >= 45:
-        failures.append(
-            f"gate-killed velocity median {gate_vel_median:.1f} >= 45 "
-            "(gate is no longer killing only quiet tails)")
+    if f1 < 0.985:
+        failures.append(f"F1 {f1:.3f} < 0.985")
 
     # Known fake re-strikes inside the score's held (tied whole-note)
-    # measures — heard as extra notes on the Disklavier when a 2026-07-15
-    # gate change wrongly rescued them. None may ever be kept again.
+    # measures — confirmed fake by BOTH the user's Disklavier listening
+    # test (v0.1.4 postmortem) and the video (continuous bars, no
+    # re-strike). None may ever be kept again.
     known_bad = [(84, 9.180), (79, 9.995), (76, 10.723), (77, 27.009)]
     for pitch, onset in known_bad:
         if any(k["pitch"] == pitch and abs(k["onset"] - onset) < 0.02
@@ -95,8 +78,9 @@ def main():
                 f"hold-measure re-strike p{pitch}@{onset}s kept — the gate "
                 "must kill it (see RESTRIKE_RISE_MIN comment in note_verify)")
 
-    print(f"merged={len(notes)} kept={n_kept} median_dur={median_dur:.3f}s "
-          f"restrikes={restrikes} gate_kill_vel_median={gate_vel_median:.1f}")
+    print(f"kept={len(kept)} TP={len(pairs)} FN={len(un_t)} FP={len(un_e)} "
+          f"P={p:.3f} R={r:.3f} F1={f1:.3f} "
+          f"(ghosts={stats['ghosts']} restrikes={stats['restrikes']})")
 
     if failures:
         print("FAIL:")

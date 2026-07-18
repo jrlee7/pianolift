@@ -349,8 +349,11 @@ export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo
     // Same math the backend bakes into the real MIDI render:
     // user offset + codec-delay compensation - dead-space trim.
     const effOffset = settings.offsetMs / 1000 + encDelay - trimStart
+    // Match the "Sustain pedal" export toggle: off means the exported files
+    // carry no CC64 either, so the preview shouldn't fake a ring for it.
     const player = createPreviewPlayer(
-      events.notes, settings, accompRef.current, effOffset)
+      events.notes, settings, accompRef.current, effOffset,
+      settings.pedal ? events.pedals : [])
     playerRef.current = player
     setPreviewing(true)
     player.start().catch(function (e) {
@@ -377,7 +380,7 @@ export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo
       events.notes, settings,
       function (t) { setPlayhead(t) },
       function () { stopPreview() },
-      startAt)
+      startAt, settings.pedal ? events.pedals : [])
     playerRef.current = player
     setPreviewing(true)
     player.start().catch(function (e) {

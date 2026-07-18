@@ -328,6 +328,62 @@ export async function buildDiskFromLibrary(songs, opts) {
   return saveDiskResult(res)
 }
 
+// --- Sheet music (PDF/MusicXML -> pedal + dynamics suggestions) ----------
+
+export async function uploadSheet(file) {
+  const form = new FormData()
+  form.append('file', file)
+  const res = await fetch(BASE + '/sheet-jobs', { method: 'POST', body: form })
+  if (!res.ok) throw new Error('Upload failed (' + res.status + ')')
+  return res.json()
+}
+
+export async function listSheetJobs() {
+  const res = await fetch(BASE + '/sheet-jobs')
+  if (!res.ok) throw new Error('Failed to list sheet jobs')
+  return res.json()
+}
+
+export async function deleteSheetJob(id) {
+  const res = await fetch(BASE + '/sheet-jobs/' + id, { method: 'DELETE' })
+  if (!res.ok) throw new Error('Delete failed')
+  return res.json()
+}
+
+export function sheetMusicXmlUrl(id) {
+  // cache-bust: the working score changes on every edit/reset, and a
+  // stale cached copy would show marks that no longer exist.
+  return BASE + '/sheet-jobs/' + id + '/musicxml?t=' + Date.now()
+}
+
+export async function fetchSheetMusicXml(id) {
+  const res = await fetch(BASE + '/sheet-jobs/' + id + '/musicxml', { cache: 'no-store' })
+  if (!res.ok) throw new Error('Score not ready')
+  return res.text()
+}
+
+// xmlText is the whole edited MusicXML document, re-serialized client-side.
+export async function saveSheetMusicXml(id, xmlText) {
+  const form = new FormData()
+  form.append('file', new Blob([xmlText], { type: 'application/xml' }), 'score.musicxml')
+  const res = await fetch(BASE + '/sheet-jobs/' + id + '/musicxml', {
+    method: 'PUT', body: form
+  })
+  if (!res.ok) throw new Error('Save failed')
+  return res.json()
+}
+
+export async function resetSheetJob(id) {
+  const res = await fetch(BASE + '/sheet-jobs/' + id + '/reset', { method: 'POST' })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail || 'Reset failed')
+  return data
+}
+
+export function sheetExportUrl(id) {
+  return BASE + '/sheet-jobs/' + id + '/export'
+}
+
 export async function fetchMidiBase64(id, settings) {
   const res = await fetch(midiUrl(id, settings))
   if (!res.ok) throw new Error('MIDI render failed')

@@ -1,7 +1,15 @@
 // Browser preview: plays the transcribed notes through a small Web Audio
 // synth, time-locked to the accompaniment <audio> element using the same
 // offset math the backend bakes into the real MIDI render. Rough piano tone —
-// for judging sync and dynamics, not fidelity.
+// for judging sync, dynamics, and sustain, not fidelity.
+//
+// Sustain pedal: the real MIDI export and the Disklavier both get pedal as
+// separate CC64 events — a real piano's damper naturally rings a note past
+// key-release while the pedal is down, no note-length change needed. This
+// synth has no damper mechanism, so to sound right it must fake that ring by
+// extending the note's audible end to pedal-up (see computeAudibleEnds).
+// Without this, pedaled/held material (hymns, tied chords) sounds chopped
+// here even though the real notes and pedal events are correct.
 
 function midiToFreq(pitch) {
   return 440 * Math.pow(2, (pitch - 69) / 12)
@@ -25,16 +33,72 @@ export function mapVelocity(raw, velMin, velMax, gamma) {
   return Math.max(1, Math.min(127, out))
 }
 
+// For each note, the time it actually stops sounding: extended to pedal-up
+// when the pedal is down at key-release, but never past the next same-pitch
+// re-strike (a fresh hammer stops the old string's ring). Precomputed once
+// per player (not per-note-scheduled) since it needs a full look-ahead/back
+// over the note list. `notes` must be onset-sorted (both callers already
+// guarantee this — backend-sorted or trim-sorted).
+export function computeAudibleEnds(notes, pedals) {
+  const sortedPedals = (pedals || []).slice().sort(function (a, b) {
+    return a.onset - b.onset
+  })
+
+  function pedalDownAtIndex(t) {
+    let lo = 0, hi = sortedPedals.length - 1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      const seg = sortedPedals[mid]
+      if (t < seg.onset) hi = mid - 1
+      else if (t > seg.offset) lo = mid + 1
+      else return mid
+    }
+    return -1
+  }
+
+  // Next onset at the same pitch, scanned backwards so each note only looks
+  // at what it needs — O(n) total, no per-note re-scan of the whole list.
+  const nextSamePitchOnset = new Array(notes.length)
+  const lastOnsetByPitch = new Map()
+  for (let i = notes.length - 1; i >= 0; i--) {
+    const n = notes[i]
+    nextSamePitchOnset[i] = lastOnsetByPitch.has(n.pitch)
+      ? lastOnsetByPitch.get(n.pitch) : Infinity
+    lastOnsetByPitch.set(n.pitch, n.onset)
+  }
+
+  const ends = new Array(notes.length)
+  for (let i = 0; i < notes.length; i++) {
+    const n = notes[i]
+    let end = n.offset
+    const si = pedalDownAtIndex(n.offset)
+    if (si >= 0) {
+      end = Math.max(end, sortedPedals[si].offset)
+      // Follow through short re-pedal gaps (<0.25s) to avoid synthetic dropout
+      for (let sj = si + 1; sj < sortedPedals.length; sj++) {
+        const next = sortedPedals[sj]
+        if (next.onset - end < 0.25) {
+          end = Math.max(end, next.offset)
+        } else break
+      }
+    }
+    ends[i] = Math.min(end, nextSamePitchOnset[i])
+  }
+  return ends
+}
+
 // Schedule one synth note at AudioContext time `when`. Shared by both the
 // accompaniment-locked player and the standalone MIDI-only player, so what you
 // hear (dynamics, release trim, sustain cap) matches the exported files.
-function synthNote(ctx, master, settings, note, when) {
+// `audibleEnd` (from computeAudibleEnds) stands in for note.offset when given,
+// so a pedaled note rings through the preview instead of cutting at key-release.
+function synthNote(ctx, master, settings, note, when, audibleEnd) {
   const vel = mapVelocity(
     note.velocity, settings.velMin, settings.velMax, settings.gamma)
   const gainVal = Math.pow(vel / 127, 1.6) * 0.35
   // mirror the backend's note-tail trim + sustain cap so preview matches
   const release = (settings.releaseMs || 0) / 1000
-  let end = note.offset - release
+  let end = (audibleEnd != null ? audibleEnd : note.offset) - release
   if (settings.capSustain) {
     const cap = note.onset + maxSustainSec(note.pitch)
     if (end > cap) end = cap
@@ -68,7 +132,7 @@ function synthNote(ctx, master, settings, note, when) {
   o2.stop(when + dur + 0.05)
 }
 
-export function createPreviewPlayer(notes, settings, audioEl, effOffsetSec) {
+export function createPreviewPlayer(notes, settings, audioEl, effOffsetSec, pedals) {
   const ctx = new (window.AudioContext || window.webkitAudioContext)()
   const master = ctx.createGain()
   master.gain.value = 0.5
@@ -78,13 +142,14 @@ export function createPreviewPlayer(notes, settings, audioEl, effOffsetSec) {
   let nextIdx = 0
   let stopped = false
   let lastTime = 0
+  const audibleEnds = computeAudibleEnds(notes, pedals)
 
   // notes sorted by onset already (backend sorts). Schedule with lookahead.
   const LOOKAHEAD = 0.4   // schedule this far into the future
   const INTERVAL = 120    // ms between scheduler ticks
 
-  function scheduleNote(note, when) {
-    synthNote(ctx, master, settings, note, when)
+  function scheduleNote(note, when, audibleEnd) {
+    synthNote(ctx, master, settings, note, when, audibleEnd)
   }
 
   function tick() {
@@ -105,7 +170,7 @@ export function createPreviewPlayer(notes, settings, audioEl, effOffsetSec) {
       const playAt = n.onset + effOffsetSec
       if (playAt > horizon) break
       if (playAt >= audioEl.currentTime - 0.05) {
-        scheduleNote(n, anchor + playAt)
+        scheduleNote(n, anchor + playAt, audibleEnds[nextIdx])
       }
       nextIdx++
     }
@@ -137,7 +202,7 @@ export function createPreviewPlayer(notes, settings, audioEl, effOffsetSec) {
 // accompaniment). Clocks straight off the AudioContext — no <audio> element.
 // onTime(sec) fires each tick to drive the playhead/keyboard; onEnded fires
 // once the last note has passed. startSec begins playback mid-song.
-export function createNotePlayer(notes, settings, onTime, onEnded, startSec) {
+export function createNotePlayer(notes, settings, onTime, onEnded, startSec, pedals) {
   const ctx = new (window.AudioContext || window.webkitAudioContext)()
   const master = ctx.createGain()
   master.gain.value = 0.5
@@ -145,9 +210,11 @@ export function createNotePlayer(notes, settings, onTime, onEnded, startSec) {
 
   const LOOKAHEAD = 0.4
   const INTERVAL = 120
+  const audibleEnds = computeAudibleEnds(notes, pedals)
+  // Pedal-extended, so onEnded doesn't fire while the last chord still rings.
   let endSec = 0
-  for (let i = 0; i < notes.length; i++) {
-    if (notes[i].offset > endSec) endSec = notes[i].offset
+  for (let i = 0; i < audibleEnds.length; i++) {
+    if (audibleEnds[i] > endSec) endSec = audibleEnds[i]
   }
 
   let timer = null
@@ -174,7 +241,9 @@ export function createNotePlayer(notes, settings, onTime, onEnded, startSec) {
     while (nextIdx < notes.length) {
       const n = notes[nextIdx]
       if (n.onset > horizon) break
-      if (n.onset >= elapsed - 0.05) synthNote(ctx, master, settings, n, anchor + n.onset)
+      if (n.onset >= elapsed - 0.05) {
+        synthNote(ctx, master, settings, n, anchor + n.onset, audibleEnds[nextIdx])
+      }
       nextIdx++
     }
     if (onTime) onTime(elapsed)

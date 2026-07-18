@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from . import (pipeline, midi_writer, note_verify, eseq_writer, disk_writer,
                transkun_engine,
                usb, job_runner)
+from . import sheet_routes
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
@@ -48,6 +49,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(sheet_routes.router)
 
 # One worker: the models are heavy and CPU-bound; queue jobs serially.
 executor = ThreadPoolExecutor(max_workers=1)

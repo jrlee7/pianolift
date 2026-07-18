@@ -9,9 +9,13 @@ import PlayerView from './components/PlayerView.jsx'
 import GotekView from './components/GotekView.jsx'
 import AuthView from './components/AuthView.jsx'
 import ActivationModal from './components/ActivationModal.jsx'
+import SheetUploadZone from './components/SheetUploadZone.jsx'
+import SheetJobCard from './components/SheetJobCard.jsx'
+import SheetResultView from './components/SheetResultView.jsx'
 import {
   listJobs, uploadMp3, submitUrl, deleteJob, verifyJob,
-  midiUrl, audioUrl, fetchMidiBase64, archiveVideo, buildDiskFromJobs
+  midiUrl, audioUrl, fetchMidiBase64, archiveVideo, buildDiskFromJobs,
+  listSheetJobs, uploadSheet
 } from './api.js'
 import {
   firebaseReady, saveSong, saveSourceUrl, listSongs, isSameSong, findExistingSong,
@@ -59,6 +63,41 @@ export default function App() {
   // Play tab target: {jobId} (Convert song) or {libSong} (library song).
   // A fresh object per click so PlayerView re-targets even for the same song.
   const [playerInit, setPlayerInit] = useState(null)
+
+  // ---- Sheet tab: PDF/MusicXML -> pedal + dynamics suggestions ----
+  const [sheetJobs, setSheetJobs] = useState([])
+  const [openSheetJobId, setOpenSheetJobId] = useState(null)
+  const [sheetUploading, setSheetUploading] = useState(false)
+
+  const refreshSheet = useCallback(async function () {
+    try {
+      setSheetJobs(await listSheetJobs())
+    } catch (e) { /* backend blip — next refresh reconciles */ }
+  }, [])
+
+  useEffect(function () {
+    refreshSheet()
+    // PDF jobs run OMR in the background (can take a while), so poll like
+    // the Convert tab does for its audio jobs.
+    const t = setInterval(refreshSheet, 2000)
+    return function () { clearInterval(t) }
+  }, [refreshSheet])
+
+  async function handleSheetFiles(files) {
+    setSheetUploading(true)
+    let lastId = null
+    for (let i = 0; i < files.length; i++) {
+      try {
+        const job = await uploadSheet(files[i])
+        lastId = job.id
+      } catch (e) {
+        alert('Upload failed: ' + e.message)
+      }
+    }
+    setSheetUploading(false)
+    if (lastId) setOpenSheetJobId(lastId)
+    refreshSheet()
+  }
 
   // ---- Accounts & the 5-song free tier ----
   const [user, setUser] = useState(null)
@@ -529,6 +568,10 @@ export default function App() {
           className={tab === 'links' ? 'active' : ''}
           onClick={function () { setTab('links') }}
         >Links</button>
+        <button
+          className={tab === 'sheet' ? 'active' : ''}
+          onClick={function () { setTab('sheet') }}
+        >Sheet</button>
       </div>
 
       {tab === 'convert' && (
@@ -665,6 +708,38 @@ export default function App() {
       {tab === 'disk' && <GotekView />}
 
       {tab === 'links' && <SourcesView />}
+
+      {tab === 'sheet' && (
+        <div>
+          {!backendUp && (
+            <div className="notice warn">
+              Backend not reachable. Start it with <code>run-backend.cmd</code> (or
+              <code> uvicorn app.main:app --port 8000</code> in backend/).
+            </div>
+          )}
+          <SheetUploadZone onFiles={handleSheetFiles} />
+          {sheetUploading && <div className="meta">Uploading…</div>}
+          {sheetJobs.slice().reverse().map(function (job) {
+            const isOpen = openSheetJobId === job.id
+            return (
+              <div key={job.id}>
+                <SheetJobCard
+                  job={job}
+                  open={isOpen}
+                  onToggle={function () { setOpenSheetJobId(isOpen ? null : job.id) }}
+                  onDeleted={function () {
+                    if (isOpen) setOpenSheetJobId(null)
+                    refreshSheet()
+                  }}
+                />
+                {isOpen && (
+                  <SheetResultView job={job} onChanged={refreshSheet} />
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
 
       {showActivation && (
         <ActivationModal

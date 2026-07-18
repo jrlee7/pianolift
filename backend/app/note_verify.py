@@ -70,6 +70,15 @@ DEDUPE_WINDOW_SEC = 0.03
 RESTRIKE_RISE_MIN = 2.0
 ONSET_SUPPORT_WINDOW_SEC = 0.10
 
+# A ByteDance-only note (Transkun silent, mix unconfirmed) must show a
+# clearly stronger attack of its own — and broadband onset support cannot
+# rescue it (support is pitch-agnostic; see the gate comment in refine()).
+# 2.5 sits at the conservative end of a measured plateau (2.5-3.0 give the
+# same result) on the video-truth Sweet Hour bench: sweep in
+# tools/score_vs_video.py history, F1 0.933 -> 0.991 with zero real notes
+# lost at any threshold up to 3.5.
+BD_ONLY_RISE_MIN = 2.5
+
 # Do NOT add a "local envelope rising → rescue from the gate" escape hatch
 # (tried 2026-07-15 as RESTRIKE_DECAY_MAX, reverted next day). On reverb-
 # heavy material the pedal wash and neighboring moving voices pulse a held
@@ -414,8 +423,21 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
 
     kept = []
     for i, (n, (score, rise, env, f0, f1)) in enumerate(zip(notes, feats)):
-        if (n["offset"] - n["onset"] < MICRO_DUR_SEC
-                and score < MICRO_SCORE_MAX):
+        # A ByteDance-only note — Transkun didn't hear it, and (below) the
+        # mix didn't confirm it. Measured against video-extracted ground
+        # truth on the Sweet Hour bench (2026-07-17, see
+        # tools/score_vs_video.py + tools/extract_video_truth.py): kept
+        # BD-only notes were 3 real vs 31 fake on pedaled/reverb-heavy
+        # material, while every kept fake in the whole 60s clip was
+        # BD-only. This class gets the strictest handling below.
+        bd_only = evidence is not None and evidence[i] == "bd" and not (
+            confirmed is not None and confirmed[i])
+        micro = n["offset"] - n["onset"] < MICRO_DUR_SEC
+        if micro and (score < MICRO_SCORE_MAX or bd_only):
+            # Sub-30ms keystrokes are physically unplayable. For a BD-only
+            # claim, the spectral score can't save it: the "score" of a
+            # 10ms sliver only measures the (real, ringing) wash behind
+            # it, not evidence that a hammer struck.
             stats["ghosts"] += 1
             continue
         protected = ((evidence is not None and evidence[i] == "both")
@@ -432,11 +454,22 @@ def refine(piano_wav, notes, pedals, progress_cb, mix_notes=None,
         if is_ghost:
             stats["ghosts"] += 1
             continue
-        if (not protected and rise < RESTRIKE_RISE_MIN
-                and not _onset_supported(onset_times, n["onset"],
-                                         ONSET_SUPPORT_WINDOW_SEC)):
-            stats["restrikes"] += 1
-            continue
+        # Re-strike gate. Broadband onset support is pitch-agnostic — in
+        # dense music almost every instant is within the window of SOME
+        # real strike, so support must not rescue a BD-only note that
+        # shows no attack of its own: a still-ringing pitch "re-heard" at
+        # the exact moment a different chord lands was the dominant
+        # surviving hallucination class (video-truth bench: 27 of 31 kept
+        # fakes had support from a neighboring chord's onset). Transkun-
+        # only notes keep the support rescue: TK's measured hallucination
+        # rate is ~1% vs ByteDance's 43% on this material, and its soft
+        # real notes legitimately show little rise under pedal wash.
+        rise_min = BD_ONLY_RISE_MIN if bd_only else RESTRIKE_RISE_MIN
+        if not protected and rise < rise_min:
+            if bd_only or not _onset_supported(onset_times, n["onset"],
+                                               ONSET_SUPPORT_WINDOW_SEC):
+                stats["restrikes"] += 1
+                continue
         new_off = _trim_offset(env, n, f0, f1)
         if new_off < n["offset"]:
             stats["trimmed"] += 1
