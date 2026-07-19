@@ -274,6 +274,29 @@ export async function decodeMidi(midiBase64) {
   return data
 }
 
+// Auto-sync (job video): cross-correlates transcribed notes against the
+// job's own kept video audio. Returns { offsetMs, confidence } for the
+// caller to preview/apply -- not persisted server-side.
+export async function autoSyncJob(id) {
+  const res = await fetch(BASE + '/jobs/' + id + '/auto-sync', { method: 'POST' })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail || 'Auto-sync failed')
+  return data
+}
+
+// Auto-sync (library song): same as above but against an archived media
+// file + baked MIDI, since library songs have no job directory.
+export async function autoSyncMedia(filename, midiBase64) {
+  const res = await fetch(BASE + '/media/auto-sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: filename, midiBase64: midiBase64 })
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail || 'Auto-sync failed')
+  return data
+}
+
 // --- Multi-song floppy disk (many songs per Gotek slot) -------------------
 // One slot = one .hfe = one 720K floppy. These pack several songs onto it.
 // `opts`: { slot, overwrite, download }. Save actions return JSON

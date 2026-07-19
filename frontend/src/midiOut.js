@@ -13,6 +13,8 @@ export function createMidiOut(onChange) {
   let access = null
   let output = null      // selected MIDIOutput (or null)
   let error = null       // human-readable init failure
+  let inputsBound = false
+  const inputNoteOnCbs = []   // cb(pitch, vel, perfTs) for key-echo calibration
 
   function outputs() {
     if (!access) return []
@@ -102,6 +104,36 @@ export function createMidiOut(onChange) {
     }
   }
 
+  // Listen on every MIDI input for note-ons — used by calibration to catch the
+  // Disklavier's key-sensor echo (the piano reporting its own key movement back
+  // out USB TO HOST). event.timeStamp is DOMHighResTimeStamp (performance.now
+  // domain), the same clock our sends use, so latency is a clean subtraction.
+  function enableInput() {
+    if (!access || inputsBound) return
+    inputsBound = true
+    access.inputs.forEach(function (inp) {
+      inp.onmidimessage = function (e) {
+        const d = e.data
+        // 0x90 note-on with non-zero velocity (0x90 vel 0 == note-off).
+        if (d && (d[0] & 0xf0) === 0x90 && d[2] > 0) {
+          for (let i = 0; i < inputNoteOnCbs.length; i++) {
+            inputNoteOnCbs[i](d[1], d[2], e.timeStamp)
+          }
+        }
+      }
+    })
+  }
+
+  // Subscribe to input note-ons; returns an unsubscribe fn.
+  function onInputNoteOn(cb) {
+    enableInput()
+    inputNoteOnCbs.push(cb)
+    return function () {
+      const i = inputNoteOnCbs.indexOf(cb)
+      if (i !== -1) inputNoteOnCbs.splice(i, 1)
+    }
+  }
+
   function noteOn(pitch, vel, ts) { return send([0x90, pitch & 0x7f, vel & 0x7f], ts) }
   function noteOff(pitch, ts) { return send([0x80, pitch & 0x7f, 0], ts) }
   function cc(num, val, ts) { return send([0xB0, num & 0x7f, val & 0x7f], ts) }
@@ -137,6 +169,8 @@ export function createMidiOut(onChange) {
     init,
     select,
     outputs,
+    enableInput,
+    onInputNoteOn,
     noteOn, noteOff, cc,
     clearQueue,
     panic,

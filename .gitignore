@@ -14,6 +14,10 @@ release/
 
 # activation keys — never commit plaintext keys
 licensing/
+PianoForge-Activation-Keys.pdf
+
+# archived library videos (large, local-only — see MEDIA_DIR in main.py)
+backend/media/
 
 # baked OAuth client secret — never commit (repo is public)
 oauth.config.json

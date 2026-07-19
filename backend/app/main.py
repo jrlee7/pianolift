@@ -15,6 +15,7 @@ import os
 import queue as queue_mod
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -29,11 +30,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import (pipeline, midi_writer, note_verify, eseq_writer, disk_writer,
-               transkun_engine,
+               transkun_engine, auto_sync,
                usb, job_runner)
 from . import sheet_routes
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# A PyInstaller onefile build's __file__ resolves inside the run's temp
+# extraction dir (%TEMP%\_MEIxxxxx), which is new and gets wiped every
+# launch -- jobs/media stored there would vanish on every relaunch. Persist
+# to a stable per-user location instead when frozen; dev mode keeps the
+# repo-relative path so `git status` shows local test jobs as usual.
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."), "PianoForge", "data")
+    os.makedirs(BASE_DIR, exist_ok=True)
+else:
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
 # Videos outlive their conversion job here (too big for the cloud library):
@@ -645,6 +655,71 @@ def save_settings(job_id: str, payload: dict = Body(...)):
         job["settings"] = settings
         _persist(job_id)
     return {"ok": True, "settings": settings}
+
+
+@app.post("/api/jobs/{job_id}/auto-sync")
+def auto_sync_job(job_id: str):
+    """Cross-correlate the transcribed notes against the job's kept video's
+    own audio track to estimate videoSyncMs automatically (see auto_sync.py).
+    Returns the offset for the frontend to preview/apply; it isn't persisted
+    here so the user can still nudge/save like with tap-sync."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if not job.get("videoFile"):
+        raise HTTPException(404, "no video kept for this song")
+    job_dir = _job_dir(job_id)
+    video_path = os.path.join(job_dir, job["videoFile"])
+    if not os.path.exists(video_path):
+        raise HTTPException(404, "video file missing")
+    events_path = os.path.join(job_dir, "events.json")
+    if not os.path.exists(events_path):
+        raise HTTPException(404, "events not ready")
+    with open(events_path) as f:
+        events = json.load(f)
+    shift = job.get("srcStartSec") or 0
+    notes = [{"onset": n["onset"] + shift, "velocity": n.get("velocity", 64)}
+              for n in events["notes"]]
+    try:
+        result = auto_sync.compute_offset(video_path, notes)
+    except Exception as e:
+        raise HTTPException(422, "auto-sync failed: " + str(e))
+    return result
+
+
+@app.post("/api/media/auto-sync")
+def auto_sync_media(payload: dict = Body(...)):
+    """Library-song variant of auto-sync: video lives in MEDIA_DIR, MIDI is
+    the baked base64 blob stored on the Firestore song doc."""
+    name = payload.get("filename") or ""
+    if "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(400, "bad filename")
+    video_path = os.path.join(MEDIA_DIR, name)
+    if not os.path.exists(video_path):
+        raise HTTPException(404, "video file missing")
+    try:
+        raw = base64.b64decode(payload.get("midiBase64") or "", validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "invalid midiBase64")
+    if not raw:
+        raise HTTPException(400, "empty MIDI payload")
+    tmp = os.path.join(JOBS_DIR, "_autosync_%s.mid" % uuid.uuid4().hex[:8])
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        notes, _pedals = midi_writer.read_midi(tmp)
+    except Exception as e:
+        raise HTTPException(400, "could not parse MIDI: " + str(e))
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    try:
+        result = auto_sync.compute_offset(video_path, notes)
+    except Exception as e:
+        raise HTTPException(422, "auto-sync failed: " + str(e))
+    return result
 
 
 def _trim_tail(job, events):

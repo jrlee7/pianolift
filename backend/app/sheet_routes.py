@@ -14,6 +14,7 @@ Job dir layout:
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -25,7 +26,13 @@ from fastapi.responses import FileResponse
 from . import musicxml_io as mxml
 from . import sheet_pipeline
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# See main.py's BASE_DIR comment: a PyInstaller onefile build's __file__
+# resolves inside a per-run temp extraction dir, so frozen mode persists to
+# a stable per-user location instead.
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."), "PianoForge", "data")
+else:
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHEET_JOBS_DIR = os.path.join(BASE_DIR, "sheet_jobs")
 os.makedirs(SHEET_JOBS_DIR, exist_ok=True)
 

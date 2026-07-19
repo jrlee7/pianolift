@@ -5,9 +5,14 @@
 
 import { useEffect, useRef, useState } from 'react'
 import {
-  getEvents, decodeMidi, saveJobSettings, jobVideoUrl, mediaVideoUrl
+  getEvents, decodeMidi, saveJobSettings, jobVideoUrl, mediaVideoUrl,
+  autoSyncJob, autoSyncMedia
 } from '../api.js'
 import { createMidiOut } from '../midiOut.js'
+import { updateSongSettings } from '../firebase.js'
+import { loadCalibration } from '../calibrate.js'
+import CalibrationWizard from './CalibrationWizard.jsx'
+import VisualTest from './VisualTest.jsx'
 import { prepareEvents, createVideoMidiPlayer } from '../videoMidiPlayer.js'
 
 const DEFAULTS = {
@@ -77,6 +82,14 @@ export default function PlayerView({ jobs, initial }) {
   // sync aids
   const [tapArmed, setTapArmed] = useState(false)
   const [tapMsg, setTapMsg] = useState(null)
+  const [autoSyncBusy, setAutoSyncBusy] = useState(false)
+  const [autoSyncMsg, setAutoSyncMsg] = useState(null)
+  // hardware calibration (velocity->latency curve + TV latency), persisted in
+  // localStorage; applied to every scheduler so notes fire early by the right
+  // per-note amount.
+  const [calibration, setCalibration] = useState(function () { return loadCalibration() })
+  const [showCalibrate, setShowCalibrate] = useState(false)
+  const [showVisual, setShowVisual] = useState(false)
   const tapsRef = useRef([])
   const tapNowRef = useRef(null)
   const [loop, setLoop] = useState(null) // {a, b} video-time loop window
@@ -118,6 +131,7 @@ export default function PlayerView({ jobs, initial }) {
     tapsRef.current = []
     setTapArmed(false)
     setTapMsg(null)
+    setAutoSyncMsg(null)
     async function load() {
       if (sel.indexOf('job:') === 0) {
         const id = sel.slice(4)
@@ -149,8 +163,9 @@ export default function PlayerView({ jobs, initial }) {
         const p = prepareEvents(ev, { releaseMs: 0, capSustain: false }, true, 0)
         if (dead) return
         setPerf(p)
-        setSyncMs(lsNum(LS.sync, 0))
-        setPedalMs(lsNum(LS.pedal, 0))
+        const libSt = libSong.settings || {}
+        setSyncMs(libSt.videoSyncMs != null ? libSt.videoSyncMs : lsNum(LS.sync, 0))
+        setPedalMs(libSt.pedalLagMs != null ? libSt.pedalLagMs : lsNum(LS.pedal, 0))
         if (libSong.localVideo) {
           const isBg = Boolean(libSong.videoIsBacking)
           setVideoSrc(mediaVideoUrl(libSong.localVideo),
@@ -170,7 +185,8 @@ export default function PlayerView({ jobs, initial }) {
     const v = videoRef.current
     if (!v || !perf || !videoUrl) return
     const player = createVideoMidiPlayer(v, midi, perf, {
-      syncMs: syncMs, pedalMs: pedalMs, velScale: velScale, pedalOn: pedalOn
+      syncMs: syncMs, pedalMs: pedalMs, velScale: velScale, pedalOn: pedalOn,
+      latencyCurve: calibration.curve, tvLatencyMs: calibration.tvLatencyMs
     })
     player.setActivityCallback(setNotesSent)
     player.attach()
@@ -189,6 +205,11 @@ export default function PlayerView({ jobs, initial }) {
   useEffect(function () {
     if (playerRef.current) playerRef.current.setPedalLagMs(pedalMs)
   }, [pedalMs])
+  useEffect(function () {
+    if (playerRef.current) {
+      playerRef.current.setCalibration(calibration.curve, calibration.tvLatencyMs)
+    }
+  }, [calibration])
   useEffect(function () {
     if (playerRef.current) playerRef.current.setVelScale(velScale)
     localStorage.setItem(LS.vel, String(velScale))
@@ -360,6 +381,38 @@ export default function PlayerView({ jobs, initial }) {
     v.play()
   }
 
+  // --- Auto sync: cross-correlates the transcribed onsets against the
+  // loaded video's own audio track (backend does the DSP) instead of the
+  // user ear-matching taps. Sets syncMs directly; still needs Save.
+  async function runAutoSync() {
+    if (autoSyncBusy) return
+    setAutoSyncBusy(true)
+    setAutoSyncMsg('Analyzing audio…')
+    try {
+      let result
+      if (sel === 'lib' && libSong) {
+        if (!libSong.localVideo) throw new Error('no video saved for this song')
+        result = await autoSyncMedia(libSong.localVideo, libSong.midiBase64)
+      } else if (songJob) {
+        if (!songJob.videoFile) throw new Error('no video kept for this song')
+        result = await autoSyncJob(songJob.id)
+      } else {
+        throw new Error('no song loaded')
+      }
+      const ms = Math.round(result.offsetMs)
+      setSyncMs(ms)
+      const pct = Math.round((result.confidence || 0) * 100)
+      setAutoSyncMsg('Set to ' + (ms >= 0 ? '+' : '') + ms + ' ms (confidence ' +
+        pct + '%)' + (pct < 40 ? ' — low confidence, check by ear' : '') +
+        ' — Save to keep it.')
+      setSaveMsg(null)
+    } catch (e) {
+      setAutoSyncMsg('Auto-sync failed: ' + e.message)
+    } finally {
+      setAutoSyncBusy(false)
+    }
+  }
+
   // In fullscreen the transport bar hides after a moment of stillness.
   function stageMouseMove() {
     if (!isFs) return
@@ -390,13 +443,17 @@ export default function PlayerView({ jobs, initial }) {
   }, [videoUrl, isFs])
 
   async function handleSaveSync() {
-    if (!songJob) return
+    const patch = { videoSyncMs: Math.round(syncMs), pedalLagMs: Math.round(pedalMs) }
     try {
-      const merged = {
-        ...DEFAULTS, ...(songJob.settings || {}),
-        videoSyncMs: Math.round(syncMs), pedalLagMs: Math.round(pedalMs)
+      if (sel === 'lib' && libSong) {
+        const settings = await updateSongSettings(libSong.id, libSong.settings, patch)
+        setLibSong(function (s) { return { ...s, settings: settings } })
+      } else if (songJob) {
+        const merged = { ...DEFAULTS, ...(songJob.settings || {}), ...patch }
+        await saveJobSettings(songJob.id, merged)
+      } else {
+        return
       }
-      await saveJobSettings(songJob.id, merged)
       setSaveMsg('Saved for this song')
     } catch (e) {
       setSaveMsg('Save failed: ' + e.message)
@@ -558,6 +615,11 @@ export default function PlayerView({ jobs, initial }) {
             <button onClick={function () { nudge(50) }}>+50</button>
           </div>
           <div className="row" style={{ marginTop: 8 }}>
+            <button className="primary" disabled={!ready || autoSyncBusy}
+              title="Analyze the video's own audio and set the timing automatically"
+              onClick={runAutoSync}>
+              {autoSyncBusy ? '⏳ Analyzing…' : '⚡ Auto sync'}
+            </button>
             <button className={tapArmed ? 'primary' : ''} disabled={!ready}
               title="Tap the T key on clear beats while watching — the app measures the offset for you"
               onClick={toggleTapSync}>
@@ -578,8 +640,21 @@ export default function PlayerView({ jobs, initial }) {
               {loop ? '⏹ Stop loop' : '🎯 Loop busiest part'}
             </button>
           </div>
-          {tapMsg && <div className="meta">{tapMsg}</div>}
-          {!tapMsg && (
+          <div className="row" style={{ marginTop: 6 }}>
+            <button disabled={!midi.connected}
+              title="Measure the piano's per-note actuation latency so every note fires early by the right amount"
+              onClick={function () { setShowCalibrate(true) }}>
+              ⚡ Calibrate piano{calibration.curve.length ? ' ✓' : ''}
+            </button>
+            <button disabled={!midi.connected}
+              title="Play a hymn on an on-screen keyboard (show it on the TV) while the piano plays it live, and fine-tune the offset"
+              onClick={function () { setShowVisual(true) }}>
+              🎹 Visual sync test
+            </button>
+          </div>
+          {autoSyncMsg && <div className="meta">{autoSyncMsg}</div>}
+          {!autoSyncMsg && tapMsg && <div className="meta">{tapMsg}</div>}
+          {!autoSyncMsg && !tapMsg && (
             <div className="meta">Nudge live with , and . keys while watching.</div>
           )}
         </div>
@@ -652,9 +727,8 @@ export default function PlayerView({ jobs, initial }) {
             </button>
           </div>
           <div className="row" style={{ marginTop: 8 }}>
-            <button disabled={!songJob} onClick={handleSaveSync}
-              title={songJob ? 'Remember these offsets for this song'
-                : 'Library songs: use the default instead'}>
+            <button disabled={!songJob && !(sel === 'lib' && libSong)} onClick={handleSaveSync}
+              title="Remember these offsets for this song">
               💾 Save timing for “{songLabel || 'song'}”
             </button>
             <button onClick={handleSaveDefault}
@@ -669,10 +743,35 @@ export default function PlayerView({ jobs, initial }) {
       <div className="meta player-help">
         Space play/pause · ←/→ skip 5s · , / . nudge piano ±10 ms · t tap sync ·
         m mute video · f fullscreen. HDMI the laptop to the TV, USB to the
-        piano's USB TO HOST port, press play. To sync fast: 👏 Tap sync (tap T
-        on 4+ beats, apply), then 🎯 loop the busiest part and nudge until the
-        hammers match the hands.
+        piano's USB TO HOST port, press play. For exact sync: ⚡ Calibrate piano
+        once (measures per-note solenoid latency), then 🎹 Visual sync test to
+        zero the remaining TV offset by eye and ear.
       </div>
+
+      {showCalibrate && (
+        <CalibrationWizard
+          midi={midi}
+          onApply={function (curve, tvMs) {
+            setCalibration({ curve: curve, tvLatencyMs: tvMs })
+            setShowCalibrate(false)
+          }}
+          onClose={function () { setShowCalibrate(false) }}
+          onLaunchVisual={function () { setShowCalibrate(false); setShowVisual(true) }}
+        />
+      )}
+
+      {showVisual && (
+        <VisualTest
+          midi={midi}
+          syncMs={syncMs}
+          pedalMs={pedalMs}
+          velScale={velScale}
+          pedalOn={pedalOn}
+          calibration={calibration}
+          onSyncChange={function (ms) { setSyncMs(ms); setSaveMsg(null) }}
+          onClose={function () { setShowVisual(false) }}
+        />
+      )}
     </div>
   )
 }

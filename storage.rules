@@ -3,11 +3,11 @@ service firebase.storage {
   match /b/{bucket}/o {
     // Accompaniment MP3s back the CLOUD library, which is family-only. Customers
     // keep audio in their local on-device library, so they never touch this.
-    // Keep this email in sync with isFamily() in firestore.rules.
+    // Keep these emails in sync with isFamily() in firestore.rules.
     match /songs/{songId}/{fileName} {
       allow read, write: if request.auth != null
         && request.auth.token.email_verified == true
-        && request.auth.token.email == 'justin.lee025@gmail.com';
+        && request.auth.token.email in ['justin.lee025@gmail.com', 'afamlee4ever@gmail.com'];
     }
   }
 }

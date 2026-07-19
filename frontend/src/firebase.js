@@ -45,7 +45,12 @@ if (firebaseReady) {
 // but because the ML runs locally a determined user can still patch the client
 // — this stops casual sharing, not a cracked build.
 // ---------------------------------------------------------------------------
-const FAMILY_EMAIL = 'justin.lee025@gmail.com'
+// Shared "family" logins: all get unlimited + the same cloud library (the
+// songs/folders/sources collections are global, so both accounts read/write
+// one merged library). Keep in sync with isFamily() in firestore.rules and
+// storage.rules. Members must sign in with Google (rules require a verified
+// email; email/password isn't verified until the user confirms).
+const FAMILY_EMAILS = ['justin.lee025@gmail.com', 'afamlee4ever@gmail.com']
 export const FREE_LIMIT = 5
 const USERS = 'users'
 const LICENSES = 'licenses'
@@ -91,7 +96,7 @@ export async function signOut() { if (auth) await fbSignOut(auth) }
 // The family account is identified by a verified email match — must line up
 // with isFamily() in firestore.rules / storage.rules.
 export function isFamilyUser(user) {
-  return Boolean(user && user.email === FAMILY_EMAIL && user.emailVerified)
+  return Boolean(user && FAMILY_EMAILS.indexOf(user.email) !== -1 && user.emailVerified)
 }
 
 // Snapshot of a user's entitlement. Family = unlimited; customers get their
@@ -320,6 +325,16 @@ export async function deleteSong(id, mp3Path) {
 export async function renameSong(id, title) {
   if (!db) throw new Error('Firebase not configured')
   await updateDoc(doc(db, SONGS, id), { title: title })
+}
+
+// Merge into the song's settings object (e.g. the Play tab's saved
+// videoSyncMs/pedalLagMs) without touching the export sliders it was
+// archived with.
+export async function updateSongSettings(id, existingSettings, patch) {
+  if (!db) throw new Error('Firebase not configured')
+  const settings = { ...(existingSettings || {}), ...patch }
+  await updateDoc(doc(db, SONGS, id), { settings: settings })
+  return settings
 }
 
 // Folders are identified by name (stored on each song's `folder` field). The

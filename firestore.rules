@@ -2,15 +2,15 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // The single shared "family" account (you + Dad, one login). The ONLY
-    // identity allowed into the cloud song library. Paying customers use a
-    // local, on-device library and never touch these collections.
+    // The shared "family" logins (you + Dad). The ONLY identities allowed into
+    // the cloud song library — one merged library across both. Paying customers
+    // use a local, on-device library and never touch these collections.
     // Google sign-in sets email_verified; email/password does not until
-    // verified, so the family account should sign in with Google.
+    // verified, so family accounts should sign in with Google.
     function isFamily() {
       return request.auth != null
         && request.auth.token.email_verified == true
-        && request.auth.token.email == 'justin.lee025@gmail.com';
+        && request.auth.token.email in ['justin.lee025@gmail.com', 'afamlee4ever@gmail.com'];
     }
 
     // ---- Cloud library: family only ----

@@ -8,6 +8,7 @@
 // scheduling time, so adjustments take effect within one tick (~100 ms).
 
 import { mapVelocity, maxSustainSec } from './previewSynth.js'
+import { latencyForVelocity } from './calibrate.js'
 
 const LOOKAHEAD_SEC = 0.35   // schedule this far ahead (real seconds)
 const TICK_MS = 100          // scheduler cadence
@@ -61,6 +62,21 @@ export function createVideoMidiPlayer(videoEl, midi, prepared, initial) {
   let pedalSec = (initial && initial.pedalMs || 0) / 1000
   let velScale = (initial && initial.velScale != null) ? initial.velScale : 1.0
   let pedalOn = !initial || initial.pedalOn !== false
+  // Hardware calibration (see calibrate.js): a velocity->latency curve for the
+  // piano's solenoids and a single TV/display latency. Each note is sent early
+  // by pianoLatency(vel) - tvLatency (real-time ms) so the acoustic strike
+  // lands when the TV shows that note. Empty curve => zero compensation, i.e.
+  // exactly the old behavior.
+  let latencyCurve = (initial && initial.latencyCurve) || []
+  let tvLatencyMs = (initial && initial.tvLatencyMs) || 0
+
+  // Real-time ms to pull a note's MIDI send earlier, for the velocity actually
+  // sent to the piano. Rate-independent: latencies are physical constants, not
+  // scaled by playbackRate.
+  function compMs(vel) {
+    if (!latencyCurve.length && !tvLatencyMs) return 0
+    return latencyForVelocity(latencyCurve, vel) - tvLatencyMs
+  }
 
   let timer = null
   let noteIdx = 0
@@ -99,7 +115,12 @@ export function createVideoMidiPlayer(videoEl, midi, prepared, initial) {
         let vel = Math.round(n.vel * velScale)
         if (vel < 1) vel = 1
         if (vel > 127) vel = 127
-        midi.noteOn(n.pitch, vel, tsFor(tv, nowMs, vt, rate))
+        // Fire earlier by the (velocity-dependent) net hardware latency so the
+        // hammer sounds in sync with the picture. clamp to not stamp absurdly
+        // far in the past if we're already at the note.
+        let ts = tsFor(tv, nowMs, vt, rate) - compMs(vel)
+        if (ts < nowMs) ts = nowMs
+        midi.noteOn(n.pitch, vel, ts)
         sounding.push({ pitch: n.pitch, tOff: n.tOff })
         notesSent++
       }
@@ -221,6 +242,10 @@ export function createVideoMidiPlayer(videoEl, midi, prepared, initial) {
     detach,
     setSyncMs(ms) { syncSec = ms / 1000; resync() },
     setPedalLagMs(ms) { pedalSec = ms / 1000; resync(); if (!videoEl.paused) chasePedal() },
+    setCalibration(curve, tvMs) {
+      latencyCurve = curve || []
+      tvLatencyMs = tvMs || 0
+    },
     setVelScale(x) { velScale = x },
     setPedalOn(b) {
       pedalOn = Boolean(b)
