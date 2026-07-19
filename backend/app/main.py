@@ -147,17 +147,21 @@ def _safe_name(title):
     return name[:120] or "untitled"
 
 
-def _process(job_id, kind, source, piano_only=False, include_video=False):
+def _process(job_id, kind, source, piano_only=False, include_video=False,
+             section=None, track_name=None):
     """Worker-thread body: run the conversion in a killable child process and
     relay its progress/result into the in-memory job. `kind` is 'file' (source
     is an audio path) or 'url' (source is a link the child downloads first).
-    include_video keeps the URL download's video for the Play tab."""
+    include_video keeps the URL download's video for the Play tab.
+    section/track_name: album-split job (download only that chapter's
+    seconds range, use the chapter title instead of the video's)."""
     job_dir = _job_dir(job_id)
     ctx = multiprocessing.get_context("spawn")
     q = ctx.Queue()
     proc = ctx.Process(
         target=job_runner.run_job_process,
-        args=(job_dir, kind, source, piano_only, q, include_video))
+        args=(job_dir, kind, source, piano_only, q, include_video, section,
+              track_name))
 
     with jobs_lock:
         if job_id in cancelled:
@@ -286,13 +290,20 @@ def create_job_from_url(payload: dict = Body(...)):
     url = (payload.get("url") or "").strip()
     piano_only = bool(payload.get("pianoOnly"))
     include_video = bool(payload.get("includeVideo"))
+    track_name = (payload.get("trackName") or "").strip() or None
+    section = None
+    if payload.get("sectionStart") is not None and payload.get("sectionEnd") is not None:
+        try:
+            section = (float(payload["sectionStart"]), float(payload["sectionEnd"]))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "invalid sectionStart/sectionEnd")
     if not url.lower().startswith(("http://", "https://")):
         raise HTTPException(400, "paste a full link starting with http(s)://")
     job_id = uuid.uuid4().hex[:12]
     os.makedirs(_job_dir(job_id), exist_ok=True)
     job = {
         "id": job_id,
-        "name": "Fetching from link…",
+        "name": track_name or "Fetching from link…",
         "status": "processing",
         "stage": "downloading",
         "progress": 0,
@@ -305,8 +316,25 @@ def create_job_from_url(payload: dict = Body(...)):
         jobs[job_id] = job
         _persist(job_id)
     futures[job_id] = executor.submit(
-        _process, job_id, "url", url, piano_only, include_video)
+        _process, job_id, "url", url, piano_only, include_video, section,
+        track_name)
     return job
+
+
+@app.post("/api/probe-url")
+def probe_url(payload: dict = Body(...)):
+    """Look up a link's chapter markers (if any) without downloading, so the
+    frontend can offer an album-as-one-video split before conversion starts."""
+    url = (payload.get("url") or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(400, "paste a full link starting with http(s)://")
+    from . import fetcher
+    try:
+        title, chapters = fetcher.probe_chapters(url)
+    except Exception as e:
+        msg = (str(e) or repr(e)).splitlines()[0]
+        raise HTTPException(400, "Couldn't read that link: " + msg)
+    return {"title": title, "chapters": chapters}
 
 
 @app.post("/api/jobs/from-library")

@@ -21,10 +21,14 @@ from . import pipeline
 _VIDEO_EXTS = (".mp4", ".m4v", ".mkv", ".mov", ".webm")
 
 
-def run_job_process(job_dir, kind, source, piano_only, q, include_video=False):
+def run_job_process(job_dir, kind, source, piano_only, q, include_video=False,
+                     section=None, track_name=None):
     """kind == 'file': source is the absolute audio path.
        kind == 'url' : source is the link; download it first.
-       include_video: keep the video stream for the video-sync Play tab."""
+       include_video: keep the video stream for the video-sync Play tab.
+       section=(start, end) seconds: download only that slice (album-split).
+       track_name: fixed job name to use instead of the video's own title
+       (album-split jobs share one video title otherwise)."""
     def cb(stage, pct):
         q.put(("progress", stage, pct))
 
@@ -33,13 +37,15 @@ def run_job_process(job_dir, kind, source, piano_only, q, include_video=False):
             from . import fetcher
             try:
                 wav_path, title, video_name = fetcher.download_audio(
-                    source, job_dir, cb, include_video=include_video)
+                    source, job_dir, cb, include_video=include_video,
+                    section=section)
             except Exception as e:  # download failures get their own label
                 msg = (str(e) or repr(e)).splitlines()[0]
                 q.put(("error", "Download failed: " + msg))
                 return
             # Let the parent record the resolved title + input filename.
-            q.put(("meta", os.path.basename(wav_path), title, video_name))
+            q.put(("meta", os.path.basename(wav_path), track_name or title,
+                    video_name))
             audio_path = wav_path
         else:
             # m4a/aac and video containers decode to PCM once here;

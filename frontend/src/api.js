@@ -13,16 +13,37 @@ export async function uploadMp3(file, pianoOnly) {
   return res.json()
 }
 
-export async function submitUrl(url, pianoOnly, includeVideo) {
+// section: { start, end, name } to download only one chapter of a video
+// that has an album's worth of chapter markers on it (see probeUrl).
+export async function submitUrl(url, pianoOnly, includeVideo, section) {
+  const body = {
+    url: url, pianoOnly: pianoOnly, includeVideo: Boolean(includeVideo)
+  }
+  if (section) {
+    body.sectionStart = section.start
+    body.sectionEnd = section.end
+    body.trackName = section.name
+  }
   const res = await fetch(BASE + '/jobs/url', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      url: url, pianoOnly: pianoOnly, includeVideo: Boolean(includeVideo)
-    })
+    body: JSON.stringify(body)
   })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail || 'Fetch failed')
+  return data
+}
+
+// Look up a link's chapter markers without downloading anything, so the UI
+// can offer to split an album-as-one-video into per-track jobs.
+export async function probeUrl(url) {
+  const res = await fetch(BASE + '/probe-url', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: url })
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail || 'Could not read that link')
   return data
 }
 

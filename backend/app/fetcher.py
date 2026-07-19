@@ -17,11 +17,54 @@ import subprocess
 from . import pipeline
 
 
-def download_audio(url, job_dir, progress_cb, include_video=False):
+def probe_chapters(url):
+    """Return (title, [{"title", "start", "end"}, ...]) for `url` without
+    downloading anything. Empty chapter list means the video has none (or
+    the platform doesn't expose them) — caller should fall back to a single
+    whole-video job."""
+    import yt_dlp  # lazy: heavy import, keeps server startup fast
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "js_runtimes": {"node": {}, "deno": {}},
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if info is None:
+        raise RuntimeError("nothing found at that link")
+    if "entries" in info:
+        entries = [e for e in info["entries"] if e]
+        if not entries:
+            raise RuntimeError("nothing found at that link")
+        info = entries[0]
+    title = (info.get("title") or "untitled").strip()
+    chapters = []
+    for ch in (info.get("chapters") or []):
+        start = ch.get("start_time")
+        end = ch.get("end_time")
+        if start is None or end is None:
+            continue
+        chapters.append({
+            "title": (ch.get("title") or "").strip() or None,
+            "start": start,
+            "end": end,
+        })
+    return title, chapters
+
+
+def download_audio(url, job_dir, progress_cb, include_video=False,
+                    section=None):
     """Download `url` into job_dir and decode audio to input.wav (44.1 kHz
     stereo PCM). Returns (wav_path, title, video_name) — video_name is the
-    kept video file's basename (include_video=True), else None."""
+    kept video file's basename (include_video=True), else None.
+
+    section=(start, end) seconds restricts the download to that slice of the
+    source (used to split an album-as-one-video into per-chapter jobs)."""
     import yt_dlp  # lazy: heavy import, keeps server startup fast
+    from yt_dlp.utils import download_range_func
 
     pipeline._ensure_ffmpeg(lambda stage, pct: None)
 
@@ -46,6 +89,10 @@ def download_audio(url, job_dir, progress_cb, include_video=False):
         # skipped). Needs yt-dlp[default] for the bundled EJS solver.
         "js_runtimes": {"node": {}, "deno": {}},
     }
+    if section:
+        start, end = section
+        opts["download_ranges"] = download_range_func(None, [(start, end)])
+        opts["force_keyframes_at_cuts"] = True
     if include_video:
         # Best video+audio muxed into mp4 (Chromium-playable, incl. vp9).
         # Cap at 1080p — the TV doesn't need 4K and the files quadruple.

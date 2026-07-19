@@ -13,10 +13,11 @@ import SheetUploadZone from './components/SheetUploadZone.jsx'
 import SheetJobCard from './components/SheetJobCard.jsx'
 import SheetResultView from './components/SheetResultView.jsx'
 import {
-  listJobs, uploadMp3, submitUrl, deleteJob, verifyJob,
+  listJobs, uploadMp3, submitUrl, probeUrl, deleteJob, verifyJob,
   midiUrl, audioUrl, fetchMidiBase64, archiveVideo, buildDiskFromJobs,
   listSheetJobs, uploadSheet
 } from './api.js'
+import ChapterSplitModal from './components/ChapterSplitModal.jsx'
 import {
   firebaseReady, saveSong, saveSourceUrl, listSongs, isSameSong, findExistingSong,
   onAuth, getAccount, isFamilyUser, signOut, recordConversion
@@ -104,6 +105,9 @@ export default function App() {
   const [account, setAccount] = useState(null) // { family, activated, conversions, remaining }
   const [authChecked, setAuthChecked] = useState(!firebaseReady) // no Firebase → no gate
   const [showActivation, setShowActivation] = useState(false)
+  // {url, chapters, pianoOnly, includeVideo} while the album-split prompt
+  // is open for a link whose video has chapter markers; null otherwise.
+  const [splitPrompt, setSplitPrompt] = useState(null)
   const accountRef = useRef(null)
   useEffect(function () { accountRef.current = account }, [account])
 
@@ -166,9 +170,10 @@ export default function App() {
     refresh()
   }
 
-  async function handleUrl(url, pianoOnly, includeVideo) {
-    if (!consumeCredit()) return // free tier exhausted → activation modal
-    if (firebaseReady) {
+  // The single-video path (unchanged behavior): one job for the whole link.
+  async function startUrlJob(url, pianoOnly, includeVideo, section) {
+    if (!consumeCredit()) return false // free tier exhausted → activation modal
+    if (firebaseReady && !section) {
       try {
         const dup = await findExistingSong(null, url)
         if (dup && !confirm(
@@ -178,14 +183,52 @@ export default function App() {
       } catch (e) { /* best-effort — a lookup failure must not block converting */ }
     }
     try {
-      await submitUrl(url, pianoOnly, includeVideo)
+      await submitUrl(url, pianoOnly, includeVideo, section)
       // Keep a history of every converted link so the source video can be
       // found again later (see the Links tab). Best-effort — a Firebase blip
       // must not block the conversion that already started.
       if (firebaseReady) saveSourceUrl(url).catch(function () { /* best-effort */ })
     } catch (e) {
       alert('Could not start download: ' + e.message)
+      return false
     }
+    return true
+  }
+
+  async function handleUrl(url, pianoOnly, includeVideo) {
+    let chapters = []
+    let title = ''
+    try {
+      const probe = await probeUrl(url)
+      chapters = probe.chapters || []
+      title = probe.title || ''
+    } catch (e) { /* best-effort — a probe failure just skips the split offer */ }
+    if (chapters.length >= 2) {
+      setSplitPrompt({ url, title, chapters, pianoOnly, includeVideo })
+      return
+    }
+    await startUrlJob(url, pianoOnly, includeVideo)
+    refresh()
+  }
+
+  async function handleSplitConfirm(selected) {
+    const { url, pianoOnly, includeVideo } = splitPrompt
+    setSplitPrompt(null)
+    for (let i = 0; i < selected.length; i++) {
+      const ch = selected[i]
+      const ok = await startUrlJob(url, pianoOnly, includeVideo, {
+        start: ch.start, end: ch.end,
+        name: ch.title || ('Track ' + (i + 1))
+      })
+      if (!ok) break // out of free credits or a submit failed — stop the batch
+    }
+    refresh()
+  }
+
+  async function handleSplitSingle() {
+    const { url, pianoOnly, includeVideo } = splitPrompt
+    setSplitPrompt(null)
+    await startUrlJob(url, pianoOnly, includeVideo)
     refresh()
   }
 
@@ -609,6 +652,19 @@ export default function App() {
             </div>
           )}
           <UploadZone onFiles={handleFiles} onUrl={handleUrl} />
+          {splitPrompt && (
+            <ChapterSplitModal
+              title={splitPrompt.title || 'This link'}
+              chapters={splitPrompt.chapters}
+              remainingCredits={
+                firebaseReady && account && !account.family && !account.activated
+                  ? account.remaining : null
+              }
+              onConfirm={handleSplitConfirm}
+              onSingle={handleSplitSingle}
+              onCancel={function () { setSplitPrompt(null) }}
+            />
+          )}
 
           {doneJobs.length > 0 && (
             <div className="lib-select-bar">
