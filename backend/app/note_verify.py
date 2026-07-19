@@ -127,8 +127,10 @@ PEDAL_GAP_MERGE_SEC = 0.05
 # A note whose offset lands within this window of a sustain-pedal release
 # was usually ended by the damper falling, not the key coming up (legato
 # pedal change: strike bass, lift pedal ~100ms later, fingers hold the
-# keys). Candidates for the forward-extension rescue below.
-PEDAL_CLIP_WINDOW_SEC = 0.08
+# keys). Candidates for the forward-extension rescue below. BD's offset
+# jitter around releases reaches ~35ms+; widened from 0.08 per the
+# err-on-long directive.
+PEDAL_CLIP_WINDOW_SEC = 0.12
 # A rescued note never grows past this TOTAL duration, measured from its
 # onset (longest legato hold on the Sweet Hour bench is ~2.1s; 4s is a
 # generous ceiling). Anchoring at the onset -- not the current offset --
@@ -138,15 +140,26 @@ PEDAL_CLIP_WINDOW_SEC = 0.08
 RESCUE_MAX_EXTEND_SEC = 4.0
 # Extensions smaller than this aren't audible across a pedal gap; skip.
 RESCUE_MIN_GAIN_SEC = 0.10
-# A freely ringing string only decays. If the walked envelope climbs this
-# far above its running minimum since the walk began, the energy is another
-# note's attack bleeding into the bins -- end the extension there. 2.0x =
-# +6dB; natural ring jitter measured well under 3dB on the Sweet Hour job.
-# The guard stays disarmed for a grace period first: a fresh strike's
-# partials keep swelling for a few hundred ms after the (clipped) offset
+# Walk continuation is anchored to the pitch's own QUIET FLOOR, not the
+# note's attack peak: a treble string decays >14dB below its peak while
+# still clearly sounding (2:50 bug: A5 sat 21dB under its peak at the walk
+# start yet rang another 2.7s, holding 5-16dB over floor until the real
+# damp crashed it 10dB below floor). A peak-anchored threshold starves
+# treble; floor-anchored errs long, which is the chosen direction.
+RESCUE_FLOOR_MARGIN = 2.0          # keep walking while >= 2x quiet floor
+# Reverb wash jitters +/-10dB frame to frame; all walk decisions run on a
+# median-smoothed envelope (~116ms) so jitter neither stops nor extends
+# the walk.
+RESCUE_SMOOTH_FRAMES = 5
+# A freely ringing string only decays. If the SMOOTHED envelope climbs
+# this far above its running minimum since the walk began, the energy is
+# another note's attack bleeding into the bins -- end the extension there
+# (raw-frame jitter false-fired at 2.5x, hence smoothing + 3.0x). The
+# guard stays disarmed for a grace period first: a fresh strike's partials
+# keep swelling for a few hundred ms after the (clipped) offset
 # (soundboard bloom / string beating), and without the grace that bloom
 # broke the walk 0.14s in (bench p36@13.2 came out 0.27s vs 1.0s truth).
-RESCUE_RISE_STOP_RATIO = 2.5
+RESCUE_RISE_STOP_RATIO = 3.0
 RESCUE_RISE_GRACE_SEC = 0.40
 
 # Bass fundamentals are weak on real pianos (string inharmonicity +
@@ -409,29 +422,48 @@ def _refine_pedals(pedals, alt_pedals, notes, stats, add_alt=False):
     return merged
 
 
+def _smoothed_envelope(mag, pitch, cache):
+    """Median-smoothed pitch envelope (RESCUE_SMOOTH_FRAMES wide), cached
+    per pitch alongside _pitch_envelope's raw one. Smoothing kills the
+    +/-10dB frame-to-frame reverb jitter that made raw-frame walk
+    decisions both stop early (false rise) and stop late (spike over
+    floor)."""
+    key = (pitch, "smooth")
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    from scipy.ndimage import median_filter
+
+    env, floor = _pitch_envelope(mag, pitch, cache)
+    env_s = median_filter(env, size=RESCUE_SMOOTH_FRAMES, mode="nearest")
+    cache[key] = (env_s, floor)
+    return env_s, floor
+
+
 def _rescue_pedal_clipped(notes, pedals, mag, stats):
     """Extend offsets of notes clipped at a sustain-pedal release.
 
     ByteDance's offset marks sound-end: at a legato pedal change the damper
     falling on the OLD harmony also chops the offset of a freshly struck,
     finger-held note (video-truth bench: bass octave held 1.0s reported as
-    0.14s). If the pitch's envelope still holds >= OFFSET_KEEP_RATIO of the
-    note's own span peak after the release, the key was still down -- walk
-    the offset forward to where the envelope really dies. Mirror of
-    _trim_offset, which only ever shortens. Never touches onsets, never
-    adds notes (the reverted re-strike rescue failure mode can't occur),
-    never moves pedal events. Repeated chords self-cap via the next
-    same-pitch onset (bench 41.3s staccato chords: +0.04s max).
+    0.14s; melody A5 at 2:50 held ~2.7s reported as 1.1s). If the pitch's
+    smoothed envelope still rings clear of its quiet floor after the
+    release, the string was still sounding -- walk the offset forward to
+    where the ring really dies. Never touches onsets, never adds notes
+    (the reverted re-strike rescue failure mode can't occur), never moves
+    pedal events.
 
-    Pedal releases only NOMINATE candidates -- they never truncate the
-    walk. A next-release cap was tried (2026-07-18) and reverted the same
-    day: BD's pedal detector flutters mid-hold on reverb material (Sweet
-    Hour 155.5-160.7s: six short segments whose gaps show no damp step in
-    the audio), so capping at the next claimed release re-cut the very
-    notes being rescued. The walk ends on the audio alone: envelope below
-    the keep threshold, a rise above the running minimum (a ring can only
-    decay -- a rise is another note's attack bleeding in), the next
-    same-pitch strike, or the hard length cap.
+    The walk threshold is FLOOR-anchored (RESCUE_FLOOR_MARGIN), not
+    peak-anchored: a peak-anchored threshold (tried first as 20% of span
+    peak) starves treble, whose strings decay >14dB below the attack while
+    still clearly audible. Pedal releases only NOMINATE candidates -- they
+    never truncate the walk; geometric caps at the next press and next
+    release were each tried and reverted (BD's pedal detector flutters
+    mid-hold, so both re-cut the notes being rescued). The walk ends on
+    the audio alone: smoothed envelope back at the quiet floor, a
+    sustained rise above the running minimum (a free ring only decays --
+    a rise is another note's attack bleeding in), the next same-pitch
+    strike, or the total-duration cap.
     """
     from bisect import bisect_left, bisect_right
     if not notes or not pedals:
@@ -451,15 +483,11 @@ def _rescue_pedal_clipped(notes, pedals, mag, stats):
                     if 0 <= j < len(releases)), default=None)
         if near is None or near[0] > PEDAL_CLIP_WINDOW_SEC:
             continue
-        env, floor = _pitch_envelope(mag, n["pitch"], cache)
-        f0 = min(n_frames - 1, max(0, int(round(n["onset"] * SR / HOP))))
-        f1 = min(n_frames - 1, max(f0, int(round(off * SR / HOP))))
-        span = env[f0:f1 + 1]
-        if span.size == 0:
-            continue
-        thresh = float(span.max()) * OFFSET_KEEP_RATIO
-        if thresh <= floor:
-            continue                 # too quiet to track credibly
+        env_s, floor = _smoothed_envelope(mag, n["pitch"], cache)
+        f1 = min(n_frames - 1, max(0, int(round(off * SR / HOP))))
+        stop_floor = floor * RESCUE_FLOOR_MARGIN
+        if env_s[f1] < stop_floor:
+            continue                 # nothing credibly ringing at the offset
         onsets = by_pitch[n["pitch"]]
         k = bisect_right(onsets, n["onset"])
         cap_t = n["onset"] + RESCUE_MAX_EXTEND_SEC
@@ -468,9 +496,9 @@ def _rescue_pedal_clipped(notes, pedals, mag, stats):
         cap_f = min(n_frames - 1, int(round(cap_t * SR / HOP)))
         grace_f = f1 + int(round(RESCUE_RISE_GRACE_SEC * SR / HOP))
         f = f1
-        run_min = env[f1]
-        while f + 1 <= cap_f and env[f + 1] >= thresh:
-            nxt = env[f + 1]
+        run_min = env_s[f1]
+        while f + 1 <= cap_f and env_s[f + 1] >= stop_floor:
+            nxt = env_s[f + 1]
             if f + 1 > grace_f and nxt > run_min * RESCUE_RISE_STOP_RATIO:
                 break            # fresh attack bleeding in, ring is over
             run_min = min(run_min, nxt)
