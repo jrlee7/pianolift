@@ -9,8 +9,10 @@ import {
   autoSyncJob, autoSyncMedia
 } from '../api.js'
 import { createMidiOut } from '../midiOut.js'
+import { createMockMidiOut, mockMidiEnabled } from '../devMockMidi.js'
 import { updateSongSettings } from '../firebase.js'
-import { loadCalibration } from '../calibrate.js'
+import { loadCalibration, saveCalibration, effectiveCalibration } from '../calibrate.js'
+import { createLiveSyncMonitor } from '../liveSync.js'
 import CalibrationWizard from './CalibrationWizard.jsx'
 import VisualTest from './VisualTest.jsx'
 import { prepareEvents, createVideoMidiPlayer } from '../videoMidiPlayer.js'
@@ -90,6 +92,10 @@ export default function PlayerView({ jobs, initial }) {
   const [calibration, setCalibration] = useState(function () { return loadCalibration() })
   const [showCalibrate, setShowCalibrate] = useState(false)
   const [showVisual, setShowVisual] = useState(false)
+  // live closed-loop residual (only populated if the piano echoes its sensors
+  // during playback); {medianErr, matches, samples}
+  const [liveSyncInfo, setLiveSyncInfo] = useState(null)
+  const liveMonitorRef = useRef(null)
   const tapsRef = useRef([])
   const tapNowRef = useRef(null)
   const [loop, setLoop] = useState(null) // {a, b} video-time loop window
@@ -101,9 +107,12 @@ export default function PlayerView({ jobs, initial }) {
   const idleTimer = useRef(null)
   const midiRef = useRef(null)
   if (!midiRef.current) {
-    midiRef.current = createMidiOut(function () {
-      setMidiTick(function (t) { return t + 1 })
-    })
+    const onMidiChange = function () { setMidiTick(function (t) { return t + 1 }) }
+    // ?mockmidi (or window.__PF_MOCK_MIDI) swaps in a hardware-free simulator so
+    // the sync UI can be exercised without a piano. No-op in normal use.
+    midiRef.current = mockMidiEnabled()
+      ? createMockMidiOut(onMidiChange)
+      : createMidiOut(onMidiChange)
   }
   const midi = midiRef.current
 
@@ -184,14 +193,25 @@ export default function PlayerView({ jobs, initial }) {
   useEffect(function () {
     const v = videoRef.current
     if (!v || !perf || !videoUrl) return
+    const eff = effectiveCalibration(calibration)
     const player = createVideoMidiPlayer(v, midi, perf, {
       syncMs: syncMs, pedalMs: pedalMs, velScale: velScale, pedalOn: pedalOn,
-      latencyCurve: calibration.curve, tvLatencyMs: calibration.tvLatencyMs
+      latencyCurve: eff.curve, tvLatencyMs: eff.tvLatencyMs, uniformComp: eff.uniformComp
     })
     player.setActivityCallback(setNotesSent)
+    // Live sync monitor: hears the piano's key-echo (when it transmits during
+    // playback) and reports the residual timing error for an optional trim.
+    const monitor = createLiveSyncMonitor(midi, { echoPortId: calibration.echoPortId })
+    monitor.setOnUpdate(setLiveSyncInfo)
+    player.setOnScheduled(monitor.noteScheduled)
+    monitor.start()
+    liveMonitorRef.current = monitor
+    setLiveSyncInfo(null)
     player.attach()
     playerRef.current = player
     return function () {
+      monitor.stop()
+      liveMonitorRef.current = null
       player.detach()
       playerRef.current = null
     }
@@ -207,7 +227,8 @@ export default function PlayerView({ jobs, initial }) {
   }, [pedalMs])
   useEffect(function () {
     if (playerRef.current) {
-      playerRef.current.setCalibration(calibration.curve, calibration.tvLatencyMs)
+      const eff = effectiveCalibration(calibration)
+      playerRef.current.setCalibration(eff.curve, eff.tvLatencyMs, { uniformComp: eff.uniformComp })
     }
   }, [calibration])
   useEffect(function () {
@@ -466,6 +487,28 @@ export default function PlayerView({ jobs, initial }) {
     setSaveMsg('Saved as default for new songs')
   }
 
+  // Toggle the piano's fixed-delay compensation mode. On = the scheduler assumes
+  // the piano's MIDI IN Delay (~500 ms) and shifts every message early by that
+  // constant; the wizard is what actually verifies the piano is in that mode.
+  function toggleDelayMode(on) {
+    setCalibration(function (c) {
+      const next = { ...c, delayMode: on }
+      saveCalibration(next)
+      return next
+    })
+  }
+
+  // Nudge the offset by the live-measured residual, then reset the monitor so
+  // it re-measures against the corrected timing.
+  function applyLiveTrim() {
+    const info = liveSyncInfo
+    if (!info || info.medianErr == null) return
+    setSyncMs(function (m) { return Math.round(m - info.medianErr) })
+    if (liveMonitorRef.current) liveMonitorRef.current.reset()
+    setLiveSyncInfo(null)
+    setSaveMsg(null)
+  }
+
   const outputs = midi.outputs()
   const songLabel = sel === 'lib' && libSong ? libSong.title
     : songJob ? songJob.name : ''
@@ -642,9 +685,9 @@ export default function PlayerView({ jobs, initial }) {
           </div>
           <div className="row" style={{ marginTop: 6 }}>
             <button disabled={!midi.connected}
-              title="Measure the piano's per-note actuation latency so every note fires early by the right amount"
+              title="Measure the piano's timing so every note fires early by the right amount"
               onClick={function () { setShowCalibrate(true) }}>
-              ⚡ Calibrate piano{calibration.curve.length ? ' ✓' : ''}
+              ⚡ Calibrate piano{(calibration.delayMode ? calibration.delayVerified : calibration.curve.length) ? ' ✓' : ''}
             </button>
             <button disabled={!midi.connected}
               title="Play a hymn on an on-screen keyboard (show it on the TV) while the piano plays it live, and fine-tune the offset"
@@ -652,6 +695,28 @@ export default function PlayerView({ jobs, initial }) {
               🎹 Visual sync test
             </button>
           </div>
+          <div className="row" style={{ marginTop: 6 }}>
+            <label className="row" style={{ gap: 4 }}
+              title="The piano's MIDI IN Delay makes timing exact and velocity-independent. Enable it on the piano, then verify with Calibrate.">
+              <input type="checkbox" checked={Boolean(calibration.delayMode)}
+                onChange={function (e) { toggleDelayMode(e.target.checked) }} />
+              500 ms delay mode
+            </label>
+            {calibration.delayMode && !calibration.delayVerified && (
+              <span className="meta">unverified — run ⚡ Calibrate to confirm</span>
+            )}
+          </div>
+          {liveSyncInfo && liveSyncInfo.matches >= 5 && liveSyncInfo.medianErr != null && (
+            <div className="row" style={{ marginTop: 6 }}>
+              <span className="meta">
+                🎧 Live: piano running {Math.abs(Math.round(liveSyncInfo.medianErr))} ms
+                {liveSyncInfo.medianErr >= 0 ? ' late' : ' early'} ({liveSyncInfo.samples} notes)
+              </span>
+              <button className="primary" onClick={applyLiveTrim}>
+                Trim {liveSyncInfo.medianErr >= 0 ? '−' : '+'}{Math.abs(Math.round(liveSyncInfo.medianErr))} ms
+              </button>
+            </div>
+          )}
           {autoSyncMsg && <div className="meta">{autoSyncMsg}</div>}
           {!autoSyncMsg && tapMsg && <div className="meta">{tapMsg}</div>}
           {!autoSyncMsg && !tapMsg && (
@@ -743,16 +808,19 @@ export default function PlayerView({ jobs, initial }) {
       <div className="meta player-help">
         Space play/pause · ←/→ skip 5s · , / . nudge piano ±10 ms · t tap sync ·
         m mute video · f fullscreen. HDMI the laptop to the TV, USB to the
-        piano's USB TO HOST port, press play. For exact sync: ⚡ Calibrate piano
-        once (measures per-note solenoid latency), then 🎹 Visual sync test to
-        zero the remaining TV offset by eye and ear.
+        piano's USB TO HOST port, press play. Best sync: turn on the piano's
+        <strong> MIDI IN Delay</strong> and tick <strong>500 ms delay mode</strong>,
+        run <strong>⚡ Calibrate</strong> once (verifies the delay and measures your
+        TV), then <strong>⚡ Auto sync</strong> per song. 🎹 Visual sync test is only
+        for a final by-eye check.
       </div>
 
       {showCalibrate && (
         <CalibrationWizard
           midi={midi}
-          onApply={function (curve, tvMs) {
-            setCalibration({ curve: curve, tvLatencyMs: tvMs })
+          current={calibration}
+          onApply={function (cal) {
+            setCalibration(cal)
             setShowCalibrate(false)
           }}
           onClose={function () { setShowCalibrate(false) }}

@@ -10,7 +10,7 @@
 import { mapVelocity, maxSustainSec } from './previewSynth.js'
 import { latencyForVelocity } from './calibrate.js'
 
-const LOOKAHEAD_SEC = 0.35   // schedule this far ahead (real seconds)
+const MIN_LOOKAHEAD_SEC = 0.35  // floor for how far ahead we schedule (real s)
 const TICK_MS = 100          // scheduler cadence
 const EPSILON = 0.03         // don't fire events already this far in the past
 
@@ -69,6 +69,27 @@ export function createVideoMidiPlayer(videoEl, midi, prepared, initial) {
   // exactly the old behavior.
   let latencyCurve = (initial && initial.latencyCurve) || []
   let tvLatencyMs = (initial && initial.tvLatencyMs) || 0
+  // Disklavier "MIDI IN Delay" mode: the piano delays EVERY incoming message by
+  // a fixed constant (~500 ms), so note-offs and pedal CC must be shifted early
+  // too (not just note-ons) to keep durations and pedal timing correct. In the
+  // ordinary per-velocity-curve mode this stays false and only note-ons shift,
+  // preserving the previously shipped behavior.
+  let uniformComp = Boolean(initial && initial.uniformComp)
+
+  // How far ahead the scheduler must look: at least MIN_LOOKAHEAD_SEC, but more
+  // when compensation is large (delay mode pulls sends ~0.5 s earlier, which
+  // must fit inside the window or every send lands in the past and gets clamped
+  // late). Recomputed whenever the calibration changes.
+  let lookaheadSec = MIN_LOOKAHEAD_SEC
+  function recomputeLookahead() {
+    let maxMs = 0
+    for (let i = 0; i < latencyCurve.length; i++) {
+      if (latencyCurve[i].ms > maxMs) maxMs = latencyCurve[i].ms
+    }
+    const maxCompSec = Math.max(0, maxMs - tvLatencyMs) / 1000
+    lookaheadSec = Math.max(MIN_LOOKAHEAD_SEC, maxCompSec + 0.25)
+  }
+  recomputeLookahead()
 
   // Real-time ms to pull a note's MIDI send earlier, for the velocity actually
   // sent to the piano. Rate-independent: latencies are physical constants, not
@@ -88,6 +109,13 @@ export function createVideoMidiPlayer(videoEl, midi, prepared, initial) {
   let pedalHeld = null     // tOff of the sounding pedal, or null
   let notesSent = 0
   let onActivity = null    // cb(notesSent) for the UI counter
+  let onScheduled = null   // cb({pitch,vel,sendTs,soundTs}) for live-sync monitor
+  // Note-ons sent with a still-in-the-future timestamp. Chromium queues them in
+  // the driver; if the user pauses/seeks before they fire, clearQueue() may be
+  // a no-op (MIDIOutput.clear isn't universal), so quiet() releases them by
+  // stamping a note-off just after each — a bounded blip instead of ghost notes
+  // playing 0.5 s into a pause. Pruned as their time passes.
+  let queuedFuture = []    // [{pitch, ts}]
 
   function noteTime(t) { return t + syncSec }
   function pedalTime(t) { return t + syncSec + pedalSec }
@@ -104,7 +132,12 @@ export function createVideoMidiPlayer(videoEl, midi, prepared, initial) {
     const nowMs = performance.now()
     const vt = videoEl.currentTime
     const rate = videoEl.playbackRate || 1
-    const horizon = vt + LOOKAHEAD_SEC * rate
+    const horizon = vt + lookaheadSec * rate
+
+    // drop future-queue entries that have already fired
+    if (queuedFuture.length) {
+      queuedFuture = queuedFuture.filter(function (q) { return q.ts > nowMs })
+    }
 
     // note-ons entering the window
     while (noteIdx < prepared.notes.length) {
@@ -118,31 +151,44 @@ export function createVideoMidiPlayer(videoEl, midi, prepared, initial) {
         // Fire earlier by the (velocity-dependent) net hardware latency so the
         // hammer sounds in sync with the picture. clamp to not stamp absurdly
         // far in the past if we're already at the note.
-        let ts = tsFor(tv, nowMs, vt, rate) - compMs(vel)
+        const soundTs = tsFor(tv, nowMs, vt, rate)
+        let ts = soundTs - compMs(vel)
         if (ts < nowMs) ts = nowMs
         midi.noteOn(n.pitch, vel, ts)
         sounding.push({ pitch: n.pitch, tOff: n.tOff })
+        if (ts > nowMs) queuedFuture.push({ pitch: n.pitch, ts: ts })
+        if (onScheduled) onScheduled({ pitch: n.pitch, vel: vel, sendTs: ts, soundTs: soundTs })
         notesSent++
       }
       noteIdx++
     }
-    // note-offs whose time has entered the window
+    // note-offs whose time has entered the window. In uniform (delay) mode the
+    // off must be pulled early by the same constant as the on, or the piano —
+    // which delays every message equally — would hold each note ~0.5 s too long.
     for (let i = sounding.length - 1; i >= 0; i--) {
       const tv = noteTime(sounding[i].tOff)
       if (tv <= horizon) {
-        midi.noteOff(sounding[i].pitch,
-          tsFor(Math.max(tv, vt), nowMs, vt, rate))
+        let offTs = tsFor(Math.max(tv, vt), nowMs, vt, rate)
+        if (uniformComp) {
+          offTs -= compMs(64)
+          if (offTs < nowMs) offTs = nowMs
+        }
+        midi.noteOff(sounding[i].pitch, offTs)
         sounding.splice(i, 1)
       }
     }
-    // pedal
+    // pedal — CC64 is likewise shifted early in uniform (delay) mode so the
+    // sustain lands with the notes; curve mode leaves it uncompensated so any
+    // hand-tuned pedalMs still means what it did before.
     if (pedalOn) {
       while (pedalIdx < prepared.pedals.length) {
         const p = prepared.pedals[pedalIdx]
         const tv = pedalTime(p.tOn)
         if (tv > horizon) break
         if (tv >= vt - EPSILON) {
-          midi.cc(64, 127, tsFor(tv, nowMs, vt, rate))
+          let onTs = tsFor(tv, nowMs, vt, rate)
+          if (uniformComp) { onTs -= compMs(64); if (onTs < nowMs) onTs = nowMs }
+          midi.cc(64, 127, onTs)
           pedalHeld = p.tOff
         }
         pedalIdx++
@@ -150,7 +196,9 @@ export function createVideoMidiPlayer(videoEl, midi, prepared, initial) {
       if (pedalHeld != null) {
         const tv = pedalTime(pedalHeld)
         if (tv <= horizon) {
-          midi.cc(64, 0, tsFor(Math.max(tv, vt), nowMs, vt, rate))
+          let offTs = tsFor(Math.max(tv, vt), nowMs, vt, rate)
+          if (uniformComp) { offTs -= compMs(64); if (offTs < nowMs) offTs = nowMs }
+          midi.cc(64, 0, offTs)
           pedalHeld = null
         }
       }
@@ -164,9 +212,22 @@ export function createVideoMidiPlayer(videoEl, midi, prepared, initial) {
     midi.clearQueue()
     for (let i = 0; i < sounding.length; i++) midi.noteOff(sounding[i].pitch)
     sounding = []
+    // Notes already queued with future timestamps may still fire if the driver
+    // ignored clearQueue(). Stamp a note-off just after each so it's released
+    // the instant it sounds — a brief blip, not a note bleeding through a pause.
+    const nowMs = performance.now()
+    for (let i = 0; i < queuedFuture.length; i++) {
+      const q = queuedFuture[i]
+      if (q.ts > nowMs) midi.noteOff(q.pitch, q.ts + 5)
+    }
+    queuedFuture = []
     if (pedalHeld != null || pedalOn) midi.cc(64, 0)
     pedalHeld = null
     midi.cc(123, 0)
+    // Backstop after the longest possible queued lead, in case a future-stamped
+    // message slipped past the per-note releases above.
+    midi.cc(123, 0, nowMs + lookaheadSec * 1000 + 20)
+    midi.cc(120, 0, nowMs + lookaheadSec * 1000 + 20)
   }
 
   // Point the cursors at the first events at/after the current video time.
@@ -202,6 +263,7 @@ export function createVideoMidiPlayer(videoEl, midi, prepared, initial) {
   // their offs get restamped on the next tick.
   function resync() {
     midi.clearQueue()
+    queuedFuture = []
     resetCursors()
   }
 
@@ -242,10 +304,13 @@ export function createVideoMidiPlayer(videoEl, midi, prepared, initial) {
     detach,
     setSyncMs(ms) { syncSec = ms / 1000; resync() },
     setPedalLagMs(ms) { pedalSec = ms / 1000; resync(); if (!videoEl.paused) chasePedal() },
-    setCalibration(curve, tvMs) {
+    setCalibration(curve, tvMs, opts) {
       latencyCurve = curve || []
       tvLatencyMs = tvMs || 0
+      uniformComp = Boolean(opts && opts.uniformComp)
+      recomputeLookahead()
     },
+    setOnScheduled(cb) { onScheduled = cb },
     setVelScale(x) { velScale = x },
     setPedalOn(b) {
       pedalOn = Boolean(b)

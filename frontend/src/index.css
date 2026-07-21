@@ -566,6 +566,15 @@ audio { width: 100%; height: 34px; }
 .cal-list { margin: 8px 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
 .cal-list li { margin: 4px 0; }
 .cal-warn { color: var(--accent); }
+.cal-radio { display: flex; gap: 8px; align-items: flex-start; margin: 10px 0; line-height: 1.45; }
+.cal-radio input { margin-top: 3px; }
+.cal-radio span { font-size: 14px; }
+.cal-note {
+  margin: 8px 0 4px; padding: 10px 12px; background: var(--panel-2);
+  border-radius: 8px; border: 1px solid var(--border);
+}
+.cal-note p { margin: 4px 0; }
+.cal-note .cal-list { margin: 4px 0; }
 .cal-actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
 .cal-progress {
   height: 8px; background: var(--panel-2); border-radius: 999px;

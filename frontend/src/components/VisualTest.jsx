@@ -10,6 +10,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { prepareEvents, createVideoMidiPlayer } from '../videoMidiPlayer.js'
+import { effectiveCalibration } from '../calibrate.js'
 import { TEACH_ME_HYMN } from '../teachMeHymn.js'
 
 const VIS_LOOKAHEAD = 3.0   // seconds of notes visible falling toward the line
@@ -101,10 +102,10 @@ export default function VisualTest({ midi, syncMs, pedalMs, velScale, pedalOn,
     perfRef.current = prepared
     const vv = createVirtualVideo(TEACH_ME_HYMN.duration)
     vvRef.current = vv
+    const eff = effectiveCalibration(calibration)
     const player = createVideoMidiPlayer(vv, midi, prepared, {
       syncMs: syncMs, pedalMs: pedalMs, velScale: velScale, pedalOn: pedalOn,
-      latencyCurve: calibration ? calibration.curve : [],
-      tvLatencyMs: calibration ? calibration.tvLatencyMs : 0
+      latencyCurve: eff.curve, tvLatencyMs: eff.tvLatencyMs, uniformComp: eff.uniformComp
     })
     player.attach()
     playerRef.current = player
@@ -135,7 +136,8 @@ export default function VisualTest({ midi, syncMs, pedalMs, velScale, pedalOn,
   }, [pedalMs])
   useEffect(function () {
     if (playerRef.current && calibration) {
-      playerRef.current.setCalibration(calibration.curve, calibration.tvLatencyMs)
+      const eff = effectiveCalibration(calibration)
+      playerRef.current.setCalibration(eff.curve, eff.tvLatencyMs, { uniformComp: eff.uniformComp })
     }
   }, [calibration])
 

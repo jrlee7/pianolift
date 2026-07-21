@@ -13,8 +13,8 @@ export function createMidiOut(onChange) {
   let access = null
   let output = null      // selected MIDIOutput (or null)
   let error = null       // human-readable init failure
-  let inputsBound = false
-  const inputNoteOnCbs = []   // cb(pitch, vel, perfTs) for key-echo calibration
+  const boundInputs = new Set()   // ids of input ports we've attached a handler to
+  const inputNoteOnCbs = []   // cb(pitch, vel, perfTs, {id,name}) for key-echo calibration
 
   function outputs() {
     if (!access) return []
@@ -23,6 +23,34 @@ export function createMidiOut(onChange) {
       list.push({ id: o.id, name: o.name || 'MIDI device' })
     })
     return list
+  }
+
+  function inputs() {
+    if (!access) return []
+    const list = []
+    access.inputs.forEach(function (i) {
+      list.push({ id: i.id, name: i.name || 'MIDI input' })
+    })
+    return list
+  }
+
+  // The input port whose name best matches the selected output — the piano's
+  // USB TO HOST exposes paired in/out ports with near-identical names, so the
+  // key-echo we want comes back on this one (not some unrelated loopback port).
+  function inputMatchingOutput() {
+    if (!access || !output) return null
+    const oname = (output.name || '').toLowerCase()
+    let exact = null
+    let partial = null
+    access.inputs.forEach(function (i) {
+      const iname = (i.name || '').toLowerCase()
+      if (iname && iname === oname) { if (!exact) exact = i }
+      else if (iname && oname && (iname.indexOf(oname) === 0 || oname.indexOf(iname) === 0)) {
+        if (!partial) partial = i
+      }
+    })
+    const pick = exact || partial || null
+    return pick ? { id: pick.id, name: pick.name || 'MIDI input' } : null
   }
 
   function notify() {
@@ -75,6 +103,10 @@ export function createMidiOut(onChange) {
         if (!still) output = null
       }
       if (!output) pickDefault()
+      // Re-bind inputs so a port connected after the first calibration run (or
+      // a re-plugged piano) still delivers its key-echo. bindInputs is a no-op
+      // for ports already bound.
+      if (inputNoteOnCbs.length) bindInputs()
       notify()
     }
     pickDefault()
@@ -108,25 +140,31 @@ export function createMidiOut(onChange) {
   // Disklavier's key-sensor echo (the piano reporting its own key movement back
   // out USB TO HOST). event.timeStamp is DOMHighResTimeStamp (performance.now
   // domain), the same clock our sends use, so latency is a clean subtraction.
-  function enableInput() {
-    if (!access || inputsBound) return
-    inputsBound = true
+  // Callbacks receive the source port {id,name} so the caller can keep only the
+  // port paired with the selected output and reject unrelated loopback ports.
+  function bindInputs() {
+    if (!access) return
     access.inputs.forEach(function (inp) {
+      if (boundInputs.has(inp.id)) return
+      boundInputs.add(inp.id)
+      const port = { id: inp.id, name: inp.name || 'MIDI input' }
       inp.onmidimessage = function (e) {
         const d = e.data
         // 0x90 note-on with non-zero velocity (0x90 vel 0 == note-off).
         if (d && (d[0] & 0xf0) === 0x90 && d[2] > 0) {
           for (let i = 0; i < inputNoteOnCbs.length; i++) {
-            inputNoteOnCbs[i](d[1], d[2], e.timeStamp)
+            inputNoteOnCbs[i](d[1], d[2], e.timeStamp, port)
           }
         }
       }
     })
   }
 
+  function enableInput() { bindInputs() }
+
   // Subscribe to input note-ons; returns an unsubscribe fn.
   function onInputNoteOn(cb) {
-    enableInput()
+    bindInputs()
     inputNoteOnCbs.push(cb)
     return function () {
       const i = inputNoteOnCbs.indexOf(cb)
@@ -169,6 +207,8 @@ export function createMidiOut(onChange) {
     init,
     select,
     outputs,
+    inputs,
+    inputMatchingOutput,
     enableInput,
     onInputNoteOn,
     noteOn, noteOff, cc,
