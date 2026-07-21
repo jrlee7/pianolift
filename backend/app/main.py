@@ -32,7 +32,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from . import (pipeline, midi_writer, note_verify, eseq_writer, disk_writer,
                transkun_engine, auto_sync,
                usb, job_runner)
-from . import sheet_routes
+from . import sheet_routes, sheet_to_events
+from . import musicxml_io
 
 # A PyInstaller onefile build's __file__ resolves inside the run's temp
 # extraction dir (%TEMP%\_MEIxxxxx), which is new and gets wiped every
@@ -415,6 +416,68 @@ def create_job_from_midi(payload: dict = Body(...)):
         "trimEndSec": None,
         "fromLibrary": True,
         "settings": job_settings,
+        "createdAt": time.time(),
+    }
+    with jobs_lock:
+        jobs[job_id] = job
+        _persist(job_id)
+    return job
+
+
+@app.post("/api/sheet-jobs/{sheet_job_id}/to-song")
+def create_job_from_sheet(sheet_job_id: str):
+    """Convert a finished sheet job's working score (MusicXML, including any
+    accepted pedal/dynamics suggestions and user edits) into a playable
+    note-events job that opens straight in the piano-roll editor — same
+    finished-job shape as /api/jobs/from-library above. Lives here rather
+    than sheet_routes.py because it needs this module's job store/writers
+    (sheet_routes must stay importable by main, not the other way around)."""
+    sheet_job = sheet_routes.jobs.get(sheet_job_id)
+    if sheet_job is None:
+        raise HTTPException(404, "sheet job not found")
+    score_path = os.path.join(sheet_routes._job_dir(sheet_job_id),
+                              "score.musicxml")
+    if sheet_job.get("status") != "done" or not os.path.exists(score_path):
+        raise HTTPException(409, "score isn't ready yet")
+
+    try:
+        root = musicxml_io.load_musicxml(score_path)
+        notes, pedals, warnings = sheet_to_events.convert(root)
+    except Exception as e:
+        raise HTTPException(400, "could not convert score: " + str(e))
+    if not notes:
+        raise HTTPException(400, "no playable notes found in this score")
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = _job_dir(job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    with open(os.path.join(job_dir, "events.json"), "w") as f:
+        json.dump({"notes": notes, "pedals": pedals}, f)
+    # Baked default render so the job dir mirrors from-library jobs (some
+    # exports read input.mid as the fallback source).
+    midi_writer.write_midi(notes, pedals, os.path.join(job_dir, "input.mid"))
+
+    job = {
+        "id": job_id,
+        "name": sheet_job.get("name") or "Sheet song",
+        "status": "done",
+        "stage": "done",
+        "progress": 100,
+        "error": None,
+        "pianoOnly": True,
+        "noteCount": len(notes),
+        "pedalCount": len(pedals),
+        "pianoStem": None,
+        "accompaniment": None,
+        "encoderDelayMs": 0.0,
+        "trimStartSec": 0.0,
+        "trimEndSec": None,
+        "fromSheet": sheet_job_id,
+        "warnings": warnings,
+        "settings": {
+            "velMin": 20, "velMax": 112, "gamma": 1.0,
+            "offsetMs": 0, "releaseMs": 0,
+        },
         "createdAt": time.time(),
     }
     with jobs_lock:

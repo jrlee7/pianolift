@@ -143,6 +143,9 @@ export default function NoteEditor({
   const [trimMode, setTrimMode] = useState(false)
   const [trimLo, setTrimLo] = useState(trimStart || 0)
   const [trimHi, setTrimHi] = useState(trimEnd)
+  const [rampFrom, setRampFrom] = useState(60)
+  const [rampTo, setRampTo] = useState(100)
+  const [speedPct, setSpeedPct] = useState(100)
 
   const canvasRef = useRef(null)
   const keyboardRef = useRef(null)
@@ -282,6 +285,67 @@ export default function NoteEditor({
         : n)
     }
     commit(notes, null)
+  }
+
+  // Linear velocity ramp across the selection in onset order — paints a
+  // crescendo/diminuendo by hand (sheet-imported songs often arrive with
+  // coarse dynamics worth reshaping). Simultaneous notes share a velocity.
+  function rampSelectedVelocity(v0, v1) {
+    if (sel.notes.size < 2) return
+    pushUndo()
+    const ev = eventsRef.current
+    const chosen = []
+    for (let i = 0; i < ev.notes.length; i++) {
+      if (sel.notes.has(ev.notes[i]._id)) chosen.push(ev.notes[i])
+    }
+    chosen.sort(byOnset)
+    const t0 = chosen[0].onset
+    const span = chosen[chosen.length - 1].onset - t0
+    const velById = new Map()
+    for (let i = 0; i < chosen.length; i++) {
+      const f = span > 0
+        ? (chosen[i].onset - t0) / span
+        : i / (chosen.length - 1)
+      velById.set(chosen[i]._id,
+        Math.max(1, Math.min(127, Math.round(v0 + (v1 - v0) * f))))
+    }
+    const notes = []
+    for (let i = 0; i < ev.notes.length; i++) {
+      const n = ev.notes[i]
+      notes.push(velById.has(n._id)
+        ? {
+            _id: n._id, onset: n.onset, offset: n.offset, pitch: n.pitch,
+            velocity: velById.get(n._id)
+          }
+        : n)
+    }
+    commit(notes, null)
+  }
+
+  // Global time stretch: 200% plays twice as fast, 50% half speed. Scales
+  // every note and pedal — the fix for a wrong tempo guess on a
+  // sheet-imported song (OMR assumes a BPM when the scan has no mark).
+  function applySpeed(pct) {
+    const f = pct / 100
+    if (!(f > 0) || f === 1) return
+    pushUndo()
+    const s = 1 / f
+    const ev = eventsRef.current
+    const notes = []
+    for (let i = 0; i < ev.notes.length; i++) {
+      const n = ev.notes[i]
+      notes.push({
+        _id: n._id, onset: n.onset * s, offset: n.offset * s,
+        pitch: n.pitch, velocity: n.velocity
+      })
+    }
+    const pedals = []
+    for (let i = 0; i < ev.pedals.length; i++) {
+      const p = ev.pedals[i]
+      pedals.push({ _id: p._id, onset: p.onset * s, offset: p.offset * s })
+    }
+    commit(notes, pedals)
+    setSpeedPct(100)
   }
 
   function transposeSelected(dp) {
@@ -1349,8 +1413,42 @@ export default function NoteEditor({
                   <button className="tool" title="Selected notes 10% louder"
                     onClick={function () { scaleSelectedVelocity(1.1) }}>△ louder</button>
                 </div>
+                {sel.notes.size > 1 && (
+                  <div className="editor-side-row" title={
+                    'Velocity ramp: fade the selected notes from the first '
+                    + 'value to the second in time order — a hand-drawn '
+                    + 'crescendo (low → high) or diminuendo (high → low).'
+                  }>
+                    <input type="number" min="1" max="127" value={rampFrom}
+                      style={{ width: 52 }}
+                      onChange={function (e) { setRampFrom(Number(e.target.value)) }} />
+                    <span>→</span>
+                    <input type="number" min="1" max="127" value={rampTo}
+                      style={{ width: 52 }}
+                      onChange={function (e) { setRampTo(Number(e.target.value)) }} />
+                    <button className="tool" onClick={function () {
+                      rampSelectedVelocity(
+                        Math.max(1, Math.min(127, rampFrom || 1)),
+                        Math.max(1, Math.min(127, rampTo || 1)))
+                    }}>◿ Ramp</button>
+                  </div>
+                )}
               </>
             )}
+
+            <div className="editor-side-title">Timing</div>
+            <div className="editor-side-row" title={
+              'Speed up or slow down the whole song: 200 plays twice as '
+              + 'fast, 50 half speed. Use when a sheet import guessed the '
+              + 'tempo wrong.'
+            }>
+              <input type="number" min="25" max="400" step="5" value={speedPct}
+                style={{ width: 56 }}
+                onChange={function (e) { setSpeedPct(Number(e.target.value)) }} />
+              <button className="tool" onClick={function () {
+                applySpeed(Math.max(25, Math.min(400, speedPct || 100)))
+              }}>⏱ Speed %</button>
+            </div>
 
             <div className="editor-side-title">History</div>
             <div className="editor-side-row">

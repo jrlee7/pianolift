@@ -26,6 +26,10 @@ piano_transcription_inference>=0.0.6
 transkun>=2.0.1
 librosa>=0.10
 mido>=1.3
+# PDF page splitting for the per-page OMR fallback (omr.py): Audiveris
+# refuses to export a book when any one page fails, so bad pages are split
+# out and skipped individually.
+pypdf>=4
 soundfile>=0.12
 # URL import (YouTube/Facebook/Instagram/...). Site extractors rot fast;
 # keep this fresh when downloads start failing. [default] pulls yt-dlp-ejs,

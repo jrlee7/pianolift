@@ -1,6 +1,14 @@
 """Optical music recognition: PDF -> MusicXML via Audiveris (external Java
 CLI, not a Python dependency — https://github.com/Audiveris/audiveris).
 Audiveris must be installed separately; this module just finds and drives it.
+
+Recognition strategy: try the whole PDF in one Audiveris run first (fastest,
+and the normal case). Audiveris refuses to export the book when ANY page
+fails internally (e.g. a NullPointerException on one messy scanned page kills
+the export of all pages), so on whole-book failure we fall back to splitting
+the PDF and recognizing page by page: unreadable pages are skipped with a
+warning and the surviving pages are merged back into one score
+(musicxml_merge.py).
 """
 
 import glob
@@ -8,10 +16,19 @@ import os
 import shutil
 import subprocess
 
+from pypdf import PdfReader, PdfWriter
+
+from . import musicxml_io as mxml
+from . import musicxml_merge
+
 _CANDIDATE_PATHS = [
     r"C:\Program Files\Audiveris\Audiveris.exe",
     r"C:\Program Files (x86)\Audiveris\Audiveris.exe",
 ]
+
+# A single page is a much smaller job than a book; if one page runs this
+# long something is wrong with it and the other pages shouldn't wait.
+PAGE_TIMEOUT = 240
 
 
 def find_audiveris():
@@ -31,30 +48,9 @@ class OmrError(ValueError):
     treats ValueError messages as user-facing, picks it up for free)."""
 
 
-def run_omr(pdf_path, out_dir, timeout=900):
-    """Run Audiveris on pdf_path in batch mode, exporting MusicXML into
-    out_dir. Returns the path to the produced .mxl/.xml file. Raises
-    OmrError with a message safe to show the user on any failure (missing
-    binary, timeout, recognition failure, no output produced)."""
-    exe = find_audiveris()
-    if exe is None:
-        raise OmrError(
-            "Audiveris (the PDF sheet-music recognizer) isn't installed. "
-            "Install it from https://github.com/Audiveris/audiveris/releases "
-            "and try again.")
-    os.makedirs(out_dir, exist_ok=True)
-    try:
-        result = subprocess.run(
-            [exe, "-batch", "-export", "-output", out_dir, "--", pdf_path],
-            capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise OmrError(
-            "Recognition took too long (over %d minutes) and was stopped — "
-            "the file may be too large or too complex." % (timeout // 60))
-    except OSError as e:
-        raise OmrError("Could not run Audiveris: " + str(e))
-
-    stem = os.path.splitext(os.path.basename(pdf_path))[0]
+def _find_output(input_path, out_dir):
+    """Locate the MusicXML file an Audiveris run left in out_dir, or None."""
+    stem = os.path.splitext(os.path.basename(input_path))[0]
     for ext in (".mxl", ".xml", ".musicxml"):
         candidate = os.path.join(out_dir, stem + ext)
         if os.path.exists(candidate):
@@ -63,11 +59,132 @@ def run_omr(pdf_path, out_dir, timeout=900):
     # the stem differently than we expect.
     hits = (glob.glob(os.path.join(out_dir, "*.mxl")) +
             glob.glob(os.path.join(out_dir, "*.xml")))
-    if hits:
-        return hits[0]
+    return hits[0] if hits else None
 
-    raise OmrError(
-        "Recognition finished but produced no MusicXML — the file may not "
-        "be readable as music notation (make sure it's an actual PDF "
-        "containing sheet music, not a scan/photo saved with the wrong "
-        "extension).")
+
+def _run_audiveris(exe, input_path, out_dir, timeout):
+    """One Audiveris batch run. Returns the produced MusicXML path, or None
+    when recognition failed or timed out (both are recoverable via the
+    per-page fallback). Raises OmrError only when Audiveris can't launch."""
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        subprocess.run(
+            [exe, "-batch", "-export", "-output", out_dir, "--", input_path],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    except OSError as e:
+        raise OmrError("Could not run Audiveris: " + str(e))
+    return _find_output(input_path, out_dir)
+
+
+def _log_tail(out_dir, max_lines=5):
+    """Last few WARN/error lines from the newest Audiveris log under
+    out_dir — appended to total-failure messages so the UI can say *why*."""
+    logs = glob.glob(os.path.join(out_dir, "*.log"))
+    logs += glob.glob(os.path.join(out_dir, "pages", "*", "*.log"))
+    if not logs:
+        return ""
+    newest = max(logs, key=os.path.getmtime)
+    try:
+        with open(newest, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return ""
+    keep = [ln.strip() for ln in lines
+            if ("WARN" in ln or "SEVERE" in ln or "Exception" in ln
+                or "Caused by" in ln)]
+    if not keep:
+        keep = [ln.strip() for ln in lines if ln.strip()]
+    tail = keep[-max_lines:]
+    return (" Recognizer log: " + " | ".join(tail)) if tail else ""
+
+
+def run_omr(pdf_path, out_dir, timeout=900, on_progress=None):
+    """Run Audiveris on pdf_path, exporting MusicXML into out_dir.
+
+    Returns (musicxml_path, warnings). Tries the whole book first; on
+    failure retries page by page, skipping unreadable pages (each skip adds
+    a warning) and merging the rest. Raises OmrError with a user-facing
+    message when nothing at all could be recognized (missing binary,
+    every page failed, ...). on_progress(page, total) is called during the
+    per-page fallback so the UI can show which page is being recognized.
+    """
+    exe = find_audiveris()
+    if exe is None:
+        raise OmrError(
+            "Audiveris (the PDF sheet-music recognizer) isn't installed. "
+            "Install it from https://github.com/Audiveris/audiveris/releases "
+            "and try again.")
+    os.makedirs(out_dir, exist_ok=True)
+
+    produced = _run_audiveris(exe, pdf_path, out_dir, timeout)
+    if produced is not None:
+        return produced, []
+    return _run_paged(exe, pdf_path, out_dir, on_progress)
+
+
+def _run_paged(exe, pdf_path, out_dir, on_progress):
+    """Per-page fallback: split the PDF, recognize each page in its own
+    Audiveris run, merge whatever succeeded. Returns (path, warnings)."""
+    try:
+        reader = PdfReader(pdf_path)
+        total = len(reader.pages)
+    except Exception as e:
+        raise OmrError("Could not read the PDF file: " + str(e))
+
+    if total <= 1:
+        raise OmrError(
+            "Recognition failed — the page may not be readable as music "
+            "notation (make sure it's an actual PDF containing sheet music, "
+            "not a photo saved with the wrong extension)." +
+            _log_tail(out_dir))
+
+    pages_dir = os.path.join(out_dir, "pages")
+    os.makedirs(pages_dir, exist_ok=True)
+    warnings = []
+    survivors = []  # (page_number, parsed MusicXML root)
+
+    for i in range(total):
+        page_no = i + 1
+        if on_progress:
+            try:
+                on_progress(page_no, total)
+            except Exception:
+                pass
+        page_pdf = os.path.join(pages_dir, "page%d.pdf" % page_no)
+        page_out = os.path.join(pages_dir, "out%d" % page_no)
+        try:
+            writer = PdfWriter()
+            writer.add_page(reader.pages[i])
+            with open(page_pdf, "wb") as f:
+                writer.write(f)
+        except Exception:
+            warnings.append("Page %d couldn't be split out of the PDF — "
+                            "skipped." % page_no)
+            continue
+        produced = _run_audiveris(exe, page_pdf, page_out, PAGE_TIMEOUT)
+        if produced is None:
+            warnings.append("Page %d couldn't be read (recognition error) — "
+                            "skipped." % page_no)
+            continue
+        try:
+            root = mxml.load_musicxml(produced)
+        except Exception:
+            warnings.append("Page %d produced an unreadable score — "
+                            "skipped." % page_no)
+            continue
+        survivors.append((page_no, root))
+
+    if not survivors:
+        raise OmrError(
+            "Recognition failed on every page — the file may not be "
+            "readable as music notation (make sure it's an actual PDF "
+            "containing sheet music, not a scan/photo saved with the wrong "
+            "extension)." + _log_tail(out_dir))
+
+    merged, merge_warnings = musicxml_merge.merge_scores(survivors)
+    warnings.extend(merge_warnings)
+    merged_path = os.path.join(out_dir, "merged.musicxml")
+    mxml.save_musicxml(merged, merged_path)
+    return merged_path, warnings

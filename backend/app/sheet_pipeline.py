@@ -13,19 +13,26 @@ from . import omr
 SCORE_EXTS = {".musicxml", ".xml", ".mxl"}
 
 
-def normalize_input(input_path, ext, out_musicxml_path, omr_dir=None):
+def normalize_input(input_path, ext, out_musicxml_path, omr_dir=None,
+                    on_progress=None):
     """Convert an uploaded score into plain MusicXML at out_musicxml_path.
     A .pdf is run through Audiveris (OMR) first — needs omr_dir for its
-    intermediate output. Raises ValueError/omr.OmrError for anything that
-    fails (unsupported type, OMR not installed, recognition failure)."""
+    intermediate output; on_progress(page, total) is forwarded to the OMR
+    per-page fallback. Returns a list of user-facing warning strings (pages
+    skipped during recognition, merge gaps — empty for the happy path).
+    Raises ValueError/omr.OmrError for anything that fails (unsupported
+    type, OMR not installed, recognition failure)."""
+    warnings = []
     if ext == ".pdf":
-        mxl_path = omr.run_omr(input_path, omr_dir)
+        mxl_path, warnings = omr.run_omr(input_path, omr_dir,
+                                         on_progress=on_progress)
         root = mxml.load_musicxml(mxl_path)
     elif ext in SCORE_EXTS:
         root = mxml.load_musicxml(input_path)
     else:
         raise ValueError("unsupported file type: " + ext)
     mxml.save_musicxml(root, out_musicxml_path)
+    return warnings
 
 
 def count_marks(root):

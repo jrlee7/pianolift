@@ -824,7 +824,17 @@ export default function App() {
                   }}
                 />
                 {isOpen && (
-                  <SheetResultView job={job} onChanged={refreshSheet} />
+                  <SheetResultView
+                    job={job}
+                    onChanged={refreshSheet}
+                    onOpenSong={function (songJob) {
+                      // Land in the piano-roll editor: the new job is a
+                      // finished Convert-tab job, so open its card there.
+                      setTab('convert')
+                      setOpenJobId(songJob.id)
+                      refresh()
+                    }}
+                  />
                 )}
               </div>
             )

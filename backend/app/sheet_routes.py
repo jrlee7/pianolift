@@ -87,23 +87,37 @@ def _run_pipeline(job_id, input_path, ext, job_dir):
     suggested_path = os.path.join(job_dir, "score_suggested.musicxml")
     working_path = os.path.join(job_dir, "score.musicxml")
     omr_dir = os.path.join(job_dir, "omr")
+
+    def on_progress(page, total):
+        # Only fires in the per-page OMR fallback; the frontend polls every
+        # couple seconds, so this shows up as "recognizing page 3/8".
+        with jobs_lock:
+            job["stage"] = "recognizing page %d/%d" % (page, total)
+            _persist(job_id)
+
     try:
-        sheet_pipeline.normalize_input(input_path, ext, original_path, omr_dir=omr_dir)
+        warnings = sheet_pipeline.normalize_input(
+            input_path, ext, original_path, omr_dir=omr_dir,
+            on_progress=on_progress)
         counts = sheet_pipeline.run_suggestions(original_path, suggested_path)
         shutil.copyfile(suggested_path, working_path)
         with jobs_lock:
             job["status"] = "done"
+            job["stage"] = None
+            job["warnings"] = warnings
             job["pedalCount"] = counts["pedalCount"]
             job["dynamicsCount"] = counts["dynamicsCount"]
             _persist(job_id)
     except ValueError as e:
         with jobs_lock:
             job["status"] = "error"
+            job["stage"] = None
             job["error"] = str(e)
             _persist(job_id)
     except Exception as e:
         with jobs_lock:
             job["status"] = "error"
+            job["stage"] = None
             job["error"] = "could not parse score: " + str(e)
             _persist(job_id)
 
@@ -123,7 +137,9 @@ async def create_sheet_job(file: UploadFile = File(...)):
         "id": job_id,
         "name": os.path.splitext(name)[0],
         "status": "processing",
+        "stage": None,
         "error": None,
+        "warnings": [],
         "pedalCount": 0,
         "dynamicsCount": 0,
         "edited": False,

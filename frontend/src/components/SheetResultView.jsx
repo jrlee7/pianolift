@@ -1,15 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  fetchSheetMusicXml, resetSheetJob, sheetExportUrl, saveSheetMusicXml
+  fetchSheetMusicXml, resetSheetJob, sheetExportUrl, saveSheetMusicXml,
+  sheetToSong
 } from '../api.js'
 
-export default function SheetResultView({ job, onChanged }) {
+export default function SheetResultView({ job, onChanged, onOpenSong }) {
   const containerRef = useRef(null)
   const fileInputRef = useRef(null)
   const osmdRef = useRef(null)
   const [error, setError] = useState(null)
   const [resetting, setResetting] = useState(false)
   const [reuploading, setReuploading] = useState(false)
+  const [converting, setConverting] = useState(false)
 
   useEffect(function () {
     let cancelled = false
@@ -67,12 +69,34 @@ export default function SheetResultView({ job, onChanged }) {
     setReuploading(false)
   }
 
+  // Turn this score into an editable, playable song on the Convert tab.
+  async function handleOpenSong() {
+    setConverting(true)
+    try {
+      const songJob = await sheetToSong(job.id)
+      if (songJob.warnings && songJob.warnings.length) {
+        alert('Heads up:\n\n' + songJob.warnings.join('\n'))
+      }
+      if (onOpenSong) onOpenSong(songJob)
+    } catch (err) {
+      alert(err.message)
+    }
+    setConverting(false)
+  }
+
+  const warnings = job.warnings || []
+
   if (job.status === 'error') {
     return <div className="notice warn">{job.error}</div>
   }
 
   return (
     <div className="card" style={{ marginTop: -8 }}>
+      {warnings.length > 0 && (
+        <div className="notice warn" style={{ marginBottom: 10 }}>
+          {warnings.map(function (w, i) { return <div key={i}>{w}</div> })}
+        </div>
+      )}
       <div className="row" style={{ marginBottom: 10 }}>
         <span className="meta" style={{ margin: 0 }}>
           Pedal and dynamics marks below are auto-suggested — check them
@@ -96,6 +120,11 @@ export default function SheetResultView({ job, onChanged }) {
             href={sheetExportUrl(job.id)} download>
             ⬇ Export MusicXML
           </a>
+          <button className="primary" disabled={converting}
+            title="Convert this score into note events and open it in the piano-roll editor — full note/velocity/pedal editing plus MIDI, floppy and library export."
+            onClick={handleOpenSong}>
+            {converting ? 'Converting…' : '🎹 Open in piano-roll editor'}
+          </button>
         </div>
       </div>
       {error && <div className="notice warn">{error}</div>}
@@ -104,9 +133,9 @@ export default function SheetResultView({ job, onChanged }) {
         style={{ background: '#fff', borderRadius: 8, padding: 16, overflowX: 'auto' }}
       />
       <div className="meta">
-        Need to fine-tune individual marks? Export, open in MuseScore
-        (free), fix the marks, then Re-upload edited file above to bring it
-        back — in-app editing of individual marks isn't built yet.
+        To adjust individual notes and dynamics in-app, use "Open in
+        piano-roll editor" above. To edit the engraved score itself, Export,
+        fix it in MuseScore (free), then Re-upload edited file above.
       </div>
     </div>
   )

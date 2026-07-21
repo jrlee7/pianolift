@@ -394,6 +394,18 @@ export async function deleteSheetJob(id) {
   return res.json()
 }
 
+// Convert a finished sheet job's score into a playable note-events job
+// (same finished-job shape as importFromLibrary) that opens straight in
+// the piano-roll editor on the Convert tab.
+export async function sheetToSong(id) {
+  const res = await fetch(BASE + '/sheet-jobs/' + id + '/to-song', {
+    method: 'POST'
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail || 'Convert failed')
+  return data
+}
+
 export function sheetMusicXmlUrl(id) {
   // cache-bust: the working score changes on every edit/reset, and a
   // stale cached copy would show marks that no longer exist.
