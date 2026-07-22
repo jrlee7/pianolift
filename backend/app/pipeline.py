@@ -188,8 +188,11 @@ def detect_dead_space(audio_path):
     """Find leading/trailing silence in the original mix.
 
     Returns (trim_start_sec, trim_end_sec) in the original timeline, with a
-    0.2s pre-roll before the first sound and a 0.5s tail after the last so
-    attacks and reverb decays aren't clipped.
+    0.2s pre-roll before the first sound and a 1.0s tail after the last so
+    attacks and reverb decays aren't clipped. The trailing edge uses a much
+    quieter threshold than the leading one: a final chord's pedal ring decays
+    below -34 dB while still clearly audible, and cutting there chops the
+    ring (leading stays at -34 dB so room hiss doesn't drag the start early).
     """
     import numpy as np
     import soundfile as sf
@@ -204,8 +207,10 @@ def detect_dead_space(audio_path):
     loud = np.where(np.abs(mono) > peak * 0.02)[0]
     if len(loud) == 0:
         return 0.0, total
+    # ~-46 dB for the tail: quiet enough to keep the audible ring-out
+    quiet = np.where(np.abs(mono) > peak * 0.005)[0]
     start = max(0.0, loud[0] / float(sr) - 0.2)
-    end = min(total, loud[-1] / float(sr) + 0.5)
+    end = min(total, quiet[-1] / float(sr) + 1.0)
     return round(start, 3), round(end, 3)
 
 

@@ -1273,7 +1273,11 @@ def build_disk_from_midi(payload: dict = Body(...)):
 
 def _trim_events_window(events, abs_start, abs_end):
     """Cut events to absolute-time [abs_start, abs_end] and shift so the window
-    starts at 0. Drops anything wholly outside; clips events straddling an edge."""
+    starts at 0. Drops anything wholly outside; clips events straddling the
+    start edge. Events straddling the END keep their full offset — chopping
+    the final chord's note/pedal tails at the trim line cuts the ring-out
+    audibly on the piano (the Disklavier re-creates the ring live, so tails
+    past the trimmed audio cost nothing)."""
     def cut(items):
         out = []
         for it in items:
@@ -1284,8 +1288,7 @@ def _trim_events_window(events, abs_start, abs_end):
             if abs_end is not None and onset >= abs_end:
                 continue                      # entirely after the window
             new_on = max(0.0, onset - abs_start)
-            hi = offset if abs_end is None else min(offset, abs_end)
-            new_off = hi - abs_start
+            new_off = offset - abs_start
             if new_off <= new_on:
                 continue
             clone = dict(it)
@@ -1330,7 +1333,9 @@ def _regen_from_originals(job, job_dir, abs_start, abs_end):
     with open(os.path.join(job_dir, "events.json"), "w") as f:
         json.dump(trimmed, f)
 
-    # piano stem, cut from the pristine full-length copy
+    # piano stem, cut from the pristine full-length copy. The cut extends past
+    # abs_end to the last kept event offset so the ring-out's audio survives
+    # for later Verify passes (events keep their tails past the trim line).
     stem_orig = job.get("pianoStemOrig")
     piano_stem = job.get("pianoStem")
     if stem_orig and piano_stem:
@@ -1338,7 +1343,13 @@ def _regen_from_originals(job, job_dir, abs_start, abs_end):
         if os.path.exists(src):
             data, sr = sf.read(src)
             lo = int(abs_start * sr)
-            hi = len(data) if abs_end is None else min(len(data), int(abs_end * sr))
+            if abs_end is None:
+                hi = len(data)
+            else:
+                tails = [e["offset"] for e in
+                         trimmed["notes"] + trimmed["pedals"]]
+                keep_end = abs_start + max(tails) if tails else abs_end
+                hi = min(len(data), int(max(abs_end, keep_end) * sr))
             sf.write(os.path.join(job_dir, piano_stem), data[lo:hi], sr)
 
     # accompaniment, re-encoded from the never-cut no_piano stem
