@@ -37,6 +37,9 @@ collect_all = [
 hidden = [
     'app.job_runner',   # multiprocessing spawn target
     'librosa', 'scipy', 'sklearn', 'soundfile', 'mido', 'yt_dlp',
+    # OMR per-page fallback modules + pypdf (imported inside the sheet pipeline)
+    'app.omr', 'app.sheet_pipeline', 'app.sheet_routes',
+    'app.musicxml_merge', 'app.sheet_to_events', 'pypdf',
 ]
 
 args = [

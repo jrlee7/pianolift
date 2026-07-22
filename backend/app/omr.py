@@ -9,6 +9,12 @@ the export of all pages), so on whole-book failure we fall back to splitting
 the PDF and recognizing page by page: unreadable pages are skipped with a
 warning and the surviving pages are merged back into one score
 (musicxml_merge.py).
+
+Image-based (scanned) PDFs skip the whole-book path entirely and go
+straight to per-page recognition on *preprocessed* page images
+(page_image.py) — cleaning/upscaling the embedded scan measurably improves
+Audiveris' note and rhythm reading over letting it rasterize a noisy
+low-DPI JPEG itself.
 """
 
 import glob
@@ -20,6 +26,7 @@ from pypdf import PdfReader, PdfWriter
 
 from . import musicxml_io as mxml
 from . import musicxml_merge
+from . import page_image
 
 _CANDIDATE_PATHS = [
     r"C:\Program Files\Audiveris\Audiveris.exe",
@@ -118,22 +125,38 @@ def run_omr(pdf_path, out_dir, timeout=900, on_progress=None):
             "and try again.")
     os.makedirs(out_dir, exist_ok=True)
 
-    produced = _run_audiveris(exe, pdf_path, out_dir, timeout)
-    if produced is not None:
-        return produced, []
-    return _run_paged(exe, pdf_path, out_dir, on_progress)
-
-
-def _run_paged(exe, pdf_path, out_dir, on_progress):
-    """Per-page fallback: split the PDF, recognize each page in its own
-    Audiveris run, merge whatever succeeded. Returns (path, warnings)."""
+    # A scanned PDF reads much better page-by-page on cleaned images than as
+    # a whole-book raster, so skip straight to the preprocessed per-page
+    # path. Native/vector PDFs take the fast whole-book path first.
     try:
         reader = PdfReader(pdf_path)
+        scanned = page_image.is_scanned_pdf(reader)
+    except Exception:
+        reader, scanned = None, False
+
+    if not scanned:
+        produced = _run_audiveris(exe, pdf_path, out_dir, timeout)
+        if produced is not None:
+            return produced, []
+    return _run_paged(exe, pdf_path, out_dir, on_progress, reader=reader,
+                      preprocess=scanned)
+
+
+def _run_paged(exe, pdf_path, out_dir, on_progress, reader=None,
+               preprocess=False):
+    """Per-page fallback: recognize each page in its own Audiveris run and
+    merge whatever succeeded. When `preprocess` is set, each page is cleaned
+    into an upscaled binarized PNG first (page_image.py) for sharper
+    recognition; otherwise Audiveris rasterizes a split-out page PDF.
+    Returns (path, warnings)."""
+    try:
+        if reader is None:
+            reader = PdfReader(pdf_path)
         total = len(reader.pages)
     except Exception as e:
         raise OmrError("Could not read the PDF file: " + str(e))
 
-    if total <= 1:
+    if total < 1:
         raise OmrError(
             "Recognition failed — the page may not be readable as music "
             "notation (make sure it's an actual PDF containing sheet music, "
@@ -152,18 +175,27 @@ def _run_paged(exe, pdf_path, out_dir, on_progress):
                 on_progress(page_no, total)
             except Exception:
                 pass
-        page_pdf = os.path.join(pages_dir, "page%d.pdf" % page_no)
         page_out = os.path.join(pages_dir, "out%d" % page_no)
-        try:
-            writer = PdfWriter()
-            writer.add_page(reader.pages[i])
-            with open(page_pdf, "wb") as f:
-                writer.write(f)
-        except Exception:
-            warnings.append("Page %d couldn't be split out of the PDF — "
-                            "skipped." % page_no)
-            continue
-        produced = _run_audiveris(exe, page_pdf, page_out, PAGE_TIMEOUT)
+        page_input = None
+        if preprocess:
+            png = os.path.join(pages_dir, "page%d.png" % page_no)
+            if page_image.preprocess_page(reader, i, png):
+                page_input = png
+        if page_input is None:
+            # Vector page, or preprocessing didn't find a dominant image:
+            # let Audiveris rasterize the split-out single-page PDF.
+            page_pdf = os.path.join(pages_dir, "page%d.pdf" % page_no)
+            try:
+                writer = PdfWriter()
+                writer.add_page(reader.pages[i])
+                with open(page_pdf, "wb") as f:
+                    writer.write(f)
+                page_input = page_pdf
+            except Exception:
+                warnings.append("Page %d couldn't be split out of the PDF — "
+                                "skipped." % page_no)
+                continue
+        produced = _run_audiveris(exe, page_input, page_out, PAGE_TIMEOUT)
         if produced is None:
             warnings.append("Page %d couldn't be read (recognition error) — "
                             "skipped." % page_no)
