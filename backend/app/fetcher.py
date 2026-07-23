@@ -16,6 +16,10 @@ import subprocess
 
 from . import pipeline
 
+# Extra seconds downloaded past a chapter's end so the final chord's pedal
+# ring-out (which decays across the chapter boundary) reaches transcription.
+RING_PAD_SEC = 4.0
+
 
 def probe_chapters(url):
     """Return (title, [{"title", "start", "end"}, ...]) for `url` without
@@ -62,7 +66,11 @@ def download_audio(url, job_dir, progress_cb, include_video=False,
     kept video file's basename (include_video=True), else None.
 
     section=(start, end) seconds restricts the download to that slice of the
-    source (used to split an album-as-one-video into per-chapter jobs)."""
+    source (used to split an album-as-one-video into per-chapter jobs). The
+    slice is padded past `end` by RING_PAD_SEC so the final chord's pedal
+    ring-out — which crosses the chapter boundary — is present in the audio
+    for transcription; the pipeline caps the export window at the unpadded
+    boundary so any next-track notes caught in the pad never play."""
     import yt_dlp  # lazy: heavy import, keeps server startup fast
     from yt_dlp.utils import download_range_func
 
@@ -91,7 +99,8 @@ def download_audio(url, job_dir, progress_cb, include_video=False,
     }
     if section:
         start, end = section
-        opts["download_ranges"] = download_range_func(None, [(start, end)])
+        opts["download_ranges"] = download_range_func(
+            None, [(start, end + RING_PAD_SEC)])
         opts["force_keyframes_at_cuts"] = True
     if include_video:
         # Best video+audio muxed into mp4 (Chromium-playable, incl. vp9).

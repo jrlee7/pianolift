@@ -62,7 +62,14 @@ def run_job_process(job_dir, kind, source, piano_only, q, include_video=False,
                 # New input filename, no title change (None keeps the name).
                 q.put(("meta", os.path.basename(audio_path), None, video_name))
 
-        result = pipeline.run_job(job_dir, audio_path, cb, piano_only=piano_only)
+        # Album-split jobs download RING_PAD_SEC past the chapter boundary so
+        # the last chord's ring-out is transcribed; cap the export window at
+        # the unpadded chapter length so next-track notes in the pad never
+        # play (their tails-only survive via the non-destructive trim).
+        max_end_sec = section[1] - section[0] if section else None
+        result = pipeline.run_job(job_dir, audio_path, cb,
+                                  piano_only=piano_only,
+                                  max_end_sec=max_end_sec)
 
         # Kept video + a real separation ran: swap its soundtrack for the
         # piano-removed stem so the TV plays the backing track and the

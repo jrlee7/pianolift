@@ -405,12 +405,18 @@ def _decode_piano_only(audio_path, job_dir, progress_cb):
     return out
 
 
-def run_job(job_dir, audio_path, progress_cb, piano_only=False):
-    """Full pipeline. Writes events.json and output.mid into job_dir."""
+def run_job(job_dir, audio_path, progress_cb, piano_only=False,
+            max_end_sec=None):
+    """Full pipeline. Writes events.json and output.mid into job_dir.
+
+    max_end_sec: the song's true end within the audio (album-split jobs pad
+    the download past the chapter boundary for ring-out; see fetcher
+    RING_PAD_SEC). Caps the non-destructive trim window so notes struck
+    after the boundary never play, while tails crossing it survive."""
     if piano_only:
         piano_wav = _decode_piano_only(audio_path, job_dir, progress_cb)
         accompaniment, encoder_delay_ms = None, 0.0
-        trim_start, trim_end = 0.0, None
+        trim_start, trim_end = 0.0, max_end_sec
     else:
         progress_cb("separating", 0)
         piano_wav = separate_piano(audio_path, job_dir, progress_cb)
@@ -420,6 +426,9 @@ def run_job(job_dir, audio_path, progress_cb, piano_only=False):
             raise RuntimeError("Separator finished but no_piano stem not found")
 
         trim_start, trim_end = detect_dead_space(audio_path)
+        if max_end_sec is not None and (trim_end is None
+                                        or trim_end > max_end_sec):
+            trim_end = max_end_sec
         # A near-silent no_piano stem means the song is really piano-only:
         # skip the accompaniment MP3 entirely (nothing to play through the
         # ENSPIRE speakers, nothing worth uploading to the cloud library).

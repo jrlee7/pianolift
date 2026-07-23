@@ -495,6 +495,43 @@ export default function NoteEditor({
       ' — Play both to compare, Ctrl+Z to undo, Save edits to keep.')
   }
 
+  // Extend the song's ending so the last chord rings out instead of cutting
+  // off (album-split tracks lose the ring past the chapter boundary). Pushes
+  // the final pedal segment and the last-sounding notes 2s later; repeat
+  // clicks stack.
+  const RING_SEC = 2
+  const RING_WINDOW = 0.75  // events ending within this of the end count
+
+  function letRing() {
+    const ev = eventsRef.current
+    let maxOff = 0
+    for (let i = 0; i < ev.notes.length; i++) {
+      if (ev.notes[i].offset > maxOff) maxOff = ev.notes[i].offset
+    }
+    for (let i = 0; i < ev.pedals.length; i++) {
+      if (ev.pedals[i].offset > maxOff) maxOff = ev.pedals[i].offset
+    }
+    if (maxOff === 0) return
+    let changed = 0
+    const notes = ev.notes.map(function (n) {
+      if (n.offset < maxOff - RING_WINDOW) return n
+      changed++
+      return { _id: n._id, onset: n.onset, offset: n.offset + RING_SEC,
+               pitch: n.pitch, velocity: n.velocity }
+    })
+    const pedals = ev.pedals.map(function (p) {
+      if (p.offset < maxOff - RING_WINDOW) return p
+      changed++
+      return { _id: p._id, onset: p.onset, offset: p.offset + RING_SEC }
+    })
+    if (changed === 0) return
+    pushUndo()
+    commit(notes, pedals)
+    setCapMsg('Extended the ending by ' + RING_SEC + 's (' + changed +
+      ' event' + (changed === 1 ? '' : 's') +
+      ') — click again for more, Ctrl+Z to undo, Save edits to keep.')
+  }
+
   // ---------- hit testing ----------
 
   function noteAt(x, y) {
@@ -1171,6 +1208,11 @@ export default function NoteEditor({
             title="Shorten notes held longer than a real piano string can ring (bass ~30s → treble ~1s). Undoable — Play both to hear before/after."
             onClick={capLongNotes}>
             ⭰ Cap long notes
+          </button>
+          <button className="tool"
+            title="Let the last chord ring out: extends the final pedal + last notes by 2s. Click again to add more. For songs whose ending cuts off (e.g. album/playlist tracks)."
+            onClick={letRing}>
+            🔔 Let ring +2s
           </button>
         </div>
         {selCount > 0 && (
