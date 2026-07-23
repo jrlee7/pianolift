@@ -1,7 +1,7 @@
 {
   "name": "pianoforge",
   "private": true,
-  "version": "0.1.10",
+  "version": "0.1.11",
   "repository": "github:jrlee7/pianolift",
   "type": "module",
   "main": "main.js",
