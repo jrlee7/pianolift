@@ -196,6 +196,18 @@ button.tool.danger { color: var(--red); border-color: #5a3038; }
 }
 .ghost-msg { color: var(--accent); }
 
+/* "Let ring +[n]s" — the seconds box sits flush against its button so the
+   pair reads as one control in the toolbar. */
+.ring-field {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 12px; color: var(--muted);
+}
+.ring-field input[type="number"] {
+  width: 52px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 5px;
+  padding: 3px 6px; font-size: 12px;
+}
+
 .editor-bar.vel-row {
   font-size: 12px; color: var(--muted); gap: 12px;
 }

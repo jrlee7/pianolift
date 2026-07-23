@@ -146,6 +146,7 @@ export default function NoteEditor({
   const [rampFrom, setRampFrom] = useState(60)
   const [rampTo, setRampTo] = useState(100)
   const [speedPct, setSpeedPct] = useState(100)
+  const [ringSec, setRingSec] = useState(3)
 
   const canvasRef = useRef(null)
   const keyboardRef = useRef(null)
@@ -497,12 +498,12 @@ export default function NoteEditor({
 
   // Extend the song's ending so the last chord rings out instead of cutting
   // off (album-split tracks lose the ring past the chapter boundary). Pushes
-  // the final pedal segment and the last-sounding notes 2s later; repeat
-  // clicks stack.
-  const RING_SEC = 2
+  // the final pedal segment and the last-sounding notes later by ringSec;
+  // repeat clicks stack.
   const RING_WINDOW = 0.75  // events ending within this of the end count
 
   function letRing() {
+    const secs = Math.min(30, Math.max(0.5, Number(ringSec) || 0))
     const ev = eventsRef.current
     let maxOff = 0
     for (let i = 0; i < ev.notes.length; i++) {
@@ -516,18 +517,18 @@ export default function NoteEditor({
     const notes = ev.notes.map(function (n) {
       if (n.offset < maxOff - RING_WINDOW) return n
       changed++
-      return { _id: n._id, onset: n.onset, offset: n.offset + RING_SEC,
+      return { _id: n._id, onset: n.onset, offset: n.offset + secs,
                pitch: n.pitch, velocity: n.velocity }
     })
     const pedals = ev.pedals.map(function (p) {
       if (p.offset < maxOff - RING_WINDOW) return p
       changed++
-      return { _id: p._id, onset: p.onset, offset: p.offset + RING_SEC }
+      return { _id: p._id, onset: p.onset, offset: p.offset + secs }
     })
     if (changed === 0) return
     pushUndo()
     commit(notes, pedals)
-    setCapMsg('Extended the ending by ' + RING_SEC + 's (' + changed +
+    setCapMsg('Extended the ending by ' + secs + 's (' + changed +
       ' event' + (changed === 1 ? '' : 's') +
       ') — click again for more, Ctrl+Z to undo, Save edits to keep.')
   }
@@ -1209,11 +1210,12 @@ export default function NoteEditor({
             onClick={capLongNotes}>
             ⭰ Cap long notes
           </button>
-          <button className="tool"
-            title="Let the last chord ring out: extends the final pedal + last notes by 2s. Click again to add more. For songs whose ending cuts off (e.g. album/playlist tracks)."
-            onClick={letRing}>
-            🔔 Let ring +2s
-          </button>
+          <label className="ring-field"
+            title="Let the last chord ring out: extends the final pedal + last notes by this many seconds. Click again to add more. For songs whose ending cuts off (e.g. album/playlist tracks).">
+            <button className="tool" onClick={letRing}>🔔 Let ring +</button>
+            <input type="number" min="0.5" max="30" step="0.5" value={ringSec}
+              onChange={function (e) { setRingSec(e.target.value) }} />s
+          </label>
         </div>
         {selCount > 0 && (
           <div className="tool-group">
