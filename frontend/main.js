@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, dialog, session, shell } from 'electron'
-import { spawn } from 'child_process'
+import { spawn, spawnSync } from 'child_process'
 import { writeFile, mkdir, readdir, readFile, rm } from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -186,6 +186,9 @@ ipcMain.handle('lib-delete', async (_e, id) => {
 
 let mainWindow
 let backendProcess
+// True once the OS has reaped the spawned process. After that its pid may be
+// recycled, so stopBackend() must never hand it to taskkill.
+let backendExited = false
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -256,6 +259,42 @@ function startBackend() {
   backendProcess.on('error', (err) => {
     console.error('Backend failed:', err)
   })
+  backendProcess.on('exit', () => {
+    backendExited = true
+  })
+}
+
+// Shut the backend down on quit. backend.exe is a PyInstaller *onefile* build
+// (backend/build_exe.py, --onefile), so the process we spawn is only the
+// bootloader: it extracts to %TEMP%\_MEIxxxxx and runs the real uvicorn server
+// as a child, which in turn spawns job workers. backendProcess.kill() reaps the
+// bootloader alone and leaves that grandchild alive still bound to :8000 — the
+// next launch then talks to a stale server instead of the one it just started.
+// Kill the whole tree instead. Idempotent: quit fires both window-all-closed
+// and before-quit, and either may run after the backend already died.
+function stopBackend() {
+  if (!backendProcess) return
+  const proc = backendProcess
+  backendProcess = null
+  // Already reaped (crashed on boot, exe missing, killed by hand) — nothing to
+  // do, and the pid may belong to somebody else by now.
+  if (backendExited || proc.exitCode !== null || proc.signalCode !== null) return
+
+  if (process.platform === 'win32') {
+    // /T walks the child tree, /F because a windowsHide'd console app gets no
+    // Ctrl+C. spawnSync so the kill completes before Electron tears us down.
+    const res = spawnSync('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { windowsHide: true })
+    // 128 = "process not found", i.e. it exited between the check and here.
+    if (res.error || (res.status !== 0 && res.status !== 128)) {
+      console.error('taskkill on backend pid', proc.pid, 'failed:',
+        res.error || (res.stderr && res.stderr.toString().trim()) || 'status ' + res.status)
+      proc.kill() // best-effort fallback
+    }
+  } else {
+    // Dev/posix path spawns `python -m uvicorn` directly — that process *is*
+    // the server, so a plain kill is enough.
+    proc.kill()
+  }
 }
 
 app.on('ready', () => {
@@ -294,12 +333,16 @@ function checkForUpdates() {
 }
 
 app.on('window-all-closed', () => {
-  if (backendProcess) {
-    backendProcess.kill()
-  }
+  stopBackend()
   if (process.platform !== 'darwin') {
     app.quit()
   }
+})
+
+// Also covers quits that never close a window first (Cmd+Q on macOS, the
+// updater's quitAndInstall, a taskbar Quit).
+app.on('before-quit', () => {
+  stopBackend()
 })
 
 app.on('activate', () => {
