@@ -185,33 +185,27 @@ def ensure_wav_input(audio_path, job_dir, progress_cb, keep_original=False):
 
 
 def detect_dead_space(audio_path):
-    """Find leading/trailing silence in the original mix.
+    """Find leading silence in the original mix.
 
     Returns (trim_start_sec, trim_end_sec) in the original timeline, with a
-    0.2s pre-roll before the first sound and a 1.0s tail after the last so
-    attacks and reverb decays aren't clipped. The trailing edge uses a much
-    quieter threshold than the leading one: a final chord's pedal ring decays
-    below -34 dB while still clearly audible, and cutting there chops the
-    ring (leading stays at -34 dB so room hiss doesn't drag the start early).
+    0.2s pre-roll before the first sound. No automatic trailing cut: any
+    quiet-tail threshold reliably chops ring-out on some recordings, so the
+    end is left full-length for the user to trim manually if they want to.
     """
     import numpy as np
     import soundfile as sf
 
     data, sr = sf.read(audio_path)
     mono = data.mean(axis=1) if data.ndim > 1 else data
-    total = len(mono) / float(sr)
     peak = float(np.max(np.abs(mono)))
     if peak <= 0:
-        return 0.0, total
+        return 0.0, None
     # ~-34 dB below the track's own peak counts as "sound"
     loud = np.where(np.abs(mono) > peak * 0.02)[0]
     if len(loud) == 0:
-        return 0.0, total
-    # ~-46 dB for the tail: quiet enough to keep the audible ring-out
-    quiet = np.where(np.abs(mono) > peak * 0.005)[0]
+        return 0.0, None
     start = max(0.0, loud[0] / float(sr) - 0.2)
-    end = min(total, quiet[-1] / float(sr) + 1.0)
-    return round(start, 3), round(end, 3)
+    return round(start, 3), None
 
 
 def has_real_accompaniment(no_piano_wav, piano_wav):
