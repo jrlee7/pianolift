@@ -385,6 +385,8 @@ def list_removable_drives():
         drives.append({
             "root": root,
             "label": label_buf.value or "USB drive",
+            "fileSystem": fs_buf.value,
+            "totalBytes": total.value,
             "freeBytes": free.value,
             "isGotek": _slot_count(root) >= GOTEK_MIN_SLOTS,
         })

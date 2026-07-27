@@ -18,6 +18,8 @@ import {
   listSheetJobs, uploadSheet
 } from './api.js'
 import ChapterSplitModal from './components/ChapterSplitModal.jsx'
+import DiskTitlesModal from './components/DiskTitlesModal.jsx'
+import UsbPrepareModal from './components/UsbPrepareModal.jsx'
 import {
   firebaseReady, saveSong, saveSourceUrl, listSongs, isSameSong, findExistingSong,
   onAuth, getAccount, isFamilyUser, signOut, recordConversion
@@ -60,6 +62,12 @@ export default function App() {
   const [selected, setSelected] = useState(function () { return new Set() })
   const [batch, setBatch] = useState(null) // null | { done, total, verb }
   const [batchResult, setBatchResult] = useState(null)
+  // null | { mode: 'write'|'download', jobs: [...] } — the title editor shown
+  // before an .hfe is built.
+  const [diskPrompt, setDiskPrompt] = useState(null)
+  // Blank-USB formatter. Opened from either tab's "no Gotek stick" dead end,
+  // as well as from the Disk tab.
+  const [prepareUsb, setPrepareUsb] = useState(false)
   const [search, setSearch] = useState('')
   // Play tab target: {jobId} (Convert song) or {libSong} (library song).
   // A fresh object per click so PlayerView re-targets even for the same song.
@@ -484,34 +492,25 @@ export default function App() {
   // Pack every selected finished song onto ONE floppy image (many songs per
   // Gotek slot, instead of one song per slot). Writes to the next free slot by
   // default, or a slot the user names — overwriting an occupied one on confirm.
-  async function handleBuildDisk() {
+  function handleBuildDisk() {
     const chosen = chosenJobs()
     if (!chosen.length) return
-    const raw = window.prompt(
-      'Write ' + chosen.length + ' song' + (chosen.length === 1 ? '' : 's') +
-      ' onto ONE floppy slot.\n\n' +
-      'Gotek slot number to write, or leave blank for the next free slot:', '')
-    if (raw === null) return // cancelled
-    const t = raw.trim()
-    let slot = null
-    if (t !== '') {
-      slot = parseInt(t, 10)
-      if (Number.isNaN(slot) || slot < 0 || slot > 999) {
-        alert('Slot must be a number 0–999 (or blank for the next free slot).')
-        return
-      }
-    }
+    setDiskPrompt({ mode: 'write', jobs: chosen })
+  }
+
+  async function writeDisk(chosen, titles, slot) {
     const ids = chosen.map(function (j) { return j.id })
     setBatchResult(null)
     setBatch({ done: 0, total: chosen.length, verb: 'Building' })
     try {
       let res
       try {
-        res = await buildDiskFromJobs(ids, { slot: slot })
+        res = await buildDiskFromJobs(ids, { slot: slot, titles: titles })
       } catch (e) {
         if (e.status === 409 &&
           confirm('Slot ' + slot + ' already holds a song. Overwrite it?')) {
-          res = await buildDiskFromJobs(ids, { slot: slot, overwrite: true })
+          res = await buildDiskFromJobs(ids, {
+            slot: slot, titles: titles, overwrite: true })
         } else {
           throw e
         }
@@ -525,10 +524,13 @@ export default function App() {
       })
       clearSelection()
     } catch (e) {
+      const msg = e.message || String(e)
       setBatch(null)
       setBatchResult({
-        verb: 'Wrote', ok: 0, total: chosen.length,
-        errors: [e.message || String(e)]
+        verb: 'Wrote', ok: 0, total: chosen.length, errors: [msg],
+        // Nothing to write to: offer to build an emulator stick out of a
+        // blank USB rather than dead-ending on the error.
+        noStick: /no gotek/i.test(msg)
       })
     }
   }
@@ -561,14 +563,19 @@ export default function App() {
 
   // Same multi-song floppy image, but hand back the .hfe file to save/drop on
   // the stick manually (no plugged-in Gotek required).
-  async function handleDownloadDisk() {
+  function handleDownloadDisk() {
     const chosen = chosenJobs()
     if (!chosen.length) return
+    setDiskPrompt({ mode: 'download', jobs: chosen })
+  }
+
+  async function downloadDisk(chosen, titles) {
     const ids = chosen.map(function (j) { return j.id })
     setBatchResult(null)
     setBatch({ done: 0, total: chosen.length, verb: 'Building' })
     try {
-      const blob = await buildDiskFromJobs(ids, { download: true })
+      const blob = await buildDiskFromJobs(ids, {
+        download: true, titles: titles })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
@@ -614,6 +621,10 @@ export default function App() {
               </span>)}
           <button className="ghost acct-signout" onClick={function () { signOut() }}>Sign out</button>
         </div>
+      )}
+
+      {prepareUsb && (
+        <UsbPrepareModal onClose={function () { setPrepareUsb(false) }} />
       )}
 
       <div className="tabs">
@@ -663,6 +674,22 @@ export default function App() {
               onConfirm={handleSplitConfirm}
               onSingle={handleSplitSingle}
               onCancel={function () { setSplitPrompt(null) }}
+            />
+          )}
+          {diskPrompt && (
+            <DiskTitlesModal
+              mode={diskPrompt.mode}
+              items={diskPrompt.jobs.map(function (j) {
+                return { key: j.id, title: j.name || 'Song' }
+              })}
+              onCancel={function () { setDiskPrompt(null) }}
+              onConfirm={async function (r) {
+                const jobs = diskPrompt.jobs
+                const mode = diskPrompt.mode
+                setDiskPrompt(null)
+                if (mode === 'write') await writeDisk(jobs, r.titles, r.slot)
+                else await downloadDisk(jobs, r.titles)
+              }}
             />
           )}
 
@@ -735,6 +762,18 @@ export default function App() {
                   Failed: {batchResult.errors.join('; ')}
                 </div>
               )}
+              {batchResult.noStick && (
+                <div style={{ marginTop: 8 }}>
+                  <button className="primary"
+                    onClick={function () { setPrepareUsb(true) }}>
+                    🖫 Prepare a blank USB
+                  </button>
+                  <span className="meta" style={{ marginLeft: 8 }}>
+                    Turns an empty FAT32 stick into an emulator stick the piano
+                    reads, then try the write again.
+                  </span>
+                </div>
+              )}
             </div>
           )}
 
@@ -771,6 +810,7 @@ export default function App() {
                   }}
                   onDeleted={refresh}
                   onCleaned={refresh}
+                  onRenamed={refresh}
                   selected={selected.has(job.id)}
                   onSelectToggle={toggleSelect}
                 />

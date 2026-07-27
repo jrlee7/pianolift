@@ -137,6 +137,19 @@ export async function saveJobSettings(id, settings) {
   return res.json()
 }
 
+export async function renameJob(id, name) {
+  const res = await fetch(BASE + '/jobs/' + id + '/name', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name })
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(function () { return {} })
+    throw new Error(data.detail || 'Rename failed')
+  }
+  return res.json()
+}
+
 export async function resetEvents(id) {
   const res = await fetch(BASE + '/jobs/' + id + '/events/reset', {
     method: 'POST'
@@ -226,6 +239,48 @@ export async function getGotekCatalog() {
 export async function getUsbStatus() {
   const res = await fetch(BASE + '/usb')
   if (!res.ok) throw new Error('USB status failed')
+  return res.json()
+}
+
+// --- Preparing a blank stick as a Gotek/Nalbantov emulator stick ----------
+// A new USB is just empty FAT32; the piano sees nothing until the HxC config
+// and a blank DSKAxxxx.hfe per slot are on it. Writing ~2GB takes minutes, so
+// the backend runs it on a thread and we poll.
+
+// Dry run. Returns { ok, blockers[], warnings[], needsForce, ... } — warnings
+// list data that would be destroyed, and require force on the real call.
+export async function checkUsbPrepare(drive, slots) {
+  const params = new URLSearchParams({ drive: drive, slots: String(slots) })
+  const res = await fetch(BASE + '/usb/prepare/check?' + params.toString())
+  const data = await res.json().catch(function () { return {} })
+  if (!res.ok) throw new Error(data.detail || 'USB check failed')
+  return data
+}
+
+export async function startUsbPrepare(drive, slots, force) {
+  const res = await fetch(BASE + '/usb/prepare', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ drive: drive, slots: slots, force: Boolean(force) })
+  })
+  const data = await res.json().catch(function () { return {} })
+  if (!res.ok) {
+    const err = new Error(data.detail || 'USB prepare failed')
+    err.status = res.status
+    throw err
+  }
+  return data
+}
+
+export async function getUsbPrepareStatus() {
+  const res = await fetch(BASE + '/usb/prepare/status')
+  if (!res.ok) throw new Error('USB prepare status failed')
+  return res.json()
+}
+
+export async function cancelUsbPrepare() {
+  const res = await fetch(BASE + '/usb/prepare/cancel', { method: 'POST' })
+  if (!res.ok) throw new Error('Cancel failed')
   return res.json()
 }
 
@@ -345,10 +400,13 @@ async function saveDiskResult(res) {
 
 // Build one floppy from converted jobs. jobIds render in the given order
 // (song 01, 02, …). Pass { download: true } to get the .hfe as a Blob.
+// `opts.titles` (same order/length) renames the songs on the piano's display
+// without touching the job names.
 export async function buildDiskFromJobs(jobIds, opts) {
   const o = opts || {}
   const res = await postDisk('/disk/build', {
-    jobIds: jobIds, slot: o.slot != null ? o.slot : null,
+    jobIds: jobIds, titles: o.titles || null,
+    slot: o.slot != null ? o.slot : null,
     overwrite: Boolean(o.overwrite), download: Boolean(o.download)
   })
   if (o.download) {

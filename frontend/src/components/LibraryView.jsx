@@ -4,6 +4,8 @@ import {
   listFolders, createFolder, deleteFolder, setSongFolder
 } from '../firebase.js'
 import { importFromLibrary, buildDiskFromLibrary } from '../api.js'
+import DiskTitlesModal from './DiskTitlesModal.jsx'
+import UsbPrepareModal from './UsbPrepareModal.jsx'
 
 function millis(song) {
   return song.createdAt && song.createdAt.toMillis ? song.createdAt.toMillis() : 0
@@ -52,6 +54,11 @@ export default function LibraryView({ onEdit, onWatch }) {
   const [selected, setSelected] = useState(function () { return new Set() })
   const [copying, setCopying] = useState(null) // null | { done, total }
   const [copyResult, setCopyResult] = useState(null)
+  // null | { mode: 'write'|'download', songs: [...] } — title editor shown
+  // before the .hfe is built.
+  const [diskPrompt, setDiskPrompt] = useState(null)
+  // Blank-USB formatter, offered when a disk write finds no emulator stick.
+  const [prepareUsb, setPrepareUsb] = useState(false)
 
   async function refresh() {
     setLoading(true)
@@ -295,29 +302,26 @@ export default function LibraryView({ onEdit, onWatch }) {
   // (many songs per Gotek slot). Songs are stored as baked MIDI; the backend
   // decodes each and renders E-SEQ. Writes to the next free slot by default, or
   // a slot the user names — overwriting an occupied one on confirm.
-  async function handleBuildDisk() {
+  // Selected songs that actually carry MIDI, or null (with a nag) if none do.
+  function diskCandidates() {
     const chosen = songs.filter(function (s) { return selected.has(s.id) })
     const withMidi = chosen.filter(function (s) { return s.midiBase64 })
     if (!withMidi.length) {
       alert('None of the selected songs have stored MIDI to put on a disk.')
-      return
+      return null
     }
-    const raw = window.prompt(
-      'Write ' + withMidi.length + ' song' + (withMidi.length === 1 ? '' : 's') +
-      ' onto ONE floppy slot.\n\n' +
-      'Gotek slot number to write, or leave blank for the next free slot:', '')
-    if (raw === null) return
-    const t = raw.trim()
-    let slot = null
-    if (t !== '') {
-      slot = parseInt(t, 10)
-      if (Number.isNaN(slot) || slot < 0 || slot > 999) {
-        alert('Slot must be a number 0–999 (or blank for the next free slot).')
-        return
-      }
-    }
-    const payload = withMidi.map(function (s) {
-      return { name: s.title, midiBase64: s.midiBase64, settings: s.settings }
+    return withMidi
+  }
+
+  function handleBuildDisk() {
+    const withMidi = diskCandidates()
+    if (!withMidi) return
+    setDiskPrompt({ mode: 'write', songs: withMidi })
+  }
+
+  async function writeDisk(withMidi, titles, slot) {
+    const payload = withMidi.map(function (s, i) {
+      return { name: titles[i], midiBase64: s.midiBase64, settings: s.settings }
     })
     setCopyResult(null)
     setCopying({ done: 0, total: withMidi.length, disk: true })
@@ -341,22 +345,28 @@ export default function LibraryView({ onEdit, onWatch }) {
       })
       clearSelection()
     } catch (e) {
+      const msg = e.message || String(e)
       setCopying(null)
-      setCopyResult({ ok: 0, total: withMidi.length, errors: [e.message || String(e)] })
+      // Nothing to write to: offer to build an emulator stick out of a blank
+      // USB rather than dead-ending on the error.
+      setCopyResult({
+        ok: 0, total: withMidi.length, errors: [msg],
+        noStick: /no gotek/i.test(msg)
+      })
     }
   }
 
   // Same multi-song floppy image, downloaded as a .hfe file to place on the
   // stick manually (no plugged-in Gotek required).
-  async function handleDownloadDisk() {
-    const chosen = songs.filter(function (s) { return selected.has(s.id) })
-    const withMidi = chosen.filter(function (s) { return s.midiBase64 })
-    if (!withMidi.length) {
-      alert('None of the selected songs have stored MIDI to put on a disk.')
-      return
-    }
-    const payload = withMidi.map(function (s) {
-      return { name: s.title, midiBase64: s.midiBase64, settings: s.settings }
+  function handleDownloadDisk() {
+    const withMidi = diskCandidates()
+    if (!withMidi) return
+    setDiskPrompt({ mode: 'download', songs: withMidi })
+  }
+
+  async function downloadDisk(withMidi, titles) {
+    const payload = withMidi.map(function (s, i) {
+      return { name: titles[i], midiBase64: s.midiBase64, settings: s.settings }
     })
     setCopyResult(null)
     setCopying({ done: 0, total: withMidi.length, disk: true })
@@ -554,7 +564,40 @@ export default function LibraryView({ onEdit, onWatch }) {
               Failed: {copyResult.errors.join('; ')}
             </div>
           )}
+          {copyResult.noStick && (
+            <div style={{ marginTop: 8 }}>
+              <button className="primary"
+                onClick={function () { setPrepareUsb(true) }}>
+                🖫 Prepare a blank USB
+              </button>
+              <span className="meta" style={{ marginLeft: 8 }}>
+                Turns an empty FAT32 stick into an emulator stick the piano
+                reads, then try the write again.
+              </span>
+            </div>
+          )}
         </div>
+      )}
+
+      {prepareUsb && (
+        <UsbPrepareModal onClose={function () { setPrepareUsb(false) }} />
+      )}
+
+      {diskPrompt && (
+        <DiskTitlesModal
+          mode={diskPrompt.mode}
+          items={diskPrompt.songs.map(function (s) {
+            return { key: s.id, title: s.title || 'Song' }
+          })}
+          onCancel={function () { setDiskPrompt(null) }}
+          onConfirm={async function (r) {
+            const picked = diskPrompt.songs
+            const mode = diskPrompt.mode
+            setDiskPrompt(null)
+            if (mode === 'write') await writeDisk(picked, r.titles, r.slot)
+            else await downloadDisk(picked, r.titles)
+          }}
+        />
       )}
 
       {loading && <div className="meta">Loading…</div>}

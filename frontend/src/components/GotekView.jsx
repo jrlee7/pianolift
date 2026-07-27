@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { getGotekCatalog } from '../api.js'
+import UsbPrepareModal from './UsbPrepareModal.jsx'
 
 // Build a clean standalone HTML document and print it, so the printed catalog
 // is just the song list — no app chrome, tabs or buttons.
@@ -60,6 +61,7 @@ export default function GotekView() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [showEmpty, setShowEmpty] = useState(false)
+  const [prepare, setPrepare] = useState(false)
 
   async function load() {
     setLoading(true)
@@ -74,6 +76,12 @@ export default function GotekView() {
   }
 
   useEffect(function () { load() }, [])
+
+  const prepareModal = prepare && (
+    <UsbPrepareModal
+      onClose={function () { setPrepare(false) }}
+      onDone={load} />
+  )
 
   if (loading && !data) {
     return (
@@ -94,12 +102,25 @@ export default function GotekView() {
 
   if (data && !data.found) {
     return (
-      <div className="notice warn">
-        No Gotek/Nalbantov stick detected. Plug in the emulator USB stick (the
-        drive full of <code>DSKAxxxx.hfe</code> files) and hit Rescan.
-        <div style={{ marginTop: 10 }}>
-          <button onClick={load}>↻ Rescan</button>
+      <div>
+        <div className="notice warn">
+          No Gotek/Nalbantov stick detected. Plug in the emulator USB stick (the
+          drive full of <code>DSKAxxxx.hfe</code> files) and hit Rescan.
+          <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
+            <button onClick={load}>↻ Rescan</button>
+            <button className="primary"
+              onClick={function () { setPrepare(true) }}>
+              🖫 Prepare a blank USB
+            </button>
+          </div>
         </div>
+        <div className="notice">
+          Starting with an empty stick? “Prepare a blank USB” writes the
+          emulator layout onto it — the firmware config plus a blank
+          1995-Disklavier floppy in every slot — so the piano can read it and
+          the Convert and Library tabs can save songs to it.
+        </div>
+        {prepareModal}
       </div>
     )
   }
@@ -124,11 +145,18 @@ export default function GotekView() {
           Show empty slots
         </label>
         <button className="primary"
+          title="Turn another blank USB stick into an emulator stick the piano can read."
+          onClick={function () { setPrepare(true) }}>
+          🖫 Prepare a blank USB
+        </button>
+        <button className="primary"
           disabled={data.totalSongs === 0}
           onClick={function () { printCatalog(data, showEmpty) }}>
           🖨 Print catalog
         </button>
       </div>
+
+      {prepareModal}
 
       {shown.length === 0 && (
         <div className="notice">

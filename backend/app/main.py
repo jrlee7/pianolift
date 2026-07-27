@@ -31,7 +31,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import (pipeline, midi_writer, note_verify, eseq_writer, disk_writer,
                transkun_engine, auto_sync,
-               usb, job_runner)
+               usb, usb_prepare, job_runner)
 from . import sheet_routes, sheet_to_events
 from . import musicxml_io
 
@@ -748,6 +748,24 @@ def save_settings(job_id: str, payload: dict = Body(...)):
     return {"ok": True, "settings": settings}
 
 
+@app.put("/api/jobs/{job_id}/name")
+def rename_job(job_id: str, payload: dict = Body(...)):
+    """Rename a converted job. The name is the song's display title everywhere —
+    the job card, library-move, and (unless overridden in the disk dialog) the
+    E-SEQ title the piano shows. Whitespace-trimmed; empty names are rejected."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise HTTPException(400, "name must be a non-empty string")
+    name = name.strip()[:120]
+    with jobs_lock:
+        job["name"] = name
+        _persist(job_id)
+    return {"ok": True, "name": name}
+
+
 @app.post("/api/jobs/{job_id}/auto-sync")
 def auto_sync_job(job_id: str):
     """Cross-correlate the transcribed notes against the job's kept video's
@@ -998,6 +1016,53 @@ def drives_status():
     }
 
 
+# ------------------------------------------------------- prepare a blank USB
+# A brand-new stick is just FAT32 free space; the emulator needs the HxC
+# config plus a DSKAxxxx.hfe per slot before the piano sees any disk at all.
+# usb_prepare lays that down. It writes ~2GB, so the work runs on a worker
+# thread and the UI polls /api/usb/prepare/status.
+
+
+@app.get("/api/usb/prepare/check")
+def usb_prepare_check(drive: str, slots: int = usb_prepare.DEFAULT_SLOTS):
+    """Dry run: what preparing `drive` would cost and destroy. Nothing is
+    written. `blockers` means it cannot run; `warnings` means it needs
+    force=true because existing data would go."""
+    try:
+        return usb_prepare.inspect(drive, slots)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/usb/prepare")
+def usb_prepare_start(payload: dict = Body(...)):
+    """Format a blank stick into a Gotek/Nalbantov emulator stick.
+    Body: {drive:"G:\\", slots?:int, force?:bool}. Returns immediately;
+    poll /api/usb/prepare/status for progress."""
+    try:
+        return usb_prepare.start(
+            payload.get("drive"),
+            int(payload.get("slots") or usb_prepare.DEFAULT_SLOTS),
+            bool(payload.get("force")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/api/usb/prepare/status")
+def usb_prepare_status():
+    """Progress of the running (or last) prepare."""
+    return usb_prepare.status()
+
+
+@app.post("/api/usb/prepare/cancel")
+def usb_prepare_cancel():
+    """Stop a running prepare after the slot it is writing. Slots already
+    written stay valid, so a cancelled stick is usable, just smaller."""
+    return usb_prepare.cancel()
+
+
 def _fs_safe_name(name):
     """Strip characters Windows/FAT filesystems reject from a filename."""
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
@@ -1201,10 +1266,18 @@ def _finish_disk(hfe, payload):
 def build_disk_from_jobs(payload: dict = Body(...)):
     """Pack several converted jobs onto ONE floppy image (many songs per Gotek
     slot). Each job renders with its own saved export settings.
-    Body: {jobIds:[...], slot?:int, overwrite?:bool, download?:bool}."""
+    An optional `titles` list (same order/length as jobIds) overrides the job
+    names, so the user can rename songs for the piano's display without
+    renaming the job.
+    Body: {jobIds:[...], titles?:[...], slot?:int, overwrite?:bool,
+           download?:bool}."""
     job_ids = payload.get("jobIds")
     if not isinstance(job_ids, list) or not job_ids:
         raise HTTPException(400, "jobIds must be a non-empty list")
+    overrides = payload.get("titles")
+    if overrides is not None:
+        if not isinstance(overrides, list) or len(overrides) != len(job_ids):
+            raise HTTPException(400, "titles must match jobIds in length")
     prepared = []  # (job, notes, pedals, settings)
     titles = []
     for jid in job_ids:
@@ -1220,14 +1293,18 @@ def build_disk_from_jobs(payload: dict = Body(...)):
         prepared.append((job, notes, pedals,
                          _norm_disk_settings(job.get("settings"))))
         titles.append(job.get("name") or "Song")
+    if overrides is not None:
+        for i, t in enumerate(overrides):
+            t = (t or "").strip()
+            if t:
+                titles[i] = t
     bases = _disk_dos_bases(titles)
     songs = []
-    for (job, notes, pedals, s), base in zip(prepared, bases):
+    for (job, notes, pedals, s), base, title in zip(prepared, bases, titles):
         eff = dict(s)
         eff["offsetMs"] = (float(s["offsetMs"]) + job.get("encoderDelayMs", 0.0)
                            - job.get("trimStartSec", 0.0) * 1000.0)
-        songs.append((_eseq_bytes(notes, pedals, job.get("name") or "",
-                                  base, eff), base))
+        songs.append((_eseq_bytes(notes, pedals, title, base, eff), base))
     try:
         hfe = disk_writer.build_disk_hfe_multi(songs)
     except ValueError as e:

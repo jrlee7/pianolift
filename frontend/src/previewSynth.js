@@ -177,9 +177,17 @@ export function createPreviewPlayer(notes, settings, audioEl, effOffsetSec, peda
   }
 
   return {
-    async start() {
-      audioEl.currentTime = 0
+    // startSec is on the <audio> element's own clock (accompaniment time, i.e.
+    // playhead - trimStart). Defaults to the top of the song.
+    async start(startSec) {
+      const begin = startSec > 0 ? startSec : 0
+      try { audioEl.currentTime = begin } catch (e) { audioEl.currentTime = 0 }
+      lastTime = begin
       nextIdx = 0
+      // Skip notes already behind the start point so the first tick doesn't
+      // walk the whole song.
+      while (nextIdx < notes.length &&
+             notes[nextIdx].onset + effOffsetSec < begin - 0.05) nextIdx++
       stopped = false
       await ctx.resume()
       await audioEl.play()

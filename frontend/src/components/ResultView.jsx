@@ -341,9 +341,9 @@ export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo
     setPreviewing(false)
   }
 
-  // Synth + accompaniment from the top. createPreviewPlayer.start() resets the
-  // <audio> to 0, so this always begins at the beginning.
-  function startBoth() {
+  // Synth + accompaniment. startAt is on the piano-roll (original) timeline;
+  // the accompaniment element's own clock is that minus the trim cut.
+  function startBoth(startAt) {
     if (!events || !accompRef.current) return
     if (stemRef.current) stemRef.current.pause()
     // Same math the backend bakes into the real MIDI render:
@@ -356,7 +356,7 @@ export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo
       settings.pedal ? events.pedals : [])
     playerRef.current = player
     setPreviewing(true)
-    player.start().catch(function (e) {
+    player.start(Math.max(0, (startAt || 0) - trimStart)).catch(function (e) {
       alert('Playback failed: ' + e.message)
       stopPreview()
     })
@@ -367,7 +367,7 @@ export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo
       stopPreview()
       return
     }
-    startBoth()
+    startBoth((playhead > 0) ? playhead : 0)
   }
 
   // Piano-only playback for songs with no accompaniment (library imports,
@@ -404,7 +404,7 @@ export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo
     if (job.accompaniment) {
       const acc = accompRef.current
       if (acc) { try { acc.currentTime = 0 } catch (e) { /* not seekable yet */ } }
-      startBoth()
+      startBoth(0)
     } else {
       startPianoAt(0)
     }
@@ -534,6 +534,7 @@ export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo
           <span className="meta" style={{ alignSelf: 'center' }}>
             Synth piano + accompaniment, using current slider settings —
             rough tone, real timing. Judge sync here before the USB trip.
+            Starts from the playhead — drag it first to start mid-song.
           </span>
         </div>
       )}

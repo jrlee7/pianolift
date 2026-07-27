@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { deleteJob, verifyJob } from '../api.js'
+import { deleteJob, verifyJob, renameJob } from '../api.js'
 
 const STAGE_LABELS = {
   queued: 'Queued…',
@@ -27,9 +27,32 @@ function barWidth(stage, progress) {
   return span[0] + (span[1] - span[0]) * progress / 100
 }
 
-export default function JobCard({ job, open, onToggle, onDeleted, onCleaned, selected, onSelectToggle }) {
+export default function JobCard({ job, open, onToggle, onDeleted, onCleaned, onRenamed, selected, onSelectToggle }) {
   const stageLabel = STAGE_LABELS[job.stage] || job.stage
   const [cleaning, setCleaning] = useState(false)
+  // Inline rename of the song title (what the library, USB copy and — unless
+  // overridden in the disk dialog — the piano's screen use). Only finished
+  // jobs; a title while still transcribing would be overwritten by the pipeline.
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  function startRename(e) {
+    e.stopPropagation()
+    setDraft(job.name || '')
+    setEditing(true)
+  }
+
+  async function commitRename() {
+    const name = draft.trim()
+    setEditing(false)
+    if (!name || name === job.name) return
+    try {
+      await renameJob(job.id, name)
+      if (onRenamed) onRenamed()
+    } catch (err) {
+      alert('Rename failed: ' + err.message)
+    }
+  }
   // Songs converted before the pipeline verified notes against the audio
   // can have it run retroactively — needs the piano stem on disk, so
   // library imports (MIDI only) don't qualify.
@@ -86,7 +109,25 @@ export default function JobCard({ job, open, onToggle, onDeleted, onCleaned, sel
             onChange={function () { onSelectToggle(job.id) }}
           />
         )}
-        <h3>{job.name}</h3>
+        {editing ? (
+          <input
+            className="url-input lib-rename"
+            autoFocus
+            value={draft}
+            onClick={function (e) { e.stopPropagation() }}
+            onChange={function (e) { setDraft(e.target.value) }}
+            onBlur={commitRename}
+            onKeyDown={function (e) {
+              if (e.key === 'Enter') commitRename()
+              if (e.key === 'Escape') setEditing(false)
+            }}
+          />
+        ) : job.status === 'done' ? (
+          <h3 className="lib-title" title="Click to rename"
+            onClick={startRename}>{job.name}</h3>
+        ) : (
+          <h3>{job.name}</h3>
+        )}
         <div className="row" style={{ gap: 8 }}>
           {job.status === 'done' && (
             <span className="status done">
