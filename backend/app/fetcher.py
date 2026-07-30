@@ -13,6 +13,7 @@ so audio and video can never come from different renditions/timelines.
 
 import os
 import subprocess
+import sys
 
 from . import pipeline
 
@@ -20,14 +21,103 @@ from . import pipeline
 # ring-out (which decays across the chapter boundary) reaches transcription.
 RING_PAD_SEC = 4.0
 
+# A user-exported cookies.txt (Netscape format) lives beside the jobs dir, so
+# the same path works in dev and in the packaged exe. Mirrors main.BASE_DIR;
+# not imported from there because app.main pulls in the whole server.
+if getattr(sys, "frozen", False):
+    _DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."),
+                             "PianoForge", "data")
+else:
+    _DATA_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+COOKIES_TXT = os.path.join(_DATA_DIR, "cookies.txt")
+
+# Substrings of the errors platforms return when they want proof of a
+# logged-in human rather than the media: YouTube's bot check, age gates,
+# members-only videos, and the bare 403 its gated format URLs answer with.
+_GATE_SIGNS = (
+    "not a bot", "sign in to confirm", "sign in to view", "login required",
+    "confirm your age", "age-restricted", "members-only", "private video",
+    "account cookies", "http error 403", "use --cookies",
+)
+
+_COOKIE_HINT = (
+    "YouTube is asking this machine to prove it's a signed-in human. "
+    "Log into YouTube in Firefox (Chrome/Edge cookies are locked on Windows), "
+    "or export a cookies.txt from a logged-in browser to " + COOKIES_TXT
+)
+
+
+# How yt-dlp complains about the cookie source itself (browser absent,
+# profile missing, DB locked or App-Bound encrypted) rather than the site.
+_COOKIE_SOURCE_SIGNS = (
+    "could not find", "unsupported browser", "cookies database",
+    "failed to decrypt", "no such file", "permission denied", "keyring",
+    "does not support", "profile",
+)
+
+
+def _is_gated(msg):
+    low = msg.lower()
+    return any(s in low for s in _GATE_SIGNS)
+
+
+def _is_cookie_source_error(msg):
+    low = msg.lower()
+    return any(s in low for s in _COOKIE_SOURCE_SIGNS)
+
+
+def _cookie_sources():
+    """Cookie fallbacks to try, best first.
+
+    An explicit cookies.txt beats guessing. Browser extraction is a coin
+    flip on Windows: Chrome 127+ (and Edge/Brave, same engine) seal the
+    cookie DB with App-Bound Encryption that yt-dlp can't open while the
+    browser holds the key, so Firefox is the one that usually works.
+    """
+    if os.path.exists(COOKIES_TXT):
+        yield {"cookiefile": COOKIES_TXT}
+    for browser in ("firefox", "chrome", "edge", "brave", "chromium",
+                    "opera", "vivaldi"):
+        yield {"cookiesfrombrowser": (browser, None, None, None)}
+
+
+def _extract(opts, url, download):
+    """yt-dlp extract_info, retried with each cookie source when the site
+    answers with a sign-in/bot gate instead of the media.
+
+    Cookie attempts swallow their own failures (browser not installed,
+    profile missing, cookie DB locked) and move on; only the original
+    gate error is reported, with instructions, if every source is exhausted.
+    """
+    import yt_dlp  # lazy: heavy import, keeps server startup fast
+
+    def run(extra):
+        with yt_dlp.YoutubeDL(dict(opts, **extra)) as ydl:
+            return ydl.extract_info(url, download=download)
+
+    try:
+        return run({})
+    except Exception as e:
+        first = (str(e) or repr(e)).splitlines()[0]
+        if not _is_gated(first):
+            raise
+
+    for extra in _cookie_sources():
+        try:
+            return run(extra)
+        except Exception as e:
+            msg = (str(e) or repr(e)).splitlines()[0]
+            if _is_gated(msg) or _is_cookie_source_error(msg):
+                continue  # still gated, or that source is unreadable
+            raise  # the cookies got us past the gate onto a real failure
+    raise RuntimeError(_COOKIE_HINT)
+
 
 def probe_chapters(url):
     """Return (title, [{"title", "start", "end"}, ...]) for `url` without
     downloading anything. Empty chapter list means the video has none (or
     the platform doesn't expose them) — caller should fall back to a single
     whole-video job."""
-    import yt_dlp  # lazy: heavy import, keeps server startup fast
-
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -35,8 +125,7 @@ def probe_chapters(url):
         "skip_download": True,
         "js_runtimes": {"node": {}, "deno": {}},
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    info = _extract(opts, url, download=False)
     if info is None:
         raise RuntimeError("nothing found at that link")
     if "entries" in info:
@@ -71,8 +160,7 @@ def download_audio(url, job_dir, progress_cb, include_video=False,
     ring-out — which crosses the chapter boundary — is present in the audio
     for transcription; the pipeline caps the export window at the unpadded
     boundary so any next-track notes caught in the pad never play."""
-    import yt_dlp  # lazy: heavy import, keeps server startup fast
-    from yt_dlp.utils import download_range_func
+    from yt_dlp.utils import download_range_func  # lazy: heavy import
 
     pipeline._ensure_ffmpeg(lambda stage, pct: None)
 
@@ -109,8 +197,7 @@ def download_audio(url, job_dir, progress_cb, include_video=False,
                           "/best[height<=1080]/best")
         opts["merge_output_format"] = "mp4"
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    info = _extract(opts, url, download=True)
     if info is None:
         raise RuntimeError("nothing downloadable at that link")
     if "entries" in info:  # playlist page despite noplaylist
@@ -120,9 +207,11 @@ def download_audio(url, job_dir, progress_cb, include_video=False,
         info = entries[0]
     title = (info.get("title") or "untitled").strip()
 
+    # A gated first attempt can leave half-written source.<ext>.part /
+    # .ytdl scratch files behind; only a finished download is the media.
     source = None
     for f in os.listdir(job_dir):
-        if f.startswith("source."):
+        if f.startswith("source.") and not f.endswith((".part", ".ytdl")):
             source = os.path.join(job_dir, f)
             break
     if source is None:
