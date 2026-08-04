@@ -14,10 +14,15 @@ import os
 import subprocess
 
 import numpy as np
-import librosa
-from scipy.ndimage import gaussian_filter1d
 
 from . import pipeline
+
+# librosa (and its numba/soundfile chain) is multiple seconds to import,
+# especially in the frozen build. It's only needed when the user actually
+# runs auto-sync, so keep it out of module import -- main.py imports this at
+# server boot, and a top-level librosa import there delays the moment uvicorn
+# binds :8000, leaving the UI showing "backend not reachable" for that whole
+# window on every launch. Imported lazily inside the two functions that use it.
 
 HOP_LENGTH = 512
 SR = 22050
@@ -35,6 +40,7 @@ def _extract_audio(video_path, out_wav):
 
 
 def _note_onset_envelope(notes, hop_sec, n_frames):
+    from scipy.ndimage import gaussian_filter1d
     env = np.zeros(n_frames, dtype=np.float64)
     for note in notes:
         idx = int(note["onset"] / hop_sec)
@@ -64,6 +70,8 @@ def compute_offset(video_path, notes, search_window_sec=SEARCH_WINDOW_SEC):
     the name suggestion in older drafts -- kept as "confidence" below."""
     if not notes:
         raise ValueError("no notes to sync against")
+
+    import librosa
 
     tmp_wav = video_path + ".__autosync.wav"
     try:

@@ -65,7 +65,9 @@ export async function importFromLibrary(name, midiBase64, settings) {
 }
 
 export async function listJobs() {
-  const res = await fetch(BASE + '/jobs')
+  // Timeout so a hung request (backend still booting, or pegged mid-
+  // conversion) rejects instead of stalling the 2s poll indefinitely.
+  const res = await fetch(BASE + '/jobs', { signal: AbortSignal.timeout(8000) })
   if (!res.ok) throw new Error('Failed to list jobs')
   return res.json()
 }

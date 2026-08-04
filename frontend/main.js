@@ -226,7 +226,27 @@ function createWindow() {
   })
 }
 
+// A backend.exe from a session that didn't quit cleanly (crash, Task Manager
+// kill, forced OS restart) can outlive stopBackend() and stay bound to :8000.
+// The next launch would then spawn a second server that fails to bind while
+// the UI keeps talking to the stale one — silently missing whatever jobs it
+// doesn't know about. Free the port first, unconditionally.
+function killStalePortOwner(port) {
+  if (process.platform !== 'win32') return
+  const res = spawnSync('powershell', [
+    '-NoProfile', '-Command',
+    `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess`
+  ], { windowsHide: true })
+  const pids = new Set(
+    (res.stdout || '').toString().split(/\s+/).filter(Boolean)
+  )
+  for (const pid of pids) {
+    spawnSync('taskkill', ['/pid', pid, '/T', '/F'], { windowsHide: true })
+  }
+}
+
 function startBackend() {
+  killStalePortOwner(8000)
   if (isDev) {
     const backendPath = path.join(__dirname, '../backend')
     backendProcess = spawn('python', ['-m', 'uvicorn', 'app.main:app', '--port', '8000'], {

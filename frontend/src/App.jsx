@@ -117,6 +117,13 @@ export default function App() {
   // is open for a link whose video has chapter markers; null otherwise.
   const [splitPrompt, setSplitPrompt] = useState(null)
   const accountRef = useRef(null)
+  // Consecutive failed job-list polls. The packaged backend (PyInstaller
+  // onefile + torch/librosa imports) takes 15-40s to bind :8000 on launch,
+  // and a heavy CPU-bound conversion can briefly stall a poll. Flipping to
+  // "backend not reachable" on the very first failure made the Convert page
+  // look broken on every launch. Only show the notice after a few misses in
+  // a row, so a booting/busy backend rides through.
+  const backendFailsRef = useRef(0)
   useEffect(function () { accountRef.current = account }, [account])
 
   useEffect(function () {
@@ -152,9 +159,13 @@ export default function App() {
     try {
       const items = await listJobs()
       setJobs(items)
+      backendFailsRef.current = 0
       setBackendUp(true)
     } catch (e) {
-      setBackendUp(false)
+      // ~8s (4 misses at the 2s poll) of grace before declaring it down, so a
+      // booting or momentarily-pegged backend doesn't flash the failure notice.
+      backendFailsRef.current += 1
+      if (backendFailsRef.current >= 4) setBackendUp(false)
     }
   }, [])
 
