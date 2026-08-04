@@ -34,17 +34,12 @@ from . import (pipeline, midi_writer, note_verify, eseq_writer, disk_writer,
                usb, usb_prepare, job_runner)
 from . import sheet_routes, sheet_to_events
 from . import musicxml_io
+from . import paths
 
-# A PyInstaller onefile build's __file__ resolves inside the run's temp
-# extraction dir (%TEMP%\_MEIxxxxx), which is new and gets wiped every
-# launch -- jobs/media stored there would vanish on every relaunch. Persist
-# to a stable per-user location instead when frozen; dev mode keeps the
-# repo-relative path so `git status` shows local test jobs as usual.
-if getattr(sys, "frozen", False):
-    BASE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."), "PianoForge", "data")
-    os.makedirs(BASE_DIR, exist_ok=True)
-else:
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Persistent data root (jobs/media). Frozen builds use a stable per-user dir;
+# dev keeps the repo-relative backend/ path. See app/paths.py for why this
+# can't just trust %LOCALAPPDATA% (elevated-launch 0-songs guard).
+BASE_DIR = paths.resolve_base_dir()
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
 # Videos outlive their conversion job here (too big for the cloud library):

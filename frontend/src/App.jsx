@@ -124,6 +124,13 @@ export default function App() {
   // look broken on every launch. Only show the notice after a few misses in
   // a row, so a booting/busy backend rides through.
   const backendFailsRef = useRef(0)
+  // Anchor for shift-click range selection of the song checkboxes (the last
+  // box the user clicked without shift), like a file-manager list.
+  const lastSelectedRef = useRef(null)
+  // The folder chosen for the last bulk "copy to folder", so repeat copies can
+  // skip the OS picker. { label, write } — see pickTargetFolder().
+  const lastFolderRef = useRef(null)
+  const [lastFolderLabel, setLastFolderLabel] = useState(null)
   useEffect(function () { accountRef.current = account }, [account])
 
   useEffect(function () {
@@ -323,13 +330,35 @@ export default function App() {
       (j.name || '').toLowerCase().includes(search.toLowerCase())
   })
 
-  function toggleSelect(id) {
+  function toggleSelect(id, shift) {
+    // Shift-click: select the contiguous run of finished songs between the
+    // last-clicked box and this one, in the on-screen order (search/reverse
+    // already applied to shownJobs). Matches how file managers range-select.
+    if (shift && lastSelectedRef.current && lastSelectedRef.current !== id) {
+      const order = shownJobs
+        .filter(function (j) { return j.status === 'done' })
+        .map(function (j) { return j.id })
+      const a = order.indexOf(lastSelectedRef.current)
+      const b = order.indexOf(id)
+      if (a !== -1 && b !== -1) {
+        const lo = Math.min(a, b)
+        const hi = Math.max(a, b)
+        setSelected(function (prev) {
+          const next = new Set(prev)
+          for (let i = lo; i <= hi; i++) next.add(order[i])
+          return next
+        })
+        lastSelectedRef.current = id
+        return
+      }
+    }
     setSelected(function (prev) {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
       else next.add(id)
       return next
     })
+    lastSelectedRef.current = id
   }
 
   function selectAllDone() {
@@ -352,42 +381,56 @@ export default function App() {
     return job.settings ? { ...DEFAULTS, ...job.settings } : DEFAULTS
   }
 
-  // Copy every selected finished song (rendered .mid + accompaniment .mp3) into
-  // a folder the user picks — typically the ENSPIRE USB stick. Runs in-browser:
-  // the MIDI/MP3 are fetched from the backend render endpoints.
-  async function handleCopyToUsb() {
-    const chosen = chosenJobs()
-    if (!chosen.length) return
-    // Desktop shell: native OS folder browser + Node file write. Browser:
-    // File System Access API. `native` unifies both behind write(name, blob).
-    let native
+  // Open the OS folder browser (desktop shell) or the File System Access API
+  // (browser) and return a { label, write(name, blob) } target, or null if the
+  // user cancelled / the platform can't pick a folder. Unifies both shells so
+  // callers don't branch, and so the choice can be cached for repeat copies.
+  async function pickTargetFolder() {
     if (window.desktop) {
-      let dirPath
-      try {
-        dirPath = await window.desktop.pickFolder()
-      } catch (e) {
-        alert('Could not open folder: ' + e.message)
-        return
-      }
-      if (!dirPath) return // user cancelled
-      native = {
+      const dirPath = await window.desktop.pickFolder()
+      if (!dirPath) return null // cancelled
+      return {
+        label: dirPath.split(/[\\/]/).filter(Boolean).pop() || dirPath,
         write: async (name, blob) =>
           window.desktop.writeFile(dirPath, name, new Uint8Array(await blob.arrayBuffer()))
       }
+    }
+    if (!window.showDirectoryPicker) {
+      alert('Your browser can\'t pick a folder. Use Chrome/Edge or the desktop app.')
+      return null
+    }
+    let dir
+    try {
+      dir = await window.showDirectoryPicker({ mode: 'readwrite' })
+    } catch (e) {
+      if (e && e.name === 'AbortError') return null // user cancelled the picker
+      alert('Could not open folder: ' + e.message)
+      return null
+    }
+    return { label: dir.name, write: function (name, blob) { return writeInto(dir, name, blob) } }
+  }
+
+  // Copy every selected finished song (rendered .mid + accompaniment .mp3) into
+  // a folder — typically the ENSPIRE USB stick. Runs in-browser: the MIDI/MP3
+  // are fetched from the backend render endpoints. `reuse` skips the picker and
+  // writes straight to the last folder used, for fast repeat copies.
+  async function handleCopyToUsb(reuse) {
+    const chosen = chosenJobs()
+    if (!chosen.length) return
+    // `native` unifies desktop + browser behind write(name, blob).
+    let native
+    if (reuse && lastFolderRef.current) {
+      native = lastFolderRef.current
     } else {
-      if (!window.showDirectoryPicker) {
-        alert('Your browser can\'t pick a folder. Use Chrome/Edge or the desktop app.')
-        return
-      }
-      let dir
       try {
-        dir = await window.showDirectoryPicker({ mode: 'readwrite' })
+        native = await pickTargetFolder()
       } catch (e) {
-        if (e && e.name === 'AbortError') return // user cancelled the picker
         alert('Could not open folder: ' + e.message)
         return
       }
-      native = { write: (name, blob) => writeInto(dir, name, blob) }
+      if (!native) return // cancelled / unsupported
+      lastFolderRef.current = native
+      setLastFolderLabel(native.label)
     }
     setBatchResult(null)
     setBatch({ done: 0, total: chosen.length, verb: 'Copying' })
@@ -716,12 +759,23 @@ export default function App() {
               <button
                 className="primary"
                 disabled={selected.size === 0 || Boolean(batch)}
-                onClick={handleCopyToUsb}
+                title="Pick a folder (USB stick or anywhere) and copy every selected song's MIDI + accompaniment into it."
+                onClick={function () { handleCopyToUsb(false) }}
               >
                 {batch && batch.verb === 'Copying'
                   ? 'Copying ' + batch.done + '/' + batch.total + '…'
-                  : '💾 Copy ' + (selected.size || '') + ' to USB folder…'}
+                  : '💾 Copy ' + (selected.size || '') + ' to folder…'}
               </button>
+              {lastFolderLabel && (
+                <button
+                  className="ghost"
+                  disabled={selected.size === 0 || Boolean(batch)}
+                  title={'Copy straight into "' + lastFolderLabel + '" again — no folder picker.'}
+                  onClick={function () { handleCopyToUsb(true) }}
+                >
+                  ↪ Copy to {lastFolderLabel}
+                </button>
+              )}
               <button
                 className="primary"
                 disabled={selected.size === 0 || Boolean(batch)}

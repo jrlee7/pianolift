@@ -104,9 +104,15 @@ export default function JobCard({ job, open, onToggle, onDeleted, onCleaned, onR
             type="checkbox"
             className="job-select"
             checked={!!selected}
-            title="Select for bulk copy / move"
-            onClick={function (e) { e.stopPropagation() }}
-            onChange={function () { onSelectToggle(job.id) }}
+            title="Select for bulk copy / move. Shift-click to select a range."
+            // onClick carries shiftKey (onChange doesn't); it drives selection,
+            // so onChange is a no-op that just silences React's controlled-input
+            // warning. stopPropagation keeps the card from toggling open.
+            onClick={function (e) {
+              e.stopPropagation()
+              onSelectToggle(job.id, e.shiftKey)
+            }}
+            onChange={function () {}}
           />
         )}
         {editing ? (

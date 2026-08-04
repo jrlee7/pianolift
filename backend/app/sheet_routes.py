@@ -25,14 +25,11 @@ from fastapi.responses import FileResponse
 
 from . import musicxml_io as mxml
 from . import sheet_pipeline
+from . import paths
 
-# See main.py's BASE_DIR comment: a PyInstaller onefile build's __file__
-# resolves inside a per-run temp extraction dir, so frozen mode persists to
-# a stable per-user location instead.
-if getattr(sys, "frozen", False):
-    BASE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."), "PianoForge", "data")
-else:
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Same persistent data root as main.py (see app/paths.py) — must match so the
+# frozen build's sheet jobs land beside the audio jobs, not in a stray dir.
+BASE_DIR = paths.resolve_base_dir()
 SHEET_JOBS_DIR = os.path.join(BASE_DIR, "sheet_jobs")
 os.makedirs(SHEET_JOBS_DIR, exist_ok=True)
 
