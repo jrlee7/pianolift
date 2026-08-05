@@ -39,6 +39,46 @@ if __name__ == "__main__":
 
     multiprocessing.freeze_support()
 
+    # Pre-flight: never start a SECOND server on :8000. Windows lets two
+    # sockets bind the same port (no SO_EXCLUSIVEADDRUSE), so a duplicate
+    # backend doesn't fail loudly -- both "run", and the OS splits requests
+    # between them. If the duplicate resolved a different/empty data dir, the
+    # UI's job-list polls alternate between the real server (N songs) and the
+    # empty one (0 songs), so the Convert page flickers empty. Duplicates arise
+    # from an auto-update relaunch racing the old backend, a leftover process,
+    # or a spawn-worker that slips past freeze_support. If a backend already
+    # answers on :8000, bow out instead of stealing half its traffic.
+    #
+    # This runs only in a real server launch: a multiprocessing spawn-worker
+    # is handled by freeze_support() above, which runs its job and exits before
+    # reaching here, so genuine conversion workers are unaffected.
+    import socket
+    import urllib.request
+
+    def _backend_already_running(host="127.0.0.1", port=8000):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.settimeout(0.5)
+        try:
+            probe.connect((host, port))
+        except OSError:
+            return False  # nothing listening -> we're the first, proceed
+        finally:
+            probe.close()
+        # Something's on the port. Confirm it's actually a live PianoForge
+        # backend (answers the job list) and not an unrelated service, so we
+        # don't silently refuse to start over a coincidental port collision.
+        try:
+            with urllib.request.urlopen(
+                    "http://%s:%d/api/jobs" % (host, port), timeout=1.5) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    if _backend_already_running():
+        print("PianoForge backend already running on :8000 -- "
+              "not starting a second server.", flush=True)
+        sys.exit(0)
+
     import uvicorn
     from app.main import app
     uvicorn.run(app, host="127.0.0.1", port=8000)
