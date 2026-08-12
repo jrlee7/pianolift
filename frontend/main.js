@@ -317,19 +317,39 @@ function stopBackend() {
   }
 }
 
-app.on('ready', () => {
-  // Web MIDI (the video-sync player streaming to the Disklavier's USB TO
-  // HOST port) needs the 'midi' permission. Electron grants requests by
-  // default, but be explicit so a future Electron default-flip can't
-  // silently kill live playback.
-  session.defaultSession.setPermissionRequestHandler((wc, permission, cb) => {
-    cb(true)
+// Single-instance lock. Each launch spawns its own backend AND runs
+// killStalePortOwner(8000) first — so a SECOND launch (double-click, taskbar
+// re-open, an installer's "run now" overlapping a running copy) kills the
+// first instance's backend mid-boot and then races its own onto :8000. The
+// packaged backend takes 15-40s to bind, so the window that was working
+// suddenly shows "Backend not reachable" for half a minute. Refuse to start a
+// second instance: hand off to the one already running and quit immediately,
+// before startBackend() can touch the port.
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.focus()
+    }
   })
-  session.defaultSession.setPermissionCheckHandler(() => true)
-  startBackend()
-  createWindow()
-  if (!isDev) checkForUpdates()
-})
+
+  app.on('ready', () => {
+    // Web MIDI (the video-sync player streaming to the Disklavier's USB TO
+    // HOST port) needs the 'midi' permission. Electron grants requests by
+    // default, but be explicit so a future Electron default-flip can't
+    // silently kill live playback.
+    session.defaultSession.setPermissionRequestHandler((wc, permission, cb) => {
+      cb(true)
+    })
+    session.defaultSession.setPermissionCheckHandler(() => true)
+    startBackend()
+    createWindow()
+    if (!isDev) checkForUpdates()
+  })
+}
 
 // Auto-update: on launch (production only) check the public releases feed and,
 // once a newer version has downloaded, prompt to restart & install. The feed is

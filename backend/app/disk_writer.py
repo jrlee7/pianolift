@@ -218,7 +218,7 @@ def img_to_hfe(img):
     header[11] = 0             # ISOIBM_MFM
     header[12:14] = struct.pack("<H", 250)
     header[14:16] = struct.pack("<H", 0)
-    header[16] = 0             # IBMPC_DD interface
+    header[16] = 1             # IBMPC_DD_FLOPPYMODE (was 0 = generic Shugart)
     header[17] = 1
     header[18:20] = struct.pack("<H", 1)  # track list at block 1
     header[20:] = b"\xFF" * (512 - 20)
@@ -279,3 +279,29 @@ def build_disk_hfe(fil_bytes, dos_base):
     """Single-song disk. fil_bytes: complete E-SEQ .FIL; dos_base: 8-char DOS
     name. Returns .hfe image bytes."""
     return build_disk_hfe_multi([(fil_bytes, dos_base)])
+
+
+def patch_fil_header(fil_bytes, dos_base=None, title=None):
+    """Rewrite an existing .FIL's embedded 8.3 name (0x27) and/or display title
+    (0x57) in place. Used when rebuilding a slot with songs reordered or renamed:
+    the play-order prefix in the DOS name changes, and it must match both the
+    disk's directory entry and PIANODIR — build_disk_hfe_multi derives the
+    directory name from dos_base and requires the .FIL header to agree."""
+    b = bytearray(fil_bytes)
+    if len(b) < 0x77:
+        return bytes(b)
+    if dos_base is not None:
+        dos11 = (dos_base.upper()[:8].ljust(8) + "FIL").encode("ascii")
+        b[0x27:0x32] = dos11
+    if title is not None:
+        t = "".join(c if 32 <= ord(c) < 127 else " " for c in title)
+        b[0x57:0x77] = t[:32].ljust(32).encode("ascii")
+    return bytes(b)
+
+
+def build_blank_hfe():
+    """A formatted-but-empty Disklavier floppy: FAT12 layout plus an empty
+    PIANODIR.FIL catalog and no songs. Matches what is_blank_slot() treats as a
+    free slot, so writing this into a slot clears it back to blank."""
+    img = build_fat12([("PIANODIRFIL", build_pianodir([]))])
+    return img_to_hfe(img)

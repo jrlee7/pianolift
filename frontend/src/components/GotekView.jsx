@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { getGotekCatalog } from '../api.js'
 import UsbPrepareModal from './UsbPrepareModal.jsx'
+import SlotEditorModal from './SlotEditorModal.jsx'
 
 // Build a clean standalone HTML document and print it, so the printed catalog
 // is just the song list — no app chrome, tabs or buttons.
@@ -56,12 +57,13 @@ function escapeHtml(s) {
   })
 }
 
-export default function GotekView() {
+export default function GotekView({ jobs, loadLibrary }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [showEmpty, setShowEmpty] = useState(false)
   const [prepare, setPrepare] = useState(false)
+  const [editSlot, setEditSlot] = useState(null)
 
   async function load() {
     setLoading(true)
@@ -173,6 +175,13 @@ export default function GotekView() {
               <div className="gotek-slot-head">
                 <span className="gotek-slot-num">Slot {s.slot}</span>
                 <span className="meta">{s.filename}</span>
+                {!s.blank && !s.error && (
+                  <button className="ghost" style={{ marginLeft: 'auto' }}
+                    title="Reorder, rename, add or remove songs on this slot"
+                    onClick={function () { setEditSlot(s.slot) }}>
+                    ✎ Edit
+                  </button>
+                )}
               </div>
               {s.blank ? (
                 <div className="meta">— empty —</div>
@@ -189,6 +198,16 @@ export default function GotekView() {
           )
         })}
       </div>
+
+      {editSlot !== null && (
+        <SlotEditorModal
+          slot={editSlot}
+          catalog={data}
+          jobs={jobs}
+          loadLibrary={loadLibrary}
+          onClose={function () { setEditSlot(null) }}
+          onSaved={function () { setEditSlot(null); load() }} />
+      )}
     </div>
   )
 }

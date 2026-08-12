@@ -135,10 +135,14 @@ export default function LibraryView({ onEdit, onWatch }) {
       // place only (no duplicates). Its stored MP3 goes too — editor imports are
       // MIDI-only anyway. Delete before navigating so it runs while mounted.
       try {
-        await deleteSong(song.id, song.mp3Path)
+        const res = await deleteSong(song.id, song.mp3Path)
         setSongs(function (prev) {
           return prev.filter(function (s) { return s.id !== song.id })
         })
+        if (res.mp3Error) {
+          alert('Opened in editor. Library entry removed, but its stored MP3 ' +
+            'could not be deleted: ' + res.mp3Error)
+        }
       } catch (e) {
         alert('Opened in editor, but could not remove the old library copy: '
           + e.message)
@@ -156,8 +160,12 @@ export default function LibraryView({ onEdit, onWatch }) {
     if (!confirm('Delete "' + song.title + '" from the library?' +
       (song.mp3Url ? ' Its stored MP3 is deleted too.' : ''))) return
     try {
-      await deleteSong(song.id, song.mp3Path)
+      const res = await deleteSong(song.id, song.mp3Path)
       refresh()
+      if (res.mp3Error) {
+        alert('Song removed from the library, but its stored MP3 could not be ' +
+          'deleted: ' + res.mp3Error)
+      }
     } catch (e) {
       alert(e.message)
     }
@@ -402,7 +410,10 @@ export default function LibraryView({ onEdit, onWatch }) {
     let done = 0
     for (const song of chosen) {
       try {
-        await deleteSong(song.id, song.mp3Path)
+        const res = await deleteSong(song.id, song.mp3Path)
+        if (res.mp3Error) {
+          errors.push(song.title + ' — MP3 not deleted: ' + res.mp3Error)
+        }
       } catch (e) {
         errors.push(song.title + ' — ' + (e.message || String(e)))
       }

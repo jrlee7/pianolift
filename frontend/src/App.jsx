@@ -7,6 +7,7 @@ import LocalLibraryView from './components/LocalLibraryView.jsx'
 import SourcesView from './components/SourcesView.jsx'
 import PlayerView from './components/PlayerView.jsx'
 import GotekView from './components/GotekView.jsx'
+import { localList } from './localLibrary.js'
 import AuthView from './components/AuthView.jsx'
 import ActivationModal from './components/ActivationModal.jsx'
 import SheetUploadZone from './components/SheetUploadZone.jsx'
@@ -169,10 +170,12 @@ export default function App() {
       backendFailsRef.current = 0
       setBackendUp(true)
     } catch (e) {
-      // ~8s (4 misses at the 2s poll) of grace before declaring it down, so a
-      // booting or momentarily-pegged backend doesn't flash the failure notice.
+      // ~30s (15 misses at the 2s poll) of grace before declaring it down. The
+      // packaged backend (PyInstaller onefile + torch/librosa) can take 15-40s
+      // to bind :8000 on a cold launch; a shorter grace flashed "not reachable"
+      // for the rest of that boot even though nothing was wrong.
       backendFailsRef.current += 1
-      if (backendFailsRef.current >= 4) setBackendUp(false)
+      if (backendFailsRef.current >= 15) setBackendUp(false)
     }
   }, [])
 
@@ -901,7 +904,11 @@ export default function App() {
 
       {tab === 'play' && <PlayerView jobs={jobs} initial={playerInit} />}
 
-      {tab === 'disk' && <GotekView />}
+      {tab === 'disk' && (
+        <GotekView
+          jobs={doneJobs}
+          loadLibrary={isFamily ? listSongs : localList} />
+      )}
 
       {tab === 'links' && <SourcesView />}
 

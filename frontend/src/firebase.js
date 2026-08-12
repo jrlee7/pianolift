@@ -311,15 +311,20 @@ export async function findExistingSong(title, sourceUrl) {
 export async function deleteSong(id, mp3Path) {
   if (!db) throw new Error('Firebase not configured')
   // Delete the Storage object first; a missing/failed audio delete must not
-  // block removing the song doc (best-effort cleanup).
+  // block removing the song doc (best-effort cleanup), but the caller needs
+  // to know it happened rather than assume the mp3 is gone.
+  let mp3Error = null
   if (mp3Path && storage) {
     try {
       await deleteObject(storageRef(storage, mp3Path))
     } catch (e) {
-      /* already gone or rules changed — drop the doc anyway */
+      if (e && e.code !== 'storage/object-not-found') {
+        mp3Error = (e && e.message) || String(e)
+      }
     }
   }
   await deleteDoc(doc(db, SONGS, id))
+  return { mp3Error: mp3Error }
 }
 
 export async function renameSong(id, title) {

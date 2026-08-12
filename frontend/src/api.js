@@ -432,6 +432,30 @@ export async function buildDiskFromLibrary(songs, opts) {
   return saveDiskResult(res)
 }
 
+// --- Editing an existing slot's songs (reorder / delete / rename / add) ---
+// One slot = one floppy that may hold many songs. These read a slot's song
+// list with full fidelity and rebuild it from an edited list.
+
+// Song titles + DOS names on one slot, in play order. Slower than the catalog
+// scan (full-decodes every track), so only called when a slot is opened.
+export async function getSlotSongs(slot) {
+  const res = await fetch(BASE + '/gotek/slot/' + slot)
+  const data = await res.json().catch(function () { return {} })
+  if (!res.ok) throw new Error(data.detail || 'Slot read failed')
+  return data
+}
+
+// Rebuild a slot from an edited song list. `songs` is the final play order,
+// each item one of:
+//   { source: 'keep', index, title? }            keep a song already on the slot
+//   { source: 'job', jobId, title? }             add a converted job
+//   { source: 'library', name, midiBase64, settings, title? }  add a library song
+// An empty list clears the slot. Overwrites the slot in place.
+export async function rewriteSlot(slot, songs) {
+  const res = await postDisk('/gotek/slot/rewrite', { slot: slot, songs: songs })
+  return saveDiskResult(res)
+}
+
 // --- Sheet music (PDF/MusicXML -> pedal + dynamics suggestions) ----------
 
 export async function uploadSheet(file) {

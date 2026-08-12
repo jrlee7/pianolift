@@ -1343,6 +1343,157 @@ def build_disk_from_midi(payload: dict = Body(...)):
     return _finish_disk(hfe, payload)
 
 
+def _job_fil_bytes(it):
+    """Render one converted job to E-SEQ .FIL bytes for slot editing. Mirrors
+    build_disk_from_jobs' per-song path (its own saved export settings, encoder
+    delay and trim baked into the offset)."""
+    jid = it.get("jobId")
+    job = jobs.get(jid)
+    if job is None:
+        raise HTTPException(404, "job not found: " + str(jid))
+    events_path = os.path.join(_job_dir(jid), "events.json")
+    if not os.path.exists(events_path):
+        raise HTTPException(404, "events not ready for job " + str(jid))
+    with open(events_path) as f:
+        events = json.load(f)
+    notes, pedals = _trim_tail(job, events)
+    s = _norm_disk_settings(job.get("settings"))
+    title = job.get("name") or "Song"
+    eff = dict(s)
+    eff["offsetMs"] = (float(s["offsetMs"]) + job.get("encoderDelayMs", 0.0)
+                       - job.get("trimStartSec", 0.0) * 1000.0)
+    base = _disk_dos_bases([title])[0]  # provisional; patched to play order later
+    return _eseq_bytes(notes, pedals, title, base, eff), title
+
+
+def _library_fil_bytes(it):
+    """Render one library song (stored as baked MIDI) to E-SEQ .FIL bytes.
+    Mirrors build_disk_from_midi (offsets already baked into the MIDI)."""
+    name = it.get("name") or "song"
+    try:
+        raw = base64.b64decode(it.get("midiBase64") or "", validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "invalid midiBase64 for " + name)
+    if not raw:
+        raise HTTPException(400, "empty MIDI for " + name)
+    try:
+        notes, pedals = _decode_library_midi(raw, it.get("settings"))
+    except Exception as e:
+        raise HTTPException(400, "could not parse MIDI for %s: %s" % (name, e))
+    s = _norm_disk_settings(it.get("settings"))
+    s["offsetMs"] = 0
+    s["releaseMs"] = 0
+    base = _disk_dos_bases([name])[0]
+    return _eseq_bytes(notes, pedals, name, base, s), name
+
+
+@app.get("/api/gotek/slot/{slot}")
+def gotek_slot_songs(slot: int):
+    """The songs on one slot with enough detail to edit it: title + DOS name in
+    play order. Full-decodes every track (slower than the catalog scan), so the
+    Disk tab calls it only when a slot is opened for editing."""
+    root = usb.find_usb_drive()
+    if root is None:
+        raise HTTPException(404, "No Gotek/Nalbantov USB stick found.")
+    path = os.path.join(root, "DSKA%04d.hfe" % slot)
+    if not os.path.exists(path):
+        raise HTTPException(404, "slot %d not found on the stick" % slot)
+    songs = usb.read_slot_songs(path)
+    if songs is None:
+        raise HTTPException(422, "slot %d is unreadable" % slot)
+    return {
+        "drive": root, "slot": slot,
+        "songs": [{"name": s["name"], "title": s["title"]} for s in songs],
+    }
+
+
+@app.post("/api/gotek/slot/rewrite")
+def rewrite_gotek_slot(payload: dict = Body(...)):
+    """Rebuild one slot's floppy from a caller-supplied song list — the single
+    operation behind the Disk tab's reorder / delete / rename / add controls.
+    Each song is kept from the slot (source:"keep", index into the current play
+    order) or added fresh (source:"job"|"library"). The final order is what the
+    piano plays; kept songs are re-extracted losslessly, added songs rendered.
+    An empty list clears the slot back to blank.
+    Body: {slot:int, songs:[{source, index?/jobId?/..., title?}]}."""
+    try:
+        slot = int(payload.get("slot"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "slot must be an integer")
+    items = payload.get("songs")
+    if not isinstance(items, list):
+        raise HTTPException(400, "songs must be a list")
+
+    root = usb.find_usb_drive()
+    if root is None:
+        raise HTTPException(404, "No Gotek/Nalbantov USB stick found. Plug it "
+                                 "in and try again.")
+    path = os.path.join(root, "DSKA%04d.hfe" % slot)
+
+    cache = {}  # lazy per-slot decode: only touch slots a "keep" references
+
+    def slot_songs(n):
+        if n not in cache:
+            p = os.path.join(root, "DSKA%04d.hfe" % n)
+            got = usb.read_slot_songs(p) if os.path.exists(p) else None
+            if got is None:
+                raise HTTPException(422, "slot %d is unreadable; cannot read it"
+                                    % n)
+            cache[n] = got
+        return cache[n]
+
+    fils = []
+    titles = []
+    for it in items:
+        if not isinstance(it, dict):
+            raise HTTPException(400, "each song must be an object")
+        src = it.get("source")
+        override = (it.get("title") or "").strip()
+        if src == "keep":
+            idx = it.get("index")
+            # A song already on this slot, or copied in from another slot.
+            from_slot = it.get("fromSlot")
+            from_slot = slot if from_slot is None else int(from_slot)
+            cur = slot_songs(from_slot)
+            if not isinstance(idx, int) or idx < 0 or idx >= len(cur):
+                raise HTTPException(400, "keep index out of range: %r" % idx)
+            fils.append(cur[idx]["fil"])
+            titles.append(override or cur[idx]["title"])
+        elif src == "job":
+            fil, title = _job_fil_bytes(it)
+            fils.append(fil)
+            titles.append(override or title)
+        elif src == "library":
+            fil, title = _library_fil_bytes(it)
+            fils.append(fil)
+            titles.append(override or title)
+        else:
+            raise HTTPException(400, "unknown song source: %r" % src)
+
+    if len(fils) > disk_writer.PIANODIR_MAX_SONGS:
+        raise HTTPException(400, "too many songs for one disk (%d, max %d)"
+                            % (len(fils), disk_writer.PIANODIR_MAX_SONGS))
+
+    if not fils:
+        hfe = disk_writer.build_blank_hfe()
+    else:
+        bases = _disk_dos_bases(titles)
+        built = []
+        for fil, base, title in zip(fils, bases, titles):
+            built.append((disk_writer.patch_fil_header(
+                fil, dos_base=base, title=title), base))
+        try:
+            hfe = disk_writer.build_disk_hfe_multi(built)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    try:
+        usb.save_to_slot(hfe, slot)
+    except (OSError, ValueError, RuntimeError) as e:
+        raise HTTPException(500, str(e))
+    return {"drive": root, "slot": slot,
+            "filename": "DSKA%04d.hfe" % slot, "songs": len(fils)}
+
+
 def _trim_events_window(events, abs_start, abs_end):
     """Cut events to absolute-time [abs_start, abs_end] and shift so the window
     starts at 0. Drops anything wholly outside; clips events straddling the

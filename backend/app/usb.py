@@ -155,17 +155,22 @@ def is_blank_slot(path):
         return False
 
 
-def _read_lbas(path):
-    """Decode tracks 0 and 1 into an {LBA: 512 bytes} map. That covers the
-    whole FAT12 metadata region (boot/FATs/root at LBA 0..13) and the start of
-    the data area (LBA 14+), which is where PIANODIR.FIL — always the first,
-    contiguous file — lives. Enough to enumerate a slot's songs without
-    decoding all 80 tracks. LBA = track*18 + side*9 + (sector-1)."""
+def _read_lbas(path, tracks=(0, 1)):
+    """Decode the given tracks into an {LBA: 512 bytes} map. The default
+    (tracks 0 and 1) covers the whole FAT12 metadata region (boot/FATs/root at
+    LBA 0..13) and the start of the data area (LBA 14+), which is where
+    PIANODIR.FIL — always the first, contiguous file — lives. Enough to
+    enumerate a slot's songs without decoding all 80 tracks. Pass a wider range
+    (e.g. range(80)) to pull whole song files back out. Undecodable/missing
+    tracks are skipped rather than aborting, so a partial disk still yields what
+    it can. LBA = track*18 + side*9 + (sector-1)."""
     out = {}
-    for track in (0, 1):
+    for track in tracks:
         s0, s1 = _track_sides(path, track)
         if s0 is None:
-            return None
+            if track == 0:
+                return None  # no track 0 -> not a decodable HFE at all
+            continue
         d0 = _decode_side(s0)
         d1 = _decode_side(s1)
         base = track * 18
@@ -250,6 +255,77 @@ def read_slot_catalog(path):
 
     if not songs:
         songs = [{"name": n, "title": n} for n in fil_names]
+    return songs
+
+
+def _read_chain(lbas, fat, start, size):
+    """Follow a FAT12 cluster chain from `start`, returning the file's first
+    `size` bytes. Data area LBA = 14 + (cluster-2)*2 (2 sectors/cluster)."""
+    data = bytearray()
+    cluster = start
+    guard = 0
+    while 2 <= cluster < 0xFF0 and len(data) < size and guard < 1440:
+        lba = 14 + (cluster - 2) * 2
+        data += lbas.get(lba, b"\x00" * 512)
+        data += lbas.get(lba + 1, b"\x00" * 512)
+        cluster = _fat12_next(fat, cluster)
+        guard += 1
+    return bytes(data[:size])
+
+
+def read_slot_songs(path):
+    """Full song extraction: every E-SEQ .FIL on the slot, in the piano's play
+    order, with the complete file bytes so a slot can be rebuilt with songs
+    reordered/removed. Returns [{name, title, fil}] (fil = raw .FIL bytes) or
+    None if the slot is undecodable. Decodes ALL tracks, so it is slower than
+    read_slot_catalog — call it only when editing one slot, not when scanning
+    the whole stick."""
+    lbas = _read_lbas(path, tracks=range(80))
+    if lbas is None:
+        return None
+    fat = b"".join(lbas.get(l, b"\x00" * 512) for l in (1, 2, 3))
+    root = b"".join(lbas.get(l, b"\x00" * 512) for l in range(7, 14))
+
+    # Map every real .FIL directory entry -> (start_cluster, size).
+    entries = {}
+    pianodir = None
+    for i in range(0, len(root), 32):
+        first = root[i]
+        if first == 0x00:
+            break
+        if first == 0xE5:
+            continue
+        attr = root[i + 11]
+        if attr == 0x0F or attr & 0x08:
+            continue  # LFN / volume label
+        name = root[i:i + 11]
+        start = root[i + 26] | (root[i + 27] << 8)
+        size = int.from_bytes(root[i + 28:i + 32], "little")
+        if name.upper() == b"PIANODIRFIL":
+            pianodir = (start, size)
+        else:
+            entries[name.decode("latin1").rstrip()] = (start, size)
+
+    # Play order + nice titles come from PIANODIR.FIL; fall back to raw dir
+    # order when a disk has no catalog.
+    catalog = read_slot_catalog(path) or []
+    order = [(c["name"], c.get("title") or c["name"]) for c in catalog]
+    if not order:
+        order = [(n, n) for n in entries]
+
+    songs = []
+    for name, title in order:
+        meta = entries.get(name)
+        if meta is None:
+            continue
+        start, size = meta
+        if size <= 0:
+            continue
+        songs.append({
+            "name": name,
+            "title": title,
+            "fil": _read_chain(lbas, fat, start, size),
+        })
     return songs
 
 
