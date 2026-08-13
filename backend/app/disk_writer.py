@@ -208,8 +208,16 @@ def _encode_track(img, cyl, head):
 
 
 def img_to_hfe(img):
-    track_len = 25088          # both sides, bytes
-    blocks_per_track = (track_len + 511) // 512  # 49
+    # track_len is the per-track bitstream length (both sides interleaved) the
+    # emulator streams per revolution. Every genuine PianoSoft/Nalbantov image
+    # declares 25008 (≈2 revs calibrated to 300 RPM at 250 kbit/s); the two
+    # encoded sides total 25088 bytes, so the trailing 80 bytes are pure gap
+    # the LUT length excludes — exactly how real disks store it. We previously
+    # declared the full 25088, emulating ~299 RPM; the piano's OEM floppy
+    # controller is stricter than our own decoder and misread it (blank /
+    # "convert disk"). The 49-block file allocation per track is unchanged.
+    track_len = 25008          # both sides, bytes (matches real PianoSoft)
+    blocks_per_track = 49      # 49 * 512 = 25088 bytes allocated per track
     header = bytearray(512)
     header[0:8] = b"HXCPICFE"
     header[8] = 0              # revision
@@ -218,7 +226,9 @@ def img_to_hfe(img):
     header[11] = 0             # ISOIBM_MFM
     header[12:14] = struct.pack("<H", 250)
     header[14:16] = struct.pack("<H", 0)
-    header[16] = 1             # IBMPC_DD_FLOPPYMODE (was 0 = generic Shugart)
+    header[16] = 0             # GENERIC_SHUGART_DD — every real PianoSoft image
+                               # uses 0 here; a prior build set 1 (IBMPC_DD),
+                               # which no working disk uses.
     header[17] = 1
     header[18:20] = struct.pack("<H", 1)  # track list at block 1
     header[20:] = b"\xFF" * (512 - 20)
