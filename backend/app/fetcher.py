@@ -154,14 +154,13 @@ def download_audio(url, job_dir, progress_cb, include_video=False,
     stereo PCM). Returns (wav_path, title, video_name) — video_name is the
     kept video file's basename (include_video=True), else None.
 
-    section=(start, end) seconds restricts the download to that slice of the
-    source (used to split an album-as-one-video into per-chapter jobs). The
-    slice is padded past `end` by RING_PAD_SEC so the final chord's pedal
-    ring-out — which crosses the chapter boundary — is present in the audio
-    for transcription; the pipeline caps the export window at the unpadded
-    boundary so any next-track notes caught in the pad never play."""
-    from yt_dlp.utils import download_range_func  # lazy: heavy import
-
+    section=(start, end) seconds selects one chapter of an album-as-one-video
+    (per-chapter split jobs). The whole source is still downloaded; the slice
+    is cut locally afterwards (see below). The kept slice is padded past `end`
+    by RING_PAD_SEC so the final chord's pedal ring-out — which crosses the
+    chapter boundary — is present in the audio for transcription; the pipeline
+    caps the export window at the unpadded boundary so any next-track notes
+    caught in the pad never play."""
     pipeline._ensure_ffmpeg(lambda stage, pct: None)
 
     def hook(d):
@@ -185,11 +184,12 @@ def download_audio(url, job_dir, progress_cb, include_video=False,
         # skipped). Needs yt-dlp[default] for the bundled EJS solver.
         "js_runtimes": {"node": {}, "deno": {}},
     }
-    if section:
-        start, end = section
-        opts["download_ranges"] = download_range_func(
-            None, [(start, end + RING_PAD_SEC)])
-        opts["force_keyframes_at_cuts"] = True
+    # A section job downloads the whole source, not just the slice: yt-dlp's
+    # range download hands the raw googlevideo URL to a bare ffmpeg, which
+    # YouTube now 403s — that URL is bound to the extractor client's
+    # User-Agent and ffmpeg sends the generic web one. The full download uses
+    # yt-dlp's native HTTP path (correct per-format headers); the chapter is
+    # cut locally below, where no 403 is possible.
     if include_video:
         # Best video+audio muxed into mp4 (Chromium-playable, incl. vp9).
         # Cap at 1080p — the TV doesn't need 4K and the files quadruple.
@@ -217,10 +217,19 @@ def download_audio(url, job_dir, progress_cb, include_video=False,
     if source is None:
         raise RuntimeError("download finished but media file missing")
 
+    # Chapter slice cut from the local file. -ss before -i seeks the input
+    # and -t bounds the decoded duration, so the WAV starts at the chapter's
+    # start (t=0 in the output), exactly as the old range download produced.
+    seek, dur = [], []
+    if section:
+        start, end = section
+        seek = ["-ss", "%.3f" % start]
+        dur = ["-t", "%.3f" % (end + RING_PAD_SEC - start)]
+
     progress_cb("downloading", 92)
     wav_path = os.path.join(job_dir, "input.wav")
     proc = subprocess.run(
-        [pipeline.FFMPEG_EXE, "-y", "-i", source, "-vn",
+        [pipeline.FFMPEG_EXE, "-y", *seek, "-i", source, *dur, "-vn",
          "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", wav_path],
         capture_output=True)
     if proc.returncode != 0 or not os.path.exists(wav_path):
@@ -230,9 +239,24 @@ def download_audio(url, job_dir, progress_cb, include_video=False,
 
     video_name = None
     if include_video:
-        # Keep the download itself as the job's video, under a stable name.
+        # Keep the download as the job's video, under a stable name.
         video_name = "video" + os.path.splitext(source)[1].lower()
-        os.replace(source, os.path.join(job_dir, video_name))
+        video_path = os.path.join(job_dir, video_name)
+        if section:
+            # Match the video to the chapter so the Play tab and the
+            # backing-track mux line up with the sliced audio. Keyframe
+            # stream-copy (fast, lossless); any sub-keyframe lead is absorbed
+            # by the Play tab's sync-offset control.
+            vproc = subprocess.run(
+                [pipeline.FFMPEG_EXE, "-y", *seek, "-i", source, *dur,
+                 "-c", "copy", video_path],
+                capture_output=True)
+            if vproc.returncode != 0 or not os.path.exists(video_path):
+                os.replace(source, video_path)  # untrimmed beats failing
+            else:
+                os.remove(source)
+        else:
+            os.replace(source, video_path)
     else:
         os.remove(source)
     progress_cb("downloading", 100)
