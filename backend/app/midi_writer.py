@@ -57,10 +57,15 @@ def shape_note_end(onset, offset, pitch, release_ms, cap_sustain):
     return end if end > floor else floor
 
 
-def map_velocity(raw, vel_min, vel_max, gamma):
+def map_velocity(raw, vel_min, vel_max, gamma, vel_scale=1.0):
     """Map raw model velocity (1-127) onto a playable Disklavier range.
 
     gamma < 1 lifts quiet notes, gamma > 1 exaggerates dynamics.
+    vel_scale (0..1) uniformly attenuates the mapped result — a non-destructive
+    "volume" drop applied at export time. Velocity is the Disklavier's loudness
+    (how hard each key strikes), so scaling it turns the whole song down while
+    keeping its relative dynamics. The output still floors at 1 so no note-on
+    silently degrades into a note-off (velocity 0).
     """
     norm = raw / 127.0
     if norm < 0.0:
@@ -68,7 +73,7 @@ def map_velocity(raw, vel_min, vel_max, gamma):
     if norm > 1.0:
         norm = 1.0
     shaped = norm ** gamma
-    out = int(round(vel_min + shaped * (vel_max - vel_min)))
+    out = int(round((vel_min + shaped * (vel_max - vel_min)) * vel_scale))
     if out < 1:
         out = 1
     if out > 127:
@@ -126,12 +131,13 @@ def read_midi(path):
 def write_midi(notes, pedals, out_path,
                vel_min=20, vel_max=112, gamma=1.0,
                offset_ms=0, include_pedal=True, release_ms=0,
-               cap_sustain=True):
+               cap_sustain=True, vel_scale=1.0):
     """notes: [{onset, offset, pitch, velocity}], pedals: [{onset, offset}].
 
     Times in seconds. offset_ms shifts every event (positive = later).
     release_ms trims each note's tail so keys don't hold too long; cap_sustain
-    clamps any note to its pitch's physical sustain ceiling.
+    clamps any note to its pitch's physical sustain ceiling. vel_scale (0..1)
+    turns the whole song's velocities down (non-destructive volume drop).
     Returns number of notes written.
     """
     shift = offset_ms / 1000.0
@@ -144,7 +150,7 @@ def write_midi(notes, pedals, out_path,
             continue
         offset = shape_note_end(onset, offset, n["pitch"], release_ms,
                                 cap_sustain)
-        vel = map_velocity(n["velocity"], vel_min, vel_max, gamma)
+        vel = map_velocity(n["velocity"], vel_min, vel_max, gamma, vel_scale)
         on_tick = _sec_to_ticks(onset)
         off_tick = _sec_to_ticks(offset)
         if off_tick <= on_tick:

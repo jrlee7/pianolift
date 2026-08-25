@@ -130,7 +130,8 @@ export default function NoteEditor({
   events, onChange, onSave, onReset, dirty, saving, playheadSec, onSeek,
   trimStart, trimEnd, onApplyTrim, trimming, hasAccompaniment,
   onPlay, onRestart, previewing,
-  loopA, loopB, onSetLoopA, onSetLoopB, onClearLoop
+  loopA, loopB, onSetLoopA, onSetLoopB, onClearLoop,
+  volPct, onVolPct
 }) {
   const [pxPerSec, setPxPerSec] = useState(40)
   const [tool, setTool] = useState('select')
@@ -1217,6 +1218,16 @@ export default function NoteEditor({
               onChange={function (e) { setRingSec(e.target.value) }} />s
           </label>
         </div>
+        {onVolPct && (
+          <div className="tool-group vol-group"
+            title="Turn the whole song down without changing its dynamics. Non-destructive — applied on export/USB/floppy, and the accompaniment drops with it. Same control as the Volume slider in the panel below.">
+            <span className="vol-icon">🔊</span>
+            <input type="range" min="10" max="100" step="1"
+              value={volPct != null ? volPct : 100}
+              onChange={function (e) { onVolPct(Number(e.target.value)) }} />
+            <span className="vol-readout">{volPct != null ? volPct : 100}%</span>
+          </div>
+        )}
         {selCount > 0 && (
           <div className="tool-group">
             <span className="sel-count">{selCount} selected</span>

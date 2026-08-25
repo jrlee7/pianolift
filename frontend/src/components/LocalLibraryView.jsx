@@ -4,6 +4,7 @@ import {
   localLibraryOnDisk
 } from '../localLibrary.js'
 import { downloadMidiBase64 } from '../firebase.js'
+import { scaleMidi, applyMp3Gain } from '../api.js'
 
 // Windows/FAT-safe filename (mirrors the cloud library's fsSafe).
 function fsSafe(name) {
@@ -21,6 +22,7 @@ export default function LocalLibraryView({ onWatch }) {
   const [draft, setDraft] = useState('')
   const [audio, setAudio] = useState(null) // { id, url }
   const [selected, setSelected] = useState(() => new Set())
+  const [bulkVol, setBulkVol] = useState(100) // transfer-time volume drop (%)
   const [copying, setCopying] = useState(null)
   const [copyResult, setCopyResult] = useState(null)
 
@@ -92,14 +94,21 @@ export default function LocalLibraryView({ onWatch }) {
       const base = fsSafe(song.title)
       try {
         if (song.midiBase64) {
-          const bin = atob(song.midiBase64)
+          // Non-destructive volume drop: rescale the stored MIDI's velocities.
+          const b64 = await scaleMidi(song.midiBase64, bulkVol)
+          const bin = atob(b64)
           const bytes = new Uint8Array(bin.length)
           for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
           await write(base + '.mid', bytes)
         }
         if (song.hasMp3) {
           const mp3 = await localMp3Bytes(song.id)
-          if (mp3) await write(base + ' (no piano).mp3', mp3)
+          if (mp3) {
+            // Drop the accompaniment by the same amount to match the piano.
+            const gained = await applyMp3Gain(new Blob([mp3], { type: 'audio/mpeg' }), bulkVol)
+            const buf = new Uint8Array(await gained.arrayBuffer())
+            await write(base + ' (no piano).mp3', buf)
+          }
         }
       } catch (e) { errors.push(song.title + ' — ' + (e.message || e)) }
       done++
@@ -139,6 +148,14 @@ export default function LocalLibraryView({ onWatch }) {
       {!loading && visible.length > 0 && (
         <div className="lib-select-bar">
           <span className="meta">{selected.size} selected</span>
+          <label className="bulk-vol"
+            title="Turn the selected songs down as they transfer — non-destructive. Affects both piano velocity and accompaniment. 100% = untouched.">
+            🔊
+            <input type="range" min="10" max="100" step="1" value={bulkVol}
+              disabled={Boolean(copying)}
+              onChange={(e) => setBulkVol(Number(e.target.value))} />
+            <span className="meta">{bulkVol}%</span>
+          </label>
           <button className="primary" disabled={!selected.size || Boolean(copying)} onClick={copyToUsb}>
             {copying ? 'Copying ' + copying.done + '/' + copying.total + '…'
               : '💾 Copy ' + (selected.size || '') + ' to USB folder…'}

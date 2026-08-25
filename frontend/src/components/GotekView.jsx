@@ -57,7 +57,7 @@ function escapeHtml(s) {
   })
 }
 
-export default function GotekView({ jobs, loadLibrary }) {
+export default function GotekView({ jobs, loadLibrary, onEditJob }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -205,6 +205,7 @@ export default function GotekView({ jobs, loadLibrary }) {
           catalog={data}
           jobs={jobs}
           loadLibrary={loadLibrary}
+          onEditJob={onEditJob}
           onClose={function () { setEditSlot(null) }}
           onSaved={function () { setEditSlot(null); load() }} />
       )}

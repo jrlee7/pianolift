@@ -10,7 +10,7 @@ import { createPreviewPlayer, createNotePlayer } from '../previewSynth.js'
 
 const DEFAULTS = {
   velMin: 20, velMax: 112, gamma: 1.0, offsetMs: 0, pedal: true,
-  releaseMs: 0, capSustain: true
+  releaseMs: 0, capSustain: true, volPct: 100
 }
 
 // give every note/pedal a stable id the editor can track selections with
@@ -349,6 +349,10 @@ export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo
     // Same math the backend bakes into the real MIDI render:
     // user offset + codec-delay compensation - dead-space trim.
     const effOffset = settings.offsetMs / 1000 + encDelay - trimStart
+    // Drop the accompaniment in step with the piano (non-destructive volume):
+    // exports attenuate both together, so the preview should too.
+    accompRef.current.volume =
+      settings.volPct != null ? Math.max(0, Math.min(1, settings.volPct / 100)) : 1
     // Match the "Sustain pedal" export toggle: off means the exported files
     // carry no CC64 either, so the preview shouldn't fake a ring for it.
     const player = createPreviewPlayer(
@@ -572,7 +576,9 @@ export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo
               if (loopA != null && playhead > loopA) setLoopB(playhead)
               else setLoopB(playhead > 0 ? playhead : null)
             }}
-            onClearLoop={function () { setLoopA(null); setLoopB(null) }} />
+            onClearLoop={function () { setLoopA(null); setLoopB(null) }}
+            volPct={settings.volPct}
+            onVolPct={function (v) { set('volPct', v) }} />
         : <div className="meta">Loading note data…</div>}
 
       {dirty && (
@@ -583,6 +589,17 @@ export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo
       )}
 
       <div className="controls">
+        <div className="control">
+          <label>Volume — <span className="val">{settings.volPct}%</span></label>
+          <input type="range" min="10" max="100" step="1" value={settings.volPct}
+            onChange={function (e) { set('volPct', Number(e.target.value)) }} />
+          <div className="hint">
+            Turns the whole song down without touching its dynamics — every note
+            softer by the same amount, and the accompaniment drops with it. 100%
+            = as tuned. Non-destructive: applied on export/USB/floppy, so the
+            stored song is untouched. Also on the editor's toolbar.
+          </div>
+        </div>
         <div className="control">
           <label>Velocity floor — <span className="val">{settings.velMin}</span></label>
           <input type="range" min="1" max="80" value={settings.velMin}

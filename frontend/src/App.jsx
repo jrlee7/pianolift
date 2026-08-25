@@ -907,7 +907,8 @@ export default function App() {
       {tab === 'disk' && (
         <GotekView
           jobs={doneJobs}
-          loadLibrary={isFamily ? listSongs : localList} />
+          loadLibrary={isFamily ? listSongs : localList}
+          onEditJob={handleEditFromLibrary} />
       )}
 
       {tab === 'links' && <SourcesView />}

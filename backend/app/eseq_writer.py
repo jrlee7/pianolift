@@ -84,11 +84,12 @@ def _preamble():
 def write_eseq(notes, pedals, out_path, title="",
                vel_min=20, vel_max=112, gamma=1.0,
                offset_ms=0, include_pedal=True, dos_name="PIANO01",
-               release_ms=0, cap_sustain=True):
+               release_ms=0, cap_sustain=True, vel_scale=1.0):
     """Write an E-SEQ .FIL. Same event semantics as midi_writer.write_midi:
     times in seconds on the original timeline, offset_ms shifts everything,
     release_ms trims each note's tail and cap_sustain clamps to the physical
-    sustain ceiling (pedal segments are left untouched).
+    sustain ceiling (pedal segments are left untouched). vel_scale (0..1)
+    turns the whole song down (non-destructive volume drop).
     Returns number of notes written."""
     shift = offset_ms / 1000.0
 
@@ -104,7 +105,7 @@ def write_eseq(notes, pedals, out_path, title="",
         offset = shape_note_end(onset, offset, n["pitch"], release_ms,
                                 cap_sustain)
         note_count += 1
-        vel = map_velocity(n["velocity"], vel_min, vel_max, gamma)
+        vel = map_velocity(n["velocity"], vel_min, vel_max, gamma, vel_scale)
         on_u = _sec_to_units(onset)
         off_u = _sec_to_units(offset)
         if off_u <= on_u:
@@ -171,3 +172,107 @@ def write_eseq(notes, pedals, out_path, title="",
     with open(out_path, "wb") as f:
         f.write(bytes(header) + bytes(stream))
     return note_count
+
+
+def read_eseq(fil_bytes):
+    """Decode an E-SEQ .FIL back into (notes, pedals, title) -- the inverse
+    of write_eseq, generalized with running-status support so it also reads
+    real PianoSoft-authored disks (not just files this app wrote): E-SEQ is
+    a fixed Yamaha format, not app-specific. Raises ValueError on anything
+    that isn't a COM-ESEQ file.
+
+    Best-effort outside the documented grammar (module docstring): system
+    common/realtime bytes other than F0-F4/F7 aren't expected to appear and
+    aren't specially handled, so a disk using them could desync -- caught by
+    the caller same as any other malformed file."""
+    if len(fil_bytes) < 0x77 or bytes(fil_bytes[0x07:0x0F]) != b"COM-ESEQ":
+        raise ValueError("not a COM-ESEQ file")
+    title = fil_bytes[0x57:0x77].decode("latin1", "replace").rstrip()
+    stream = fil_bytes[0x77:]
+    n = len(stream)
+
+    notes, pedals = [], []
+    held = {}              # pitch -> (onset_units, velocity)
+    pedal_on_units = None
+    cur = 0
+    pos = 0
+    status = None
+    while pos < n:
+        b = stream[pos]
+        if b == 0xF2:
+            break
+        if b == 0xF3:
+            if pos + 1 >= n:
+                break
+            cur += stream[pos + 1]
+            pos += 2
+            continue
+        if b == 0xF4:
+            if pos + 2 >= n:
+                break
+            cur += stream[pos + 1] | (stream[pos + 2] << 7)
+            pos += 3
+            continue
+        if b == 0xF0:
+            end = stream.find(0xF7, pos + 1)
+            pos = n if end < 0 else end + 1
+            continue
+        if b == 0xF1:
+            pos += 2  # 1 data byte, no musical meaning (device-reset marker)
+            continue
+        if b & 0x80:
+            status = b
+            pos += 1
+            if pos >= n:
+                break
+            d1 = stream[pos]
+        else:
+            if status is None:
+                pos += 1
+                continue
+            d1 = b
+        hi = status & 0xF0
+        if hi in (0x80, 0x90, 0xA0, 0xB0, 0xE0):
+            pos += 1
+            if pos >= n:
+                break
+            d2 = stream[pos]
+            pos += 1
+        elif hi in (0xC0, 0xD0):
+            d2 = None
+            pos += 1
+        else:
+            pos += 1
+            continue
+
+        if hi == 0x90 and d2:
+            held[d1] = (cur, d2)
+        elif hi == 0x80 or (hi == 0x90 and not d2):
+            start = held.pop(d1, None)
+            if start is not None:
+                on_u, vel = start
+                notes.append({"onset": round(on_u / UNITS_PER_SEC, 4),
+                             "offset": round(cur / UNITS_PER_SEC, 4),
+                             "pitch": d1, "velocity": vel})
+        elif hi == 0xB0 and d1 == 0x40:
+            if d2 is not None and d2 >= 64:
+                if pedal_on_units is None:
+                    pedal_on_units = cur
+            elif pedal_on_units is not None:
+                pedals.append({"onset": round(pedal_on_units / UNITS_PER_SEC, 4),
+                              "offset": round(cur / UNITS_PER_SEC, 4)})
+                pedal_on_units = None
+
+    # Anything still held when the stream ends (or was truncated) closes at
+    # the last position seen rather than being dropped.
+    for pitch, (on_u, vel) in held.items():
+        notes.append({"onset": round(on_u / UNITS_PER_SEC, 4),
+                     "offset": round(cur / UNITS_PER_SEC, 4),
+                     "pitch": pitch, "velocity": vel})
+    if pedal_on_units is not None:
+        pedals.append({"onset": round(pedal_on_units / UNITS_PER_SEC, 4),
+                      "offset": round(cur / UNITS_PER_SEC, 4)})
+
+    notes.sort(key=lambda x: x["onset"])
+    pedals.sort(key=lambda x: x["onset"])
+    return notes, pedals, title

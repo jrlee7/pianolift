@@ -72,19 +72,48 @@ def _ensure_ffmpeg(progress_cb):
     os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ["PATH"]
 
 
-def separate_piano(audio_path, job_dir, progress_cb):
-    """Run BS-Roformer-SW, return path to the piano stem wav.
+# A whole-file separation loads the entire stereo waveform (plus the model's
+# tensors) into RAM at once. On the CPU path a full-length concert/movie
+# (~2.6 GB just for the 44.1k stereo PCM of a 2-hour file) overruns memory and
+# the OS kills the worker — which surfaces to the UI as the generic
+# "Conversion process exited unexpectedly". Above SEP_LONG_THRESHOLD_SEC the
+# audio is separated in overlapping windows and the stems crossfaded back
+# together, so peak memory is bounded by the window size no matter how long the
+# source runs. Short songs (the common case) still take the single-pass path.
+SEP_LONG_THRESHOLD_SEC = 900.0   # 15 min
+SEP_CHUNK_SEC = 300.0            # 5-minute separation windows
+SEP_OVERLAP_SEC = 6.0           # crossfaded seam between adjacent windows
 
-    The model has no Demucs-style "--two-stems" complement, so we also sum
-    the other 5 stems it produces into no_piano.wav -- the accompaniment
-    that plays through the ENSPIRE speakers.
-    """
+# Same OOM shape hits transcription: a single ByteDance or Transkun forward
+# pass over a whole 2-hour file's worth of frames holds the model's
+# internal activations for the entire sequence at once. Separation got
+# chunked in 0.1.25; a later addition -- transcribing the original mix a
+# second time as note_verify cross-check evidence -- reintroduced a
+# whole-file model pass that wasn't there when that fix was validated, and
+# now fails the same way, late (mid-"transcribing" stage) and silently
+# (child OOM-killed -> queue gets nothing -> generic "exited unexpectedly").
+# Above the threshold, each model pass runs in overlapping windows: the
+# overlap is context only (for accurate onsets/offsets right at the seam),
+# and only the non-overlapping core of each window's events is kept, so
+# windows stitch back together with no dedup pass needed. The raw decoded
+# audio arrays are loaded once, whole, up front -- that's a few hundred MB
+# to a couple GB and isn't what was OOMing; only the model passes are
+# chunked.
+TRX_LONG_THRESHOLD_SEC = 900.0   # 15 min
+TRX_CHUNK_SEC = 240.0            # 4-minute core window per model pass
+TRX_PAD_SEC = 20.0               # context on each side, trimmed after
+# A pedal held continuously across a chunk seam gets cut into two segments
+# (each window only sees its own slice); segments that touch within this
+# gap are the same physical hold and get merged back into one.
+PEDAL_MERGE_GAP_SEC = 0.5
+
+
+def _build_separator(job_dir):
+    """Create the BS-Roformer separator and load its checkpoint once. Reused
+    across every window of a chunked job so the ~700MB model loads a single
+    time."""
     from audio_separator.separator import Separator
-    import logging
-    import soundfile as sf
 
-    progress_cb("separating", 0)
-    _ensure_ffmpeg(progress_cb)
     sep_out = os.path.join(job_dir, "separated")
     model_dir = os.path.join(os.path.expanduser("~"), "audio_separator_models")
     # overlap 16 (default 8) doubles prediction-window overlap: fewer
@@ -98,13 +127,19 @@ def separate_piano(audio_path, job_dir, progress_cb):
         output_dir=sep_out, output_format="WAV", model_file_dir=model_dir,
         mdxc_params={"segment_size": 256, "override_model_segment_size": False,
                      "batch_size": 1, "overlap": overlap, "pitch_shift": 0})
-    progress_cb("separating", 5)  # first run downloads a ~700MB checkpoint
     separator.load_model(model_filename=SEPARATION_MODEL)
+    return separator, sep_out
 
-    # audio_separator's Separator.separate() catches any exception per file
-    # internally and only logs it -- a genuine failure (OOM, a corrupt
-    # cached checkpoint, a disk error) looks identical to "produced nothing"
-    # unless we grab its suppressed log record ourselves.
+
+def _separate_one(separator, sep_out, in_path):
+    """Separate a single file into (piano_path, [accompaniment_paths]).
+
+    audio_separator's separate() catches any exception per file internally and
+    only logs it, so a genuine failure (OOM, a corrupt cached checkpoint, a
+    disk error) looks identical to "produced nothing" unless we grab its
+    suppressed log record ourselves."""
+    import logging
+
     class _CaptureErrors(logging.Handler):
         def __init__(self):
             super().__init__(level=logging.ERROR)
@@ -117,27 +152,150 @@ def separate_piano(audio_path, job_dir, progress_cb):
     logging.getLogger().addHandler(capture)
     try:
         # separate() returns bare filenames, not joined with output_dir.
-        output_files = [os.path.join(sep_out, f) for f in separator.separate(audio_path)]
+        outs = [os.path.join(sep_out, f) for f in separator.separate(in_path)]
     finally:
         logging.getLogger().removeHandler(capture)
-    progress_cb("separating", 100)
 
-    piano_wav = next(
-        (f for f in output_files if "piano" in os.path.basename(f).lower()), None)
-    if piano_wav is None:
+    piano = next(
+        (f for f in outs if "piano" in os.path.basename(f).lower()), None)
+    if piano is None:
         detail = "; ".join(capture.messages) or "no error logged by the separator"
         raise RuntimeError("Separator finished but piano stem not found (" + detail + ")")
-
-    accompaniment_stems = [f for f in output_files if f != piano_wav]
-    if not accompaniment_stems:
+    accomp = [f for f in outs if f != piano]
+    if not accomp:
         raise RuntimeError("Separator finished but no accompaniment stems found")
+    return piano, accomp
+
+
+def _sum_stems(paths):
+    """Read and sum a window's accompaniment stems into one (frames, ch) array
+    — the no_piano mix for that window."""
+    import soundfile as sf
+
     mix = None
-    sr = None
-    for f in accompaniment_stems:
-        data, sr = sf.read(f, dtype="float32")
+    for f in paths:
+        data, _ = sf.read(f, dtype="float32", always_2d=True)
         mix = data if mix is None else mix + data
+    return mix
+
+
+def _write_stitch(writer, chunk, prev_tail, over_fr, is_last):
+    """Append one window's audio to a streaming SoundFile, crossfading its head
+    against the previous window's held-back tail so window seams are inaudible.
+    Returns this window's own tail (last over_fr frames) to hand to the next
+    call, or None on the final window. Only a few seconds of audio are ever
+    held in memory, which is what keeps a multi-hour stitch bounded."""
+    import numpy as np
+
+    n = len(chunk)
+    start = 0
+    if prev_tail is not None and over_fr > 0:
+        o = min(over_fr, n, len(prev_tail))
+        if o > 0:
+            ramp = np.linspace(0.0, 1.0, o, dtype=np.float32).reshape(-1, 1)
+            writer.write(prev_tail[-o:] * (1.0 - ramp) + chunk[:o] * ramp)
+            start = o
+    if is_last:
+        if start < n:
+            writer.write(chunk[start:])
+        return None
+    tail_len = min(over_fr, n - start)
+    body_end = n - tail_len
+    if body_end > start:
+        writer.write(chunk[start:body_end])
+    return chunk[body_end:].copy() if tail_len > 0 else None
+
+
+def _separate_piano_chunked(audio_path, sep_out, separator, info, progress_cb):
+    """Separate a long file window-by-window, streaming the crossfaded piano
+    and no_piano stems straight to disk. Returns the piano stem path; writes
+    no_piano.wav beside it — same contract as the single-pass path."""
+    import soundfile as sf
+
+    sr = info.samplerate
+    total = info.frames
+    chunk_fr = int(SEP_CHUNK_SEC * sr)
+    over_fr = int(SEP_OVERLAP_SEC * sr)
+    n_chunks = max(1, (total + chunk_fr - 1) // chunk_fr)
+
+    piano_out = os.path.join(sep_out, "piano_full.wav")
+    nopiano_out = os.path.join(sep_out, "no_piano.wav")
+    piano_w = nopiano_w = None
+    tail_p = tail_n = None
+    try:
+        for i in range(n_chunks):
+            start = i * chunk_fr
+            if start >= total:
+                break
+            end = min(total, (i + 1) * chunk_fr + over_fr)
+            chunk, _ = sf.read(audio_path, start=start, frames=end - start,
+                               dtype="float32", always_2d=True)
+            tmp_in = os.path.join(sep_out, "chunk_%03d.wav" % i)
+            sf.write(tmp_in, chunk, sr)
+            del chunk
+
+            piano_p, accomp = _separate_one(separator, sep_out, tmp_in)
+            p, _ = sf.read(piano_p, dtype="float32", always_2d=True)
+            npmix = _sum_stems(accomp)
+
+            if piano_w is None:
+                piano_w = sf.SoundFile(piano_out, mode="w", samplerate=sr,
+                                       channels=p.shape[1], subtype="PCM_16")
+                nopiano_w = sf.SoundFile(nopiano_out, mode="w", samplerate=sr,
+                                         channels=npmix.shape[1], subtype="PCM_16")
+
+            # end can reach the file end early when a window's overlap padding
+            # spills past `total`; that window already covers the rest, so stop
+            # rather than emit a spurious tiny trailing window.
+            is_last = end >= total
+            tail_p = _write_stitch(piano_w, p, tail_p, over_fr, is_last)
+            tail_n = _write_stitch(nopiano_w, npmix, tail_n, over_fr, is_last)
+
+            for f in [tmp_in, piano_p] + accomp:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            progress_cb("separating", min(99, 5 + int(94 * (i + 1) / n_chunks)))
+            if is_last:
+                break
+    finally:
+        if piano_w is not None:
+            piano_w.close()
+        if nopiano_w is not None:
+            nopiano_w.close()
+
+    progress_cb("separating", 100)
+    return piano_out
+
+
+def separate_piano(audio_path, job_dir, progress_cb):
+    """Run BS-Roformer-SW, return path to the piano stem wav.
+
+    The model has no Demucs-style "--two-stems" complement, so we also sum
+    the other 5 stems it produces into no_piano.wav -- the accompaniment
+    that plays through the ENSPIRE speakers. Long inputs are separated in
+    windows (see _separate_piano_chunked) to keep memory bounded.
+    """
+    import soundfile as sf
+
+    progress_cb("separating", 0)
+    _ensure_ffmpeg(progress_cb)
+    info = sf.info(audio_path)
+    duration = info.frames / float(info.samplerate) if info.samplerate else 0.0
+    separator, sep_out = _build_separator(job_dir)
+    progress_cb("separating", 5)  # first run downloads a ~700MB checkpoint
+
+    if duration > SEP_LONG_THRESHOLD_SEC:
+        return _separate_piano_chunked(audio_path, sep_out, separator, info,
+                                       progress_cb)
+
+    piano_wav, accompaniment_stems = _separate_one(separator, sep_out, audio_path)
+    progress_cb("separating", 100)
+
+    mix = _sum_stems(accompaniment_stems)
     no_piano_wav = os.path.join(os.path.dirname(piano_wav), "no_piano.wav")
-    sf.write(no_piano_wav, mix, sr)
+    sf.write(no_piano_wav, mix, info.samplerate)
 
     # The 5 individual stems (~50MB each) are never read again once summed:
     # every later step (trim re-encode, verify, playback) uses only the
@@ -195,16 +353,34 @@ def detect_dead_space(audio_path):
     import numpy as np
     import soundfile as sf
 
-    data, sr = sf.read(audio_path)
-    mono = data.mean(axis=1) if data.ndim > 1 else data
-    peak = float(np.max(np.abs(mono)))
+    # Streamed in blocks so a multi-hour mix never loads whole into RAM (a
+    # full sf.read of a 2-hour file is gigabytes of float). Pass 1 finds the
+    # track's peak; pass 2 finds the first frame that clears the threshold.
+    sr = sf.info(audio_path).samplerate
+    BLK = 1 << 20  # ~1M frames/block
+
+    peak = 0.0
+    for block in sf.blocks(audio_path, blocksize=BLK, dtype="float32"):
+        mono = block.mean(axis=1) if block.ndim > 1 else block
+        if len(mono):
+            peak = max(peak, float(np.max(np.abs(mono))))
     if peak <= 0:
         return 0.0, None
+
     # ~-34 dB below the track's own peak counts as "sound"
-    loud = np.where(np.abs(mono) > peak * 0.02)[0]
-    if len(loud) == 0:
+    thr = peak * 0.02
+    pos = 0
+    first = None
+    for block in sf.blocks(audio_path, blocksize=BLK, dtype="float32"):
+        mono = block.mean(axis=1) if block.ndim > 1 else block
+        idx = np.where(np.abs(mono) > thr)[0]
+        if len(idx):
+            first = pos + int(idx[0])
+            break
+        pos += len(mono)
+    if first is None:
         return 0.0, None
-    start = max(0.0, loud[0] / float(sr) - 0.2)
+    start = max(0.0, first / float(sr) - 0.2)
     return round(start, 3), None
 
 
@@ -225,11 +401,15 @@ def has_real_accompaniment(no_piano_wav, piano_wav):
     import soundfile as sf
 
     def rms(path):
-        data, _ = sf.read(path, dtype="float32")
-        mono = data.mean(axis=1) if data.ndim > 1 else data
-        if len(mono) == 0:
-            return 0.0
-        return float(np.sqrt(np.mean(np.square(mono))))
+        # Block-streamed so long stems don't load whole into RAM.
+        total = 0.0
+        count = 0
+        for block in sf.blocks(path, blocksize=1 << 20, dtype="float32"):
+            mono = block.mean(axis=1) if block.ndim > 1 else block
+            if len(mono):
+                total += float(np.sum(np.square(mono)))
+                count += len(mono)
+        return float(np.sqrt(total / count)) if count else 0.0
 
     acc = rms(no_piano_wav)
     piano = rms(piano_wav)
@@ -249,23 +429,34 @@ def encode_accompaniment(no_piano_wav, job_dir, progress_cb,
     import soundfile as sf
 
     progress_cb("encoding", 0)
-    data, sr = sf.read(no_piano_wav, dtype="int16")
-    if data.ndim == 1:
-        data = np.column_stack([data, data])
+    info = sf.info(no_piano_wav)
+    sr = info.samplerate
     lo = int(trim_start * sr)
-    hi = len(data) if trim_end is None else min(len(data), int(trim_end * sr))
-    data = data[lo:hi]
+    hi = info.frames if trim_end is None else min(info.frames,
+                                                  int(trim_end * sr))
     encoder = lameenc.Encoder()
     encoder.set_bit_rate(320)
     encoder.set_in_sample_rate(sr)
     encoder.set_channels(2)
     encoder.set_quality(2)
     encoder.silence()
-    mp3_bytes = encoder.encode(data.tobytes())
-    mp3_bytes += encoder.flush()
     out = os.path.join(job_dir, "accompaniment.mp3")
+    # Stream the trimmed window [lo, hi) through the encoder in blocks: a
+    # 2-hour stem is >1 GB of int16, and .tobytes() would double it — the old
+    # whole-file read OOM'd on long inputs. lameenc keeps state across encode()
+    # calls, so block-by-block output is identical to one big call.
     with open(out, "wb") as f:
-        f.write(bytes(mp3_bytes))
+        pos = lo
+        BLK = 1 << 20
+        while pos < hi:
+            n = min(BLK, hi - pos)
+            data, _ = sf.read(no_piano_wav, start=pos, frames=n,
+                              dtype="int16", always_2d=True)
+            if data.shape[1] == 1:
+                data = np.column_stack([data[:, 0], data[:, 0]])
+            f.write(bytes(encoder.encode(data.tobytes())))
+            pos += n
+        f.write(bytes(encoder.flush()))
     progress_cb("encoding", 100)
     delay_ms = MP3_ENCODER_DELAY_SAMPLES / sr * 1000.0
     return out, delay_ms
@@ -327,6 +518,87 @@ def _peak_normalize(audio):
     return audio
 
 
+def _chunk_windows(duration_sec, chunk_sec, pad_sec):
+    """Yield (window_start, window_end, core_start, core_end) in seconds
+    covering [0, duration_sec) in non-overlapping cores, each window padded
+    with context on both sides (clamped to the file's bounds)."""
+    core_start = 0.0
+    while core_start < duration_sec:
+        core_end = min(core_start + chunk_sec, duration_sec)
+        window_start = max(0.0, core_start - pad_sec)
+        window_end = min(duration_sec, core_end + pad_sec)
+        yield window_start, window_end, core_start, core_end
+        core_start = core_end
+
+
+def _keep_core_events(notes, pedals, window_start, core_start, core_end,
+                       out_notes, out_pedals):
+    """Shift a window's locally-timed events to absolute time and keep
+    only those whose onset falls in the window's non-overlapping core —
+    the padding on either side exists purely for model context."""
+    for n in notes:
+        onset = n["onset"] + window_start
+        if core_start <= onset < core_end:
+            n2 = dict(n)
+            n2["onset"] = round(onset, 4)
+            n2["offset"] = round(n["offset"] + window_start, 4)
+            out_notes.append(n2)
+    for p in pedals:
+        onset = p["onset"] + window_start
+        if core_start <= onset < core_end:
+            p2 = dict(p)
+            p2["onset"] = round(onset, 4)
+            p2["offset"] = round(p["offset"] + window_start, 4)
+            out_pedals.append(p2)
+
+
+def _merge_touching_pedals(pedals, gap_sec=PEDAL_MERGE_GAP_SEC):
+    """A pedal held across a chunk seam is split into two segments (each
+    window only sees its own slice); segments that touch within gap_sec
+    are one physical hold and get merged back together."""
+    if not pedals:
+        return pedals
+    pedals = sorted(pedals, key=lambda p: p["onset"])
+    merged = [dict(pedals[0])]
+    for p in pedals[1:]:
+        last = merged[-1]
+        if p["onset"] - last["offset"] <= gap_sec:
+            last["offset"] = max(last["offset"], p["offset"])
+        else:
+            merged.append(dict(p))
+    return merged
+
+
+def _bd_transcribe_chunked(transcriptor, audio, sr, progress_cb, lo, hi):
+    duration = len(audio) / sr
+    windows = list(_chunk_windows(duration, TRX_CHUNK_SEC, TRX_PAD_SEC))
+    notes, pedals = [], []
+    for i, (ws, we, cs, ce) in enumerate(windows):
+        result = transcriptor.transcribe(audio[int(ws * sr):int(we * sr)], None)
+        w_notes, w_pedals = _events_from_result(result)
+        _keep_core_events(w_notes, w_pedals, ws, cs, ce, notes, pedals)
+        if progress_cb:
+            progress_cb("transcribing", lo + (hi - lo) * (i + 1) / len(windows))
+    notes.sort(key=lambda n: n["onset"])
+    pedals = _merge_touching_pedals(pedals)
+    return notes, pedals
+
+
+def _transkun_transcribe_chunked(data, sr, progress_cb, lo, hi):
+    duration = len(data) / sr
+    windows = list(_chunk_windows(duration, TRX_CHUNK_SEC, TRX_PAD_SEC))
+    notes, pedals = [], []
+    for i, (ws, we, cs, ce) in enumerate(windows):
+        w_notes, w_pedals = transkun_engine.transcribe_array(
+            data[int(ws * sr):int(we * sr)], sr)
+        _keep_core_events(w_notes, w_pedals, ws, cs, ce, notes, pedals)
+        if progress_cb:
+            progress_cb("transcribing", lo + (hi - lo) * (i + 1) / len(windows))
+    notes.sort(key=lambda n: n["onset"])
+    pedals = _merge_touching_pedals(pedals)
+    return notes, pedals
+
+
 def transcribe(piano_wav, progress_cb, mix_path=None):
     """Transcribe piano stem to note + pedal events (with velocities),
     with two engines: ByteDance high-res (primary) and Transkun V2
@@ -340,10 +612,15 @@ def transcribe(piano_wav, progress_cb, mix_path=None):
     from the mix don't matter — they were never in the stem's list, so they
     can't add notes, only confirm. Roughly doubles transcription time.
 
+    Above TRX_LONG_THRESHOLD_SEC each model pass runs chunked (see
+    TRX_CHUNK_SEC comment) to bound peak RAM; the decoded audio itself is
+    still loaded whole, once, up front.
+
     Returns (notes, pedals, mix_notes, alt_notes, alt_pedals).
     """
     from piano_transcription_inference import sample_rate
     import librosa
+    import soundfile as sf
 
     progress_cb("transcribing", 5)
     transcriptor = _load_transcriptor(progress_cb)
@@ -351,13 +628,25 @@ def transcribe(piano_wav, progress_cb, mix_path=None):
     # which Windows lacks; the stem is a plain wav so soundfile handles it.
     audio, _ = librosa.load(piano_wav, sr=sample_rate, mono=True)
     audio = _peak_normalize(audio)
+    duration = len(audio) / sample_rate
+    chunked = duration > TRX_LONG_THRESHOLD_SEC
+
     progress_cb("transcribing", 15)
-    result = transcriptor.transcribe(audio, None)
-    notes, pedals = _events_from_result(result)
+    if chunked:
+        notes, pedals = _bd_transcribe_chunked(
+            transcriptor, audio, sample_rate, progress_cb, 15, 45)
+    else:
+        result = transcriptor.transcribe(audio, None)
+        notes, pedals = _events_from_result(result)
 
     # Second engine on the same stem (Transkun normalizes internally).
     progress_cb("transcribing", 45)
-    alt_notes, alt_pedals = transkun_engine.transcribe(piano_wav)
+    if chunked:
+        tk_data, tk_sr = sf.read(piano_wav, dtype="float32")
+        alt_notes, alt_pedals = _transkun_transcribe_chunked(
+            tk_data, tk_sr, progress_cb, 45, 60)
+    else:
+        alt_notes, alt_pedals = transkun_engine.transcribe(piano_wav)
 
     mix_notes = None
     if mix_path is not None:
@@ -366,8 +655,12 @@ def transcribe(piano_wav, progress_cb, mix_path=None):
         # separation always runs first and puts our ffmpeg on PATH.
         mix_audio, _ = librosa.load(mix_path, sr=sample_rate, mono=True)
         progress_cb("transcribing", 65)
-        mix_result = transcriptor.transcribe(mix_audio, None)
-        mix_notes, _ = _events_from_result(mix_result)
+        if chunked:
+            mix_notes, _ = _bd_transcribe_chunked(
+                transcriptor, mix_audio, sample_rate, progress_cb, 65, 100)
+        else:
+            mix_result = transcriptor.transcribe(mix_audio, None)
+            mix_notes, _ = _events_from_result(mix_result)
 
     progress_cb("transcribing", 100)
     return notes, pedals, mix_notes, alt_notes, alt_pedals

@@ -3,7 +3,9 @@ import {
   firebaseReady, listSongs, deleteSong, renameSong, downloadMidiBase64,
   listFolders, createFolder, deleteFolder, setSongFolder
 } from '../firebase.js'
-import { importFromLibrary, buildDiskFromLibrary } from '../api.js'
+import {
+  importFromLibrary, buildDiskFromLibrary, scaleMidi, applyMp3Gain
+} from '../api.js'
 import DiskTitlesModal from './DiskTitlesModal.jsx'
 import UsbPrepareModal from './UsbPrepareModal.jsx'
 
@@ -52,6 +54,9 @@ export default function LibraryView({ onEdit, onWatch }) {
   const [draft, setDraft] = useState('')
   const [newFolder, setNewFolder] = useState(null) // null = closed, '' = typing
   const [selected, setSelected] = useState(function () { return new Set() })
+  // Transfer-time volume drop (1-100%) applied to the selected songs as they're
+  // copied/burned — non-destructive, the stored library copy is untouched.
+  const [bulkVol, setBulkVol] = useState(100)
   const [copying, setCopying] = useState(null) // null | { done, total }
   const [copyResult, setCopyResult] = useState(null)
   // null | { mode: 'write'|'download', songs: [...] } — title editor shown
@@ -288,12 +293,17 @@ export default function LibraryView({ onEdit, onWatch }) {
       const base = fsSafe(song.title)
       try {
         if (song.midiBase64) {
-          await native.write(base + '.mid', b64ToBytes(song.midiBase64))
+          // Turn the piano down (velocity) if a volume drop is set; the backend
+          // rescales without disturbing timing or dynamics shape.
+          const midi = await scaleMidi(song.midiBase64, bulkVol)
+          await native.write(base + '.mid', b64ToBytes(midi))
         }
         if (song.mp3Url) {
           const res = await fetch(song.mp3Url)
           if (!res.ok) throw new Error('MP3 download failed (' + res.status + ')')
-          await native.write(base + ' (no piano).mp3', await res.blob())
+          // Drop the accompaniment by the same amount so it matches the piano.
+          const mp3 = await applyMp3Gain(await res.blob(), bulkVol)
+          await native.write(base + ' (no piano).mp3', mp3)
         }
       } catch (e) {
         errors.push(song.title + ' — ' + (e.message || String(e)))
@@ -336,11 +346,12 @@ export default function LibraryView({ onEdit, onWatch }) {
     try {
       let res
       try {
-        res = await buildDiskFromLibrary(payload, { slot: slot })
+        res = await buildDiskFromLibrary(payload, { slot: slot, volPct: bulkVol })
       } catch (e) {
         if (e.status === 409 &&
           confirm('Slot ' + slot + ' already holds a song. Overwrite it?')) {
-          res = await buildDiskFromLibrary(payload, { slot: slot, overwrite: true })
+          res = await buildDiskFromLibrary(
+            payload, { slot: slot, overwrite: true, volPct: bulkVol })
         } else {
           throw e
         }
@@ -379,7 +390,8 @@ export default function LibraryView({ onEdit, onWatch }) {
     setCopyResult(null)
     setCopying({ done: 0, total: withMidi.length, disk: true })
     try {
-      const blob = await buildDiskFromLibrary(payload, { download: true })
+      const blob = await buildDiskFromLibrary(
+        payload, { download: true, volPct: bulkVol })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
@@ -526,6 +538,14 @@ export default function LibraryView({ onEdit, onWatch }) {
             <button className="ghost" onClick={clearSelection}>Clear</button>
           )}
           <span className="meta">{selected.size} selected</span>
+          <label className="bulk-vol"
+            title="Turn the selected songs down as they transfer — non-destructive, the stored library copies stay full-volume. Affects both the piano velocity and the accompaniment. 100% = untouched.">
+            🔊
+            <input type="range" min="10" max="100" step="1" value={bulkVol}
+              disabled={Boolean(copying)}
+              onChange={function (e) { setBulkVol(Number(e.target.value)) }} />
+            <span className="meta">{bulkVol}%</span>
+          </label>
           <button
             className="primary"
             disabled={selected.size === 0 || Boolean(copying)}

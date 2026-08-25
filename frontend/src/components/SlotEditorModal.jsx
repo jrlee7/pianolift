@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getSlotSongs, rewriteSlot } from '../api.js'
+import { getSlotSongs, rewriteSlot, importSongFromDisk } from '../api.js'
 import {
   MAX_PIANO_TITLE, sanitizePianoTitle, finalizePianoTitle
 } from '../pianoTitle.js'
@@ -20,7 +20,7 @@ let _keySeq = 0
 function freshKey() { return 'row' + (_keySeq++) }
 
 export default function SlotEditorModal({
-  slot, catalog, jobs, loadLibrary, onClose, onSaved
+  slot, catalog, jobs, loadLibrary, onClose, onSaved, onEditJob
 }) {
   const [rows, setRows] = useState(null)
   const [loadErr, setLoadErr] = useState(null)
@@ -137,6 +137,35 @@ export default function SlotEditorModal({
     }
   }
 
+  // Pull a song off the floppy into the app: decode it into a job (opens in
+  // the editor from there), then rewrite this slot without it so the disk
+  // reflects the move. Requires a clean list for the same reason doMove
+  // does -- origin indices must still line up with what's on the floppy.
+  async function sendToEditor(rowIdx) {
+    setErr(null)
+    setBusy(true)
+    try {
+      const song = rows[rowIdx]
+      const job = await importSongFromDisk(song.ref.fromSlot, song.ref.index)
+      try {
+        const originItems = rows
+          .filter(function (_r, k) { return k !== rowIdx })
+          .map(function (r) {
+            return { source: 'keep', fromSlot: slot, index: r.ref.index,
+                     title: finalizePianoTitle(r.title, r.origTitle) }
+          })
+        await rewriteSlot(slot, originItems)
+      } catch (e) {
+        alert('Opened in editor, but could not remove the old copy from the '
+          + 'floppy: ' + e.message)
+      }
+      if (onEditJob) await onEditJob(job.id)
+    } catch (e) {
+      setErr(e.message)
+      setBusy(false)
+    }
+  }
+
   const emptying = rows && rows.length === 0
   const badgeText = {
     job: '🎵 new', library: '📚 new',
@@ -199,6 +228,14 @@ export default function SlotEditorModal({
                         ? 'Save your changes first, then move'
                         : 'Move this song to another slot'}
                       onClick={function () { setMoving(i) }}>⇄</button>
+                    {r.kind === 'keep' && onEditJob && (
+                      <button className="ghost"
+                        disabled={busy || dirty}
+                        title={dirty
+                          ? 'Save your changes first, then send to the editor'
+                          : 'Pull this song off the floppy into the editor'}
+                        onClick={function () { sendToEditor(i) }}>✎→</button>
+                    )}
                     <button className="ghost" disabled={busy} title="Remove"
                       onClick={function () { remove(i) }}>🗑</button>
                   </div>

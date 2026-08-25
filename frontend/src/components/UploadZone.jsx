@@ -3,12 +3,19 @@ import { useRef, useState } from 'react'
 export default function UploadZone({ onFiles, onUrl }) {
   const inputRef = useRef(null)
   const [drag, setDrag] = useState(false)
-  const [pianoOnly, setPianoOnly] = useState(false)
+  const [pianoOnly, setPianoOnly] = useState(function () {
+    return localStorage.getItem('pf_piano_only') === '1'
+  })
   const [url, setUrl] = useState('')
   const [fetching, setFetching] = useState(false)
   const [includeVideo, setIncludeVideo] = useState(function () {
     return localStorage.getItem('pf_include_video') === '1'
   })
+
+  function togglePianoOnly(on) {
+    setPianoOnly(on)
+    localStorage.setItem('pf_piano_only', on ? '1' : '0')
+  }
 
   function toggleIncludeVideo(on) {
     setIncludeVideo(on)
@@ -93,7 +100,7 @@ export default function UploadZone({ onFiles, onUrl }) {
       </div>
       <div className="check" style={{ marginTop: 8 }}>
         <input id="pianoOnly" type="checkbox" checked={pianoOnly}
-          onChange={function (e) { setPianoOnly(e.target.checked) }} />
+          onChange={function (e) { togglePianoOnly(e.target.checked) }} />
         <label htmlFor="pianoOnly" style={{ margin: 0 }}>
           This file is piano-only — skip separation (much faster)
         </label>

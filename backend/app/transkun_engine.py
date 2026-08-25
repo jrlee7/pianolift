@@ -52,10 +52,17 @@ def transcribe(wav_path):
     control changes; only CC64 (sustain) maps to the Disklavier pedal.
     """
     import soundfile as sf
+
+    data, sr = sf.read(wav_path, dtype="float32")
+    return transcribe_array(data, sr)
+
+
+def transcribe_array(data, sr):
+    """Same as transcribe(), for already-decoded audio (e.g. one window of
+    a longer file the caller is chunking to bound memory)."""
     import torch
 
     model = _load_model()
-    data, sr = sf.read(wav_path, dtype="float32")
     if data.ndim == 1:
         data = data[:, None]
     peak = float(np.max(np.abs(data))) if len(data) else 0.0

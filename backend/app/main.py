@@ -734,6 +734,8 @@ def save_settings(job_id: str, payload: dict = Body(...)):
         raise HTTPException(404, "job not found")
     keys = ("velMin", "velMax", "gamma", "offsetMs",
             "pedal", "releaseMs", "capSustain",
+            # non-destructive per-song volume (1-100%); scales export velocity
+            "volPct",
             # video-sync player: per-song piano/pedal timing offsets
             "videoSyncMs", "pedalLagMs")
     settings = {k: payload[k] for k in keys if k in payload}
@@ -826,6 +828,50 @@ def auto_sync_media(payload: dict = Body(...)):
     return result
 
 
+def _vol_scale(vol_pct):
+    """Clamp a 1-100 volume percentage to a 0..1 velocity/audio scale.
+    100 (or missing) = full volume, no attenuation."""
+    try:
+        v = float(vol_pct)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.0, min(1.0, v / 100.0))
+
+
+def _mp3_with_gain(data, vol_scale):
+    """Return mp3 bytes attenuated by vol_scale (0..1) via ffmpeg. At (near)
+    full volume returns the input unchanged. Lets a song's accompaniment drop
+    in step with its piano velocity when a volume cut is applied on export."""
+    if vol_scale >= 0.999:
+        return data
+    import subprocess
+    pipeline._ensure_ffmpeg(lambda stage, pct: None)
+    fd_in, in_path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd_in)
+    fd_out, out_path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd_out)
+    try:
+        with open(in_path, "wb") as f:
+            f.write(data)
+        proc = subprocess.run(
+            [pipeline.FFMPEG_EXE, "-y", "-i", in_path,
+             "-af", "volume=%.4f" % vol_scale,
+             "-c:a", "libmp3lame", "-q:a", "2", out_path],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = (proc.stderr or "").strip().splitlines()
+            raise RuntimeError("ffmpeg volume failed: "
+                               + (tail[-1] if tail else "unknown error"))
+        with open(out_path, "rb") as f:
+            return f.read()
+    finally:
+        for p in (in_path, out_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
 def _trim_tail(job, events):
     """Drop notes/pedals that start after the song's trim-end so every export
     ends where the (identically trimmed) accompaniment MP3 ends. The front cut
@@ -841,7 +887,8 @@ def _trim_tail(job, events):
 @app.get("/api/jobs/{job_id}/midi")
 def get_midi(job_id: str, vel_min: int = 20, vel_max: int = 112,
              gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True,
-             release_ms: int = 0, cap_sustain: bool = True):
+             release_ms: int = 0, cap_sustain: bool = True,
+             vol_pct: int = 100):
     """Render MIDI with the given settings from stored events (no re-ML)."""
     job = jobs.get(job_id)
     if job is None:
@@ -863,7 +910,8 @@ def get_midi(job_id: str, vel_min: int = 20, vel_max: int = 112,
         notes, pedals, out,
         vel_min=vel_min, vel_max=vel_max, gamma=gamma,
         offset_ms=effective_offset_ms, include_pedal=pedal,
-        release_ms=release_ms, cap_sustain=cap_sustain)
+        release_ms=release_ms, cap_sustain=cap_sustain,
+        vel_scale=_vol_scale(vol_pct))
     return FileResponse(
         out, media_type="audio/midi",
         filename=job["name"] + ".mid")
@@ -892,7 +940,8 @@ def get_piano_stem(job_id: str):
 @app.get("/api/jobs/{job_id}/eseq")
 def get_eseq(job_id: str, vel_min: int = 20, vel_max: int = 112,
              gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True,
-             release_ms: int = 0, cap_sustain: bool = True):
+             release_ms: int = 0, cap_sustain: bool = True,
+             vol_pct: int = 100):
     """Render Yamaha E-SEQ (.FIL) for floppy-era Disklaviers, with the same
     settings and baked offsets as the MIDI render."""
     job = jobs.get(job_id)
@@ -911,14 +960,15 @@ def get_eseq(job_id: str, vel_min: int = 20, vel_max: int = 112,
         notes, pedals, out, title=job["name"],
         vel_min=vel_min, vel_max=vel_max, gamma=gamma,
         offset_ms=effective_offset_ms, include_pedal=pedal,
-        dos_name=job["name"], release_ms=release_ms, cap_sustain=cap_sustain)
+        dos_name=job["name"], release_ms=release_ms, cap_sustain=cap_sustain,
+        vel_scale=_vol_scale(vol_pct))
     return FileResponse(
         out, media_type="application/octet-stream",
         filename=eseq_writer._sanitize_83(job["name"]).strip() + ".FIL")
 
 
 def _render_hfe(job_id, vel_min, vel_max, gamma, offset_ms, pedal,
-                release_ms=0, cap_sustain=True):
+                release_ms=0, cap_sustain=True, vol_pct=100):
     """Build the .hfe disk image for a job; returns (path, dos_base)."""
     job = jobs.get(job_id)
     if job is None:
@@ -936,7 +986,8 @@ def _render_hfe(job_id, vel_min, vel_max, gamma, offset_ms, pedal,
         notes, pedals, fil_path, title=job["name"],
         vel_min=vel_min, vel_max=vel_max, gamma=gamma,
         offset_ms=effective_offset_ms, include_pedal=pedal,
-        dos_name=job["name"], release_ms=release_ms, cap_sustain=cap_sustain)
+        dos_name=job["name"], release_ms=release_ms, cap_sustain=cap_sustain,
+        vel_scale=_vol_scale(vol_pct))
     with open(fil_path, "rb") as f:
         fil_bytes = f.read()
     dos_base = eseq_writer._sanitize_83(job["name"])
@@ -950,12 +1001,14 @@ def _render_hfe(job_id, vel_min, vel_max, gamma, offset_ms, pedal,
 @app.get("/api/jobs/{job_id}/hfe")
 def get_hfe(job_id: str, vel_min: int = 20, vel_max: int = 112,
             gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True,
-            release_ms: int = 0, cap_sustain: bool = True):
+            release_ms: int = 0, cap_sustain: bool = True,
+            vol_pct: int = 100):
     """Complete Gotek/Nalbantov floppy image (.hfe): FAT12 disk holding
     PIANODIR.FIL + the E-SEQ song, MFM-encoded. Drop on the emulator USB
     stick as DSKAxxxx.hfe and play."""
     out, dos_base = _render_hfe(job_id, vel_min, vel_max, gamma,
-                                offset_ms, pedal, release_ms, cap_sustain)
+                                offset_ms, pedal, release_ms, cap_sustain,
+                                vol_pct)
     return FileResponse(
         out, media_type="application/octet-stream",
         filename=dos_base.strip() + ".hfe")
@@ -1069,19 +1122,22 @@ def export_job_file(job_id: str, kind: str, dest: str,
                     vel_min: int = 20, vel_max: int = 112,
                     gamma: float = 1.0, offset_ms: int = 0,
                     pedal: bool = True, release_ms: int = 0,
-                    cap_sustain: bool = True):
+                    cap_sustain: bool = True, vol_pct: int = 100):
     """Render one deliverable (midi / mp3 / hfe) and copy it into `dest`
-    (typically a removable drive root chosen in the UI)."""
+    (typically a removable drive root chosen in the UI). vol_pct (<100)
+    turns the song down: piano velocity for midi/hfe, audio gain for the mp3."""
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "job not found")
     if not os.path.isdir(dest):
         raise HTTPException(400, "target folder not found: " + dest)
 
+    scale = _vol_scale(vol_pct)
+    data = None
     if kind == "midi":
         # same render path as GET /midi
         get_midi(job_id, vel_min, vel_max, gamma, offset_ms, pedal,
-                 release_ms, cap_sustain)
+                 release_ms, cap_sustain, vol_pct)
         src = os.path.join(_job_dir(job_id), "render.mid")
         filename = _fs_safe_name(job["name"]) + ".mid"
     elif kind == "mp3":
@@ -1091,17 +1147,24 @@ def export_job_file(job_id: str, kind: str, dest: str,
         if not os.path.exists(src):
             raise HTTPException(404, "accompaniment file missing")
         filename = _fs_safe_name(job["name"]) + " (no piano).mp3"
+        try:
+            with open(src, "rb") as f:
+                data = _mp3_with_gain(f.read(), scale)
+        except (OSError, RuntimeError) as e:
+            raise HTTPException(500, "mp3 volume failed: " + str(e))
     elif kind == "hfe":
         src, dos_base = _render_hfe(job_id, vel_min, vel_max, gamma,
-                                    offset_ms, pedal, release_ms, cap_sustain)
+                                    offset_ms, pedal, release_ms, cap_sustain,
+                                    vol_pct)
         filename = dos_base.strip() + ".hfe"
     else:
         raise HTTPException(400, "kind must be midi, mp3 or hfe")
 
     out_path = os.path.join(dest, filename)
     try:
-        with open(src, "rb") as f:
-            data = f.read()
+        if data is None:
+            with open(src, "rb") as f:
+                data = f.read()
         # fsync onto the device: a removable drive pulled before Windows
         # flushes its write cache would otherwise leave a truncated file.
         usb.write_flushed(out_path, data)
@@ -1114,12 +1177,13 @@ def export_job_file(job_id: str, kind: str, dest: str,
 def save_job_to_usb(job_id: str, vel_min: int = 20, vel_max: int = 112,
                     gamma: float = 1.0, offset_ms: int = 0,
                     pedal: bool = True, release_ms: int = 0,
-                    cap_sustain: bool = True):
+                    cap_sustain: bool = True, vol_pct: int = 100):
     """Render the .hfe and write it straight into the first blank slot on
     the emulator stick. Blankness is verified by decoding each slot's FAT
     root directory, so existing songs can't be overwritten."""
     out, _dos_base = _render_hfe(job_id, vel_min, vel_max, gamma,
-                                 offset_ms, pedal, release_ms, cap_sustain)
+                                 offset_ms, pedal, release_ms, cap_sustain,
+                                 vol_pct)
     with open(out, "rb") as f:
         hfe_bytes = f.read()
     try:
@@ -1142,7 +1206,7 @@ def save_job_to_usb(job_id: str, vel_min: int = 20, vel_max: int = 112,
 
 _DISK_DEFAULTS = {"velMin": 20, "velMax": 112, "gamma": 1.0,
                   "offsetMs": 0, "pedal": True, "releaseMs": 0,
-                  "capSustain": True}
+                  "capSustain": True, "volPct": 100}
 
 
 def _norm_disk_settings(raw):
@@ -1153,6 +1217,22 @@ def _norm_disk_settings(raw):
             if raw.get(k) is not None:
                 s[k] = raw[k]
     return s
+
+
+def _apply_bulk_vol(s, bulk_pct):
+    """Fold a transfer-wide volume percentage into a per-song settings dict so
+    a batch write can turn every selected song down at once. Effective volume =
+    song volume x bulk volume; None/100 leaves the song's own setting alone."""
+    if bulk_pct is None:
+        return s
+    try:
+        b = float(bulk_pct)
+    except (TypeError, ValueError):
+        return s
+    out = dict(s)
+    out["volPct"] = max(0.0, min(100.0,
+                                 float(s.get("volPct", 100)) * b / 100.0))
+    return out
 
 
 def _disk_dos_bases(names):
@@ -1178,7 +1258,8 @@ def _eseq_bytes(notes, pedals, title, dos_base, s):
             vel_min=int(s["velMin"]), vel_max=int(s["velMax"]),
             gamma=float(s["gamma"]), offset_ms=float(s["offsetMs"]),
             include_pedal=bool(s["pedal"]), dos_name=dos_base,
-            release_ms=int(s["releaseMs"]), cap_sustain=bool(s["capSustain"]))
+            release_ms=int(s["releaseMs"]), cap_sustain=bool(s["capSustain"]),
+            vel_scale=_vol_scale(s.get("volPct", 100)))
         with open(tmp, "rb") as f:
             return f.read()
     finally:
@@ -1293,10 +1374,11 @@ def build_disk_from_jobs(payload: dict = Body(...)):
             t = (t or "").strip()
             if t:
                 titles[i] = t
+    bulk_vol = payload.get("volPct")
     bases = _disk_dos_bases(titles)
     songs = []
     for (job, notes, pedals, s), base, title in zip(prepared, bases, titles):
-        eff = dict(s)
+        eff = _apply_bulk_vol(s, bulk_vol)
         eff["offsetMs"] = (float(s["offsetMs"]) + job.get("encoderDelayMs", 0.0)
                            - job.get("trimStartSec", 0.0) * 1000.0)
         songs.append((_eseq_bytes(notes, pedals, title, base, eff), base))
@@ -1314,6 +1396,7 @@ def build_disk_from_midi(payload: dict = Body(...)):
     items = payload.get("songs")
     if not isinstance(items, list) or not items:
         raise HTTPException(400, "songs must be a non-empty list")
+    bulk_vol = payload.get("volPct")
     titles = [it.get("name") or "Song" for it in items]
     bases = _disk_dos_bases(titles)
     built = []
@@ -1330,7 +1413,7 @@ def build_disk_from_midi(payload: dict = Body(...)):
         except Exception as e:
             raise HTTPException(400, "could not parse MIDI for %s: %s"
                                 % (name, e))
-        s = _norm_disk_settings(it.get("settings"))
+        s = _apply_bulk_vol(_norm_disk_settings(it.get("settings")), bulk_vol)
         # Offsets/tail were baked into the stored MIDI's event times; don't
         # apply them a second time on export.
         s["offsetMs"] = 0
@@ -1405,6 +1488,73 @@ def gotek_slot_songs(slot: int):
         "drive": root, "slot": slot,
         "songs": [{"name": s["name"], "title": s["title"]} for s in songs],
     }
+
+
+@app.post("/api/gotek/slot/{slot}/import")
+def import_disk_song(slot: int, payload: dict = Body(...)):
+    """Pull one song off a Gotek slot into the app: decode its E-SEQ .FIL
+    back into notes/pedals and register a finished, MIDI-only job (same
+    shape as /jobs/from-library) so it opens straight in the editor and can
+    be saved to the library from there. Works on songs this app wrote and
+    on real PianoSoft-authored disks -- E-SEQ is a fixed Yamaha format, not
+    app-specific. Body: {index:int} (position in the slot's play order)."""
+    try:
+        index = int(payload.get("index"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "index must be an integer")
+    root = usb.find_usb_drive()
+    if root is None:
+        raise HTTPException(404, "No Gotek/Nalbantov USB stick found.")
+    path = os.path.join(root, "DSKA%04d.hfe" % slot)
+    if not os.path.exists(path):
+        raise HTTPException(404, "slot %d not found on the stick" % slot)
+    songs = usb.read_slot_songs(path)
+    if songs is None:
+        raise HTTPException(422, "slot %d is unreadable" % slot)
+    if index < 0 or index >= len(songs):
+        raise HTTPException(404, "song %d not found on slot %d" % (index, slot))
+    song = songs[index]
+    try:
+        notes, pedals, eseq_title = eseq_writer.read_eseq(song["fil"])
+    except ValueError as e:
+        raise HTTPException(400, "could not decode this song: " + str(e))
+    if not notes:
+        raise HTTPException(400, "no playable notes found in this song")
+
+    name = _safe_name(song["title"] or eseq_title or song["name"])
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = _job_dir(job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    with open(os.path.join(job_dir, "events.json"), "w") as f:
+        json.dump({"notes": notes, "pedals": pedals}, f)
+    midi_writer.write_midi(notes, pedals, os.path.join(job_dir, "input.mid"))
+
+    job = {
+        "id": job_id,
+        "name": name,
+        "status": "done",
+        "stage": "done",
+        "progress": 100,
+        "error": None,
+        "pianoOnly": True,
+        "noteCount": len(notes),
+        "pedalCount": len(pedals),
+        "pianoStem": None,
+        "accompaniment": None,
+        "encoderDelayMs": 0.0,
+        "trimStartSec": 0.0,
+        "trimEndSec": None,
+        "fromDisk": {"slot": slot, "index": index},
+        "settings": {
+            "velMin": 20, "velMax": 112, "gamma": 1.0,
+            "offsetMs": 0, "releaseMs": 0,
+        },
+        "createdAt": time.time(),
+    }
+    with jobs_lock:
+        jobs[job_id] = job
+        _persist(job_id)
+    return job
 
 
 @app.post("/api/gotek/slot/rewrite")
@@ -1788,6 +1938,58 @@ def decode_midi(payload: dict = Body(...)):
         except OSError:
             pass
     return {"notes": notes, "pedals": pedals}
+
+
+@app.post("/api/midi/scale")
+def scale_midi(payload: dict = Body(...)):
+    """Turn a stored library MIDI down by volPct without disturbing anything
+    else. The library copy holds already-mapped velocities and baked timing, so
+    this decodes, rewrites with an identity velocity map (vel_min=0/vel_max=127/
+    gamma=1) times the volume scale, and keeps offsets/tails as-is — a clean
+    uniform volume cut for the ENSPIRE 'copy to USB folder' path. Returns the
+    scaled MIDI as base64."""
+    try:
+        raw = base64.b64decode(payload.get("midiBase64") or "", validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "invalid midiBase64")
+    if not raw:
+        raise HTTPException(400, "empty MIDI payload")
+    scale = _vol_scale(payload.get("volPct", 100))
+    tmp_in = os.path.join(JOBS_DIR, "_scin_%s.mid" % uuid.uuid4().hex[:8])
+    tmp_out = os.path.join(JOBS_DIR, "_scout_%s.mid" % uuid.uuid4().hex[:8])
+    try:
+        with open(tmp_in, "wb") as f:
+            f.write(raw)
+        notes, pedals = midi_writer.read_midi(tmp_in)
+        midi_writer.write_midi(
+            notes, pedals, tmp_out,
+            vel_min=0, vel_max=127, gamma=1.0, offset_ms=0,
+            include_pedal=True, release_ms=0, cap_sustain=False,
+            vel_scale=scale)
+        with open(tmp_out, "rb") as f:
+            out = f.read()
+    except Exception as e:
+        raise HTTPException(400, "could not scale MIDI: " + str(e))
+    finally:
+        for p in (tmp_in, tmp_out):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    return {"midiBase64": base64.b64encode(out).decode("ascii")}
+
+
+@app.post("/api/audio/gain")
+async def audio_gain(file: UploadFile = File(...), vol_pct: int = Form(100)):
+    """Attenuate an uploaded mp3 by vol_pct (via ffmpeg) and stream it back, so
+    the ENSPIRE 'copy to USB folder' path can drop a song's accompaniment in
+    step with its piano velocity. At 100% the bytes come back unchanged."""
+    data = await file.read()
+    try:
+        out = _mp3_with_gain(data, _vol_scale(vol_pct))
+    except (OSError, RuntimeError) as e:
+        raise HTTPException(500, "audio volume failed: " + str(e))
+    return StreamingResponse(BytesIO(out), media_type="audio/mpeg")
 
 
 @app.get("/api/health")

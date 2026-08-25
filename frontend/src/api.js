@@ -169,7 +169,8 @@ export function midiUrl(id, settings) {
     offset_ms: String(settings.offsetMs),
     pedal: settings.pedal ? 'true' : 'false',
     release_ms: String(settings.releaseMs),
-    cap_sustain: settings.capSustain ? 'true' : 'false'
+    cap_sustain: settings.capSustain ? 'true' : 'false',
+    vol_pct: String(settings.volPct != null ? settings.volPct : 100)
   })
   return BASE + '/jobs/' + id + '/midi?' + params.toString()
 }
@@ -199,7 +200,8 @@ export function hfeUrl(id, settings) {
     offset_ms: String(settings.offsetMs),
     pedal: settings.pedal ? 'true' : 'false',
     release_ms: String(settings.releaseMs),
-    cap_sustain: settings.capSustain ? 'true' : 'false'
+    cap_sustain: settings.capSustain ? 'true' : 'false',
+    vol_pct: String(settings.volPct != null ? settings.volPct : 100)
   })
   return BASE + '/jobs/' + id + '/hfe?' + params.toString()
 }
@@ -220,7 +222,8 @@ export async function exportToDrive(id, kind, dest, settings) {
     offset_ms: String(settings.offsetMs),
     pedal: settings.pedal ? 'true' : 'false',
     release_ms: String(settings.releaseMs),
-    cap_sustain: settings.capSustain ? 'true' : 'false'
+    cap_sustain: settings.capSustain ? 'true' : 'false',
+    vol_pct: String(settings.volPct != null ? settings.volPct : 100)
   })
   const res = await fetch(BASE + '/jobs/' + id + '/export?' + params.toString(), {
     method: 'POST'
@@ -294,7 +297,8 @@ export async function saveToUsb(id, settings) {
     offset_ms: String(settings.offsetMs),
     pedal: settings.pedal ? 'true' : 'false',
     release_ms: String(settings.releaseMs),
-    cap_sustain: settings.capSustain ? 'true' : 'false'
+    cap_sustain: settings.capSustain ? 'true' : 'false',
+    vol_pct: String(settings.volPct != null ? settings.volPct : 100)
   })
   const res = await fetch(BASE + '/jobs/' + id + '/usb?' + params.toString(), {
     method: 'POST'
@@ -312,7 +316,8 @@ export function eseqUrl(id, settings) {
     offset_ms: String(settings.offsetMs),
     pedal: settings.pedal ? 'true' : 'false',
     release_ms: String(settings.releaseMs),
-    cap_sustain: settings.capSustain ? 'true' : 'false'
+    cap_sustain: settings.capSustain ? 'true' : 'false',
+    vol_pct: String(settings.volPct != null ? settings.volPct : 100)
   })
   return BASE + '/jobs/' + id + '/eseq?' + params.toString()
 }
@@ -350,6 +355,37 @@ export async function decodeMidi(midiBase64) {
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail || 'MIDI decode failed')
   return data
+}
+
+// Turn a library song's stored MIDI down by volPct (1-100) without touching
+// its timing/dynamics shape — used by the "copy to USB folder" path so an
+// ENSPIRE .mid drops in step with its accompaniment. Returns scaled base64.
+export async function scaleMidi(midiBase64, volPct) {
+  if (volPct == null || volPct >= 100) return midiBase64
+  const res = await fetch(BASE + '/midi/scale', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ midiBase64: midiBase64, volPct: volPct })
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail || 'MIDI volume scale failed')
+  return data.midiBase64
+}
+
+// Attenuate an mp3 Blob by volPct (1-100) via the backend (ffmpeg). Returns a
+// new Blob. At full volume the original blob is returned untouched.
+export async function applyMp3Gain(blob, volPct) {
+  if (volPct == null || volPct >= 100) return blob
+  const fd = new FormData()
+  fd.append('file', blob, 'in.mp3')
+  fd.append('vol_pct', String(volPct))
+  const res = await fetch(BASE + '/audio/gain', { method: 'POST', body: fd })
+  if (!res.ok) {
+    let msg = 'Audio volume failed'
+    try { msg = (await res.json()).detail || msg } catch (e) { /* non-JSON */ }
+    throw new Error(msg)
+  }
+  return res.blob()
 }
 
 // Auto-sync (job video): cross-correlates transcribed notes against the
@@ -409,7 +445,8 @@ export async function buildDiskFromJobs(jobIds, opts) {
   const res = await postDisk('/disk/build', {
     jobIds: jobIds, titles: o.titles || null,
     slot: o.slot != null ? o.slot : null,
-    overwrite: Boolean(o.overwrite), download: Boolean(o.download)
+    overwrite: Boolean(o.overwrite), download: Boolean(o.download),
+    volPct: o.volPct != null ? o.volPct : null
   })
   if (o.download) {
     if (!res.ok) throw await saveDiskResult(res)
@@ -423,7 +460,8 @@ export async function buildDiskFromLibrary(songs, opts) {
   const o = opts || {}
   const res = await postDisk('/disk/build-midi', {
     songs: songs, slot: o.slot != null ? o.slot : null,
-    overwrite: Boolean(o.overwrite), download: Boolean(o.download)
+    overwrite: Boolean(o.overwrite), download: Boolean(o.download),
+    volPct: o.volPct != null ? o.volPct : null
   })
   if (o.download) {
     if (!res.ok) throw await saveDiskResult(res)
@@ -454,6 +492,20 @@ export async function getSlotSongs(slot) {
 export async function rewriteSlot(slot, songs) {
   const res = await postDisk('/gotek/slot/rewrite', { slot: slot, songs: songs })
   return saveDiskResult(res)
+}
+
+// Pull one song off a slot into the app: decodes its E-SEQ data back into
+// notes/pedals and returns a finished, MIDI-only job (same shape as
+// importFromLibrary) that opens straight in the editor.
+export async function importSongFromDisk(slot, index) {
+  const res = await fetch(BASE + '/gotek/slot/' + slot + '/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ index: index })
+  })
+  const data = await res.json().catch(function () { return {} })
+  if (!res.ok) throw new Error(data.detail || 'Import failed')
+  return data
 }
 
 // --- Sheet music (PDF/MusicXML -> pedal + dynamics suggestions) ----------

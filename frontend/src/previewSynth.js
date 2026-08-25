@@ -93,8 +93,11 @@ export function computeAudibleEnds(notes, pedals) {
 // `audibleEnd` (from computeAudibleEnds) stands in for note.offset when given,
 // so a pedaled note rings through the preview instead of cutting at key-release.
 function synthNote(ctx, master, settings, note, when, audibleEnd) {
-  const vel = mapVelocity(
-    note.velocity, settings.velMin, settings.velMax, settings.gamma)
+  // Fold the non-destructive per-song volume (volPct) into the previewed
+  // velocity so the synth is as loud as the exported files will be.
+  const volScale = settings.volPct != null ? settings.volPct / 100 : 1
+  const vel = Math.max(1, Math.min(127, mapVelocity(
+    note.velocity, settings.velMin, settings.velMax, settings.gamma) * volScale))
   const gainVal = Math.pow(vel / 127, 1.6) * 0.35
   // mirror the backend's note-tail trim + sustain cap so preview matches
   const release = (settings.releaseMs || 0) / 1000
