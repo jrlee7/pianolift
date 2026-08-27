@@ -128,6 +128,119 @@ def read_midi(path):
     return notes, pedals
 
 
+DRUM_CHANNEL = 9   # MIDI channel 10 (0-indexed) is percussion by GM convention
+
+
+def read_midi_file(path, drop_drums=True):
+    """Parse an ARBITRARY Standard MIDI File into (notes, pedals, stats).
+
+    read_midi() above reads back MIDI this app wrote; this reads files from
+    anywhere, so it has to cope with what real-world MIDI actually contains:
+
+      * many tracks and channels -- all merged onto the one piano, since the
+        Disklavier has exactly one instrument to play them on;
+      * percussion on channel 10, where the note number is a drum, not a
+        pitch -- played on a piano it is random banging, so it is dropped;
+      * notes outside the 88 keys (21-108), which no key can sound;
+      * note-on with velocity 0 used as note-off (legal and common);
+      * the same pitch struck again before its note-off, which a single
+        pitch->onset map would silently swallow -- held notes are queued per
+        pitch so each note-off closes the oldest still-sounding strike.
+
+    Velocities come back as the file's authored dynamics, NOT remapped: the
+    caller runs them through map_velocity the same way model-predicted
+    velocities are mapped, so an external MIDI lands in the same playable
+    range as a converted song. (Contrast read_midi, whose velocities were
+    already mapped when the file was written and must be inverted first.)
+
+    Type-2 MIDI files hold tracks that are musically independent rather than
+    simultaneous; mido merges them like any other, which is the best that can
+    be done without guessing the author's intent.
+
+    stats reports what was thrown away so the UI can warn before writing to a
+    floppy that cannot be edited afterwards.
+    """
+    mid = mido.MidiFile(path)
+    abs_t = 0.0
+    held = {}        # pitch -> [onset_sec, ...] oldest first
+    ped_on = None
+    notes = []
+    pedals = []
+    dropped_drums = 0
+    dropped_range = 0
+    channels = set()
+    title = ""
+
+    def close(pitch):
+        starts = held.get(pitch)
+        if not starts:
+            return
+        onset, vel = starts.pop(0)
+        if not starts:
+            held.pop(pitch, None)
+        if abs_t > onset:
+            notes.append({"onset": round(onset, 4), "offset": round(abs_t, 4),
+                          "pitch": pitch, "velocity": vel})
+
+    for msg in mid:
+        abs_t += msg.time
+        if msg.type == "track_name" and not title:
+            title = (msg.name or "").strip()
+            continue
+        if msg.type not in ("note_on", "note_off", "control_change"):
+            continue
+        ch = getattr(msg, "channel", 0)
+        channels.add(ch)
+        if msg.type == "control_change":
+            # Sustain from any channel counts: it is one physical pedal, and
+            # a file may carry the piano part on a channel of its choosing.
+            if msg.control != 64:
+                continue
+            if msg.value >= 64:
+                if ped_on is None:
+                    ped_on = abs_t
+            elif ped_on is not None:
+                if abs_t > ped_on:
+                    pedals.append({"onset": round(ped_on, 4),
+                                   "offset": round(abs_t, 4)})
+                ped_on = None
+            continue
+        is_on = msg.type == "note_on" and msg.velocity > 0
+        if drop_drums and ch == DRUM_CHANNEL:
+            if is_on:
+                dropped_drums += 1
+            continue
+        if msg.note < _PITCH_LOW or msg.note > _PITCH_HIGH:
+            if is_on:
+                dropped_range += 1
+            continue
+        if is_on:
+            held.setdefault(msg.note, []).append((abs_t, msg.velocity))
+        else:
+            close(msg.note)
+
+    # Close whatever the file left hanging rather than dropping those notes.
+    for pitch in list(held):
+        while held.get(pitch):
+            close(pitch)
+    if ped_on is not None and abs_t > ped_on:
+        pedals.append({"onset": round(ped_on, 4), "offset": round(abs_t, 4)})
+
+    notes.sort(key=lambda n: n["onset"])
+    pedals.sort(key=lambda p: p["onset"])
+    stats = {
+        "noteCount": len(notes),
+        "pedalCount": len(pedals),
+        "durationSec": round(max((n["offset"] for n in notes), default=0.0), 2),
+        "droppedDrumNotes": dropped_drums,
+        "droppedOutOfRange": dropped_range,
+        "channels": sorted(channels),
+        "trackCount": len(mid.tracks),
+        "suggestedTitle": title,
+    }
+    return notes, pedals, stats
+
+
 def write_midi(notes, pedals, out_path,
                vel_min=20, vel_max=112, gamma=1.0,
                offset_ms=0, include_pedal=True, release_ms=0,

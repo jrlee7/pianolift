@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { getGotekCatalog } from '../api.js'
 import UsbPrepareModal from './UsbPrepareModal.jsx'
 import SlotEditorModal from './SlotEditorModal.jsx'
+import AddMidiModal from './AddMidiModal.jsx'
 
 // Build a clean standalone HTML document and print it, so the printed catalog
 // is just the song list — no app chrome, tabs or buttons.
@@ -64,6 +65,8 @@ export default function GotekView({ jobs, loadLibrary, onEditJob }) {
   const [showEmpty, setShowEmpty] = useState(false)
   const [prepare, setPrepare] = useState(false)
   const [editSlot, setEditSlot] = useState(null)
+  const [addMidi, setAddMidi] = useState(false)
+  const [flash, setFlash] = useState(null)
 
   async function load() {
     setLoading(true)
@@ -152,11 +155,18 @@ export default function GotekView({ jobs, loadLibrary, onEditJob }) {
           🖫 Prepare a blank USB
         </button>
         <button className="primary"
+          title="Pick MIDI files from your hard drive or a USB stick and write them onto a slot the piano can play."
+          onClick={function () { setAddMidi(true) }}>
+          🎵 Add MIDI from folder
+        </button>
+        <button className="primary"
           disabled={data.totalSongs === 0}
           onClick={function () { printCatalog(data, showEmpty) }}>
           🖨 Print catalog
         </button>
       </div>
+
+      {flash && <div className="notice" style={{ marginTop: 10 }}>{flash}</div>}
 
       {prepareModal}
 
@@ -208,6 +218,18 @@ export default function GotekView({ jobs, loadLibrary, onEditJob }) {
           onEditJob={onEditJob}
           onClose={function () { setEditSlot(null) }}
           onSaved={function () { setEditSlot(null); load() }} />
+      )}
+
+      {addMidi && (
+        <AddMidiModal
+          catalog={data}
+          onClose={function () { setAddMidi(false) }}
+          onSaved={function (res) {
+            setAddMidi(false)
+            setFlash('Wrote ' + res.songs + ' song'
+              + (res.songs === 1 ? '' : 's') + ' to slot ' + res.slot + '.')
+            load()
+          }} />
       )}
     </div>
   )

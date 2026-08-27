@@ -1470,6 +1470,67 @@ def _library_fil_bytes(it):
     return _eseq_bytes(notes, pedals, name, base, s), name
 
 
+def _external_midi_events(it):
+    """Decode a user-supplied .mid (base64) into events. Unlike a library
+    song's baked MIDI, these velocities are the file's own authored dynamics,
+    so there is no export curve to invert -- they are mapped once, at render
+    time, exactly like model-predicted velocities are."""
+    name = it.get("name") or "song"
+    try:
+        raw = base64.b64decode(it.get("midiBase64") or "", validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "invalid midiBase64 for " + name)
+    if not raw:
+        raise HTTPException(400, "empty MIDI for " + name)
+    fd, tmp = tempfile.mkstemp(suffix=".mid")
+    os.close(fd)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        notes, pedals, stats = midi_writer.read_midi_file(tmp)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, "could not parse MIDI for %s: %s" % (name, e))
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return notes, pedals, stats
+
+
+def _midi_fil_bytes(it):
+    """Render one user-supplied MIDI file to E-SEQ .FIL bytes for a slot."""
+    name = it.get("name") or "song"
+    notes, pedals, _stats = _external_midi_events(it)
+    if not notes:
+        raise HTTPException(400, "no playable piano notes in " + name)
+    s = _norm_disk_settings(it.get("settings"))
+    base = _disk_dos_bases([name])[0]
+    return _eseq_bytes(notes, pedals, name, base, s), name
+
+
+@app.post("/api/midi/inspect")
+def inspect_midi(payload: dict = Body(...)):
+    """Preflight a user-supplied .mid before it is written to a floppy: what
+    the piano would actually play, and what had to be dropped to get there.
+    A floppy can't be edited in place afterwards, so the Disk tab shows this
+    (note count, length, dropped drum/out-of-range notes, rendered size)
+    before committing. Body: {name?, midiBase64}."""
+    name = payload.get("name") or "song"
+    notes, pedals, stats = _external_midi_events(payload)
+    size = 0
+    if notes:
+        s = _norm_disk_settings(payload.get("settings"))
+        base = _disk_dos_bases([name])[0]
+        size = len(_eseq_bytes(notes, pedals, name, base, s))
+    out = dict(stats)
+    out["name"] = name
+    out["eseqBytes"] = size
+    return out
+
+
 @app.get("/api/gotek/slot/{slot}")
 def gotek_slot_songs(slot: int):
     """The songs on one slot with enough detail to edit it: title + DOS name in
@@ -1562,7 +1623,8 @@ def rewrite_gotek_slot(payload: dict = Body(...)):
     """Rebuild one slot's floppy from a caller-supplied song list — the single
     operation behind the Disk tab's reorder / delete / rename / add controls.
     Each song is kept from the slot (source:"keep", index into the current play
-    order) or added fresh (source:"job"|"library"). The final order is what the
+    order) or added fresh (source:"job"|"library"|"midi", the last being a
+    user-supplied .mid file from anywhere on disk). The final order is what the
     piano plays; kept songs are re-extracted losslessly, added songs rendered.
     An empty list clears the slot back to blank.
     Body: {slot:int, songs:[{source, index?/jobId?/..., title?}]}."""
@@ -1615,6 +1677,10 @@ def rewrite_gotek_slot(payload: dict = Body(...)):
             titles.append(override or title)
         elif src == "library":
             fil, title = _library_fil_bytes(it)
+            fils.append(fil)
+            titles.append(override or title)
+        elif src == "midi":
+            fil, title = _midi_fil_bytes(it)
             fils.append(fil)
             titles.append(override or title)
         else:

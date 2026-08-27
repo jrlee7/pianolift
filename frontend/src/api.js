@@ -488,10 +488,25 @@ export async function getSlotSongs(slot) {
 //   { source: 'keep', index, title? }            keep a song already on the slot
 //   { source: 'job', jobId, title? }             add a converted job
 //   { source: 'library', name, midiBase64, settings, title? }  add a library song
+//   { source: 'midi', name, midiBase64, title? }  add a MIDI file from disk
 // An empty list clears the slot. Overwrites the slot in place.
 export async function rewriteSlot(slot, songs) {
   const res = await postDisk('/gotek/slot/rewrite', { slot: slot, songs: songs })
   return saveDiskResult(res)
+}
+
+// Preflight a MIDI file picked off the hard drive / a USB stick before it is
+// written to a floppy: what the piano would actually play, and what had to be
+// dropped (drum track, notes outside the 88 keys) to get there.
+export async function inspectMidi(name, midiBase64) {
+  const res = await fetch(BASE + '/midi/inspect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name, midiBase64: midiBase64 })
+  })
+  const data = await res.json().catch(function () { return {} })
+  if (!res.ok) throw new Error(data.detail || 'Could not read that MIDI file')
+  return data
 }
 
 // Pull one song off a slot into the app: decodes its E-SEQ data back into
