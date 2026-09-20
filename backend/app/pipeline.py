@@ -83,6 +83,13 @@ def _ensure_ffmpeg(progress_cb):
 SEP_LONG_THRESHOLD_SEC = 900.0   # 15 min
 SEP_CHUNK_SEC = 300.0            # 5-minute separation windows
 SEP_OVERLAP_SEC = 6.0           # crossfaded seam between adjacent windows
+# A file whose length lands just past a chunk boundary leaves a tiny trailing
+# window (a few seconds). BS-Roformer intermittently emits no piano stem for
+# such a sliver — the sibling stems write but (piano) doesn't — which used to
+# fail the whole job at ~95% with "Error opening chunk_NNN_(piano)…: System
+# error". Any final remainder shorter than this is folded into the preceding
+# window instead (it's well within the memory budget of one window).
+SEP_MIN_TAIL_SEC = 45.0
 
 # Same OOM shape hits transcription: a single ByteDance or Transkun forward
 # pass over a whole 2-hour file's worth of frames holds the model's
@@ -158,7 +165,12 @@ def _separate_one(separator, sep_out, in_path):
 
     piano = next(
         (f for f in outs if "piano" in os.path.basename(f).lower()), None)
-    if piano is None:
+    # audio_separator returns the stem's intended filename even when the model
+    # pass for it failed internally (the error is swallowed to a log record);
+    # the file is then absent, and reading it downstream would raise a cryptic
+    # libsndfile "System error". Treat a missing/unwritten piano stem as the
+    # failure it is, here, with the separator's own logged reason attached.
+    if piano is None or not os.path.exists(piano):
         detail = "; ".join(capture.messages) or "no error logged by the separator"
         raise RuntimeError("Separator finished but piano stem not found (" + detail + ")")
     accomp = [f for f in outs if f != piano]
@@ -216,6 +228,7 @@ def _separate_piano_chunked(audio_path, sep_out, separator, info, progress_cb):
     total = info.frames
     chunk_fr = int(SEP_CHUNK_SEC * sr)
     over_fr = int(SEP_OVERLAP_SEC * sr)
+    min_tail_fr = int(SEP_MIN_TAIL_SEC * sr)
     n_chunks = max(1, (total + chunk_fr - 1) // chunk_fr)
 
     piano_out = os.path.join(sep_out, "piano_full.wav")
@@ -228,13 +241,27 @@ def _separate_piano_chunked(audio_path, sep_out, separator, info, progress_cb):
             if start >= total:
                 break
             end = min(total, (i + 1) * chunk_fr + over_fr)
+            # Absorb a too-short trailing remainder into this window rather than
+            # separating it as its own sliver (see SEP_MIN_TAIL_SEC).
+            if 0 < total - end < min_tail_fr:
+                end = total
             chunk, _ = sf.read(audio_path, start=start, frames=end - start,
                                dtype="float32", always_2d=True)
             tmp_in = os.path.join(sep_out, "chunk_%03d.wav" % i)
             sf.write(tmp_in, chunk, sr)
             del chunk
 
-            piano_p, accomp = _separate_one(separator, sep_out, tmp_in)
+            # Retry a window that comes back without a piano stem: the failure
+            # is usually transient (a swallowed intermittent model error), and
+            # one 5-minute window failing shouldn't sink a multi-hour job.
+            piano_p = accomp = None
+            for attempt in range(3):
+                try:
+                    piano_p, accomp = _separate_one(separator, sep_out, tmp_in)
+                    break
+                except RuntimeError:
+                    if attempt == 2:
+                        raise
             p, _ = sf.read(piano_p, dtype="float32", always_2d=True)
             npmix = _sum_stems(accomp)
 
