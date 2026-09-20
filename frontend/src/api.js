@@ -47,6 +47,20 @@ export async function probeUrl(url) {
   return data
 }
 
+// Expand a playlist link into its videos (title + per-video URL) without
+// downloading anything, so the UI can offer to convert the whole playlist as
+// one job per video. entries is [] when the link isn't a playlist.
+export async function probePlaylist(url) {
+  const res = await fetch(BASE + '/probe-playlist', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: url })
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail || 'Could not read that link')
+  return data
+}
+
 // Re-open a library song in the editor: the backend decodes its baked MIDI
 // back into editable events and returns a finished, MIDI-only job. settings
 // (the sliders the song was archived with) let the backend invert the

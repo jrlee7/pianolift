@@ -333,6 +333,23 @@ def probe_url(payload: dict = Body(...)):
     return {"title": title, "chapters": chapters}
 
 
+@app.post("/api/probe-playlist")
+def probe_playlist(payload: dict = Body(...)):
+    """Expand a playlist link into its video entries (title + per-video URL)
+    without downloading anything, so the frontend can offer to convert the
+    whole playlist as one job per video. Empty entries = not a playlist."""
+    url = (payload.get("url") or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(400, "paste a full link starting with http(s)://")
+    from . import fetcher
+    try:
+        title, entries = fetcher.probe_playlist(url)
+    except Exception as e:
+        msg = (str(e) or repr(e)).splitlines()[0]
+        raise HTTPException(400, "Couldn't read that link: " + msg)
+    return {"title": title, "entries": entries}
+
+
 @app.post("/api/jobs/from-library")
 def create_job_from_midi(payload: dict = Body(...)):
     """Re-open a library song in the editor. Library songs are stored only as

@@ -14,11 +14,12 @@ import SheetUploadZone from './components/SheetUploadZone.jsx'
 import SheetJobCard from './components/SheetJobCard.jsx'
 import SheetResultView from './components/SheetResultView.jsx'
 import {
-  listJobs, uploadMp3, submitUrl, probeUrl, deleteJob, verifyJob,
+  listJobs, uploadMp3, submitUrl, probeUrl, probePlaylist, deleteJob, verifyJob,
   midiUrl, audioUrl, fetchMidiBase64, archiveVideo, buildDiskFromJobs,
   listSheetJobs, uploadSheet
 } from './api.js'
 import ChapterSplitModal from './components/ChapterSplitModal.jsx'
+import PlaylistModal from './components/PlaylistModal.jsx'
 import DiskTitlesModal from './components/DiskTitlesModal.jsx'
 import UsbPrepareModal from './components/UsbPrepareModal.jsx'
 import {
@@ -117,6 +118,9 @@ export default function App() {
   // {url, chapters, pianoOnly, includeVideo} while the album-split prompt
   // is open for a link whose video has chapter markers; null otherwise.
   const [splitPrompt, setSplitPrompt] = useState(null)
+  // {url, title, entries, hasSingle, pianoOnly, includeVideo} while the
+  // playlist prompt is open for a link that resolved to a playlist; null else.
+  const [playlistPrompt, setPlaylistPrompt] = useState(null)
   const accountRef = useRef(null)
   // Consecutive failed job-list polls. The packaged backend (PyInstaller
   // onefile + torch/librosa imports) takes 15-40s to bind :8000 on launch,
@@ -225,6 +229,22 @@ export default function App() {
   }
 
   async function handleUrl(url, pianoOnly, includeVideo) {
+    // A link with list=… is (or contains) a playlist. Expand it first; if it
+    // has ≥2 videos, offer to convert the whole thing. A watch?v=…&list=… link
+    // also names one video, so the modal can offer "just this one" too.
+    if (/[?&]list=/i.test(url)) {
+      try {
+        const pl = await probePlaylist(url)
+        const entries = pl.entries || []
+        if (entries.length >= 2) {
+          setPlaylistPrompt({
+            url, title: pl.title || '', entries,
+            hasSingle: /[?&]v=/i.test(url), pianoOnly, includeVideo
+          })
+          return
+        }
+      } catch (e) { /* best-effort — fall through to the single-video path */ }
+    }
     let chapters = []
     let title = ''
     try {
@@ -238,6 +258,27 @@ export default function App() {
     }
     await startUrlJob(url, pianoOnly, includeVideo)
     refresh()
+  }
+
+  async function handlePlaylistConfirm(selected) {
+    const { pianoOnly, includeVideo } = playlistPrompt
+    setPlaylistPrompt(null)
+    // One whole-video job per entry, in playlist order. Each consumes a free
+    // credit inside startUrlJob; the loop stops if the tier runs out.
+    for (let i = 0; i < selected.length; i++) {
+      const ok = await startUrlJob(selected[i].url, pianoOnly, includeVideo)
+      if (ok === false) break
+    }
+    refresh()
+  }
+
+  async function handlePlaylistSingle() {
+    // "Just this one video" — drop the list= context and convert the single
+    // video the link names (which may itself carry chapter markers).
+    const { url, pianoOnly, includeVideo } = playlistPrompt
+    setPlaylistPrompt(null)
+    const single = url.replace(/([?&])list=[^&]*/i, '$1').replace(/[?&]$/, '')
+    await handleUrl(single, pianoOnly, includeVideo)
   }
 
   async function handleSplitConfirm(selected) {
@@ -731,6 +772,20 @@ export default function App() {
               onConfirm={handleSplitConfirm}
               onSingle={handleSplitSingle}
               onCancel={function () { setSplitPrompt(null) }}
+            />
+          )}
+          {playlistPrompt && (
+            <PlaylistModal
+              title={playlistPrompt.title}
+              entries={playlistPrompt.entries}
+              hasSingle={playlistPrompt.hasSingle}
+              remainingCredits={
+                firebaseReady && account && !account.family && !account.activated
+                  ? account.remaining : null
+              }
+              onConfirm={handlePlaylistConfirm}
+              onSingle={handlePlaylistSingle}
+              onCancel={function () { setPlaylistPrompt(null) }}
             />
           )}
           {diskPrompt && (

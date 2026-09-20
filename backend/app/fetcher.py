@@ -148,6 +148,48 @@ def probe_chapters(url):
     return title, chapters
 
 
+# Hard cap on how many playlist entries we expand. YouTube "Mix"/radio lists
+# (list=RD…) are auto-generated and effectively endless; without a ceiling a
+# flat extract of one would try to enumerate hundreds of videos.
+MAX_PLAYLIST = 200
+
+
+def probe_playlist(url):
+    """Return (playlist_title, [{"url", "title"}, ...]) for a playlist link
+    without downloading any media. Uses a *flat* extract — it reads only the
+    playlist page(s), not each video — so it stays fast even for long lists.
+
+    Empty list means the link isn't a playlist (or exposes no entries); the
+    caller should fall back to the single-video path."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",  # don't recurse into each video
+        "playlistend": MAX_PLAYLIST,
+        "skip_download": True,
+        "js_runtimes": {"node": {}, "deno": {}},
+    }
+    info = _extract(opts, url, download=False)
+    if info is None or "entries" not in info:
+        return "", []  # a bare video link, not a playlist
+    title = (info.get("title") or "playlist").strip()
+    entries = []
+    for e in info.get("entries") or []:
+        if not e:
+            continue
+        u = e.get("url") or ""
+        if not (u.startswith("http://") or u.startswith("https://")):
+            vid = e.get("id")
+            if not vid:
+                continue  # nothing addressable
+            u = "https://www.youtube.com/watch?v=" + vid
+        entries.append({
+            "url": u,
+            "title": (e.get("title") or "").strip() or None,
+        })
+    return title, entries
+
+
 def download_audio(url, job_dir, progress_cb, include_video=False,
                     section=None):
     """Download `url` into job_dir and decode audio to input.wav (44.1 kHz

@@ -87,7 +87,7 @@ export default function UploadZone({ onFiles, onUrl }) {
         <input
           type="text"
           className="url-input"
-          placeholder="…or paste a link — YouTube, Facebook, Instagram, SoundCloud…"
+          placeholder="…or paste a link — a video, or a whole YouTube playlist"
           value={url}
           disabled={fetching}
           onChange={function (e) { setUrl(e.target.value) }}
