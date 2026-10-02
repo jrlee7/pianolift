@@ -723,9 +723,9 @@ def run_job(job_dir, audio_path, progress_cb, piano_only=False,
             max_end_sec=None):
     """Full pipeline. Writes events.json and output.mid into job_dir.
 
-    max_end_sec: the song's true end within the audio (album-split jobs pad
-    the download past the chapter boundary for ring-out; see fetcher
-    RING_PAD_SEC). Caps the non-destructive trim window so notes struck
+    max_end_sec: the song's true end within the audio (album-split jobs may
+    pad the download past the song's end for ring-out; see fetcher
+    refine_section). Caps the non-destructive trim window so notes struck
     after the boundary never play, while tails crossing it survive."""
     if piano_only:
         piano_wav = _decode_piano_only(audio_path, job_dir, progress_cb)

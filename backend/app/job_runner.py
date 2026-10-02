@@ -33,10 +33,11 @@ def run_job_process(job_dir, kind, source, piano_only, q, include_video=False,
         q.put(("progress", stage, pct))
 
     try:
+        song_len = None
         if kind == "url":
             from . import fetcher
             try:
-                wav_path, title, video_name = fetcher.download_audio(
+                wav_path, title, video_name, song_len = fetcher.download_audio(
                     source, job_dir, cb, include_video=include_video,
                     section=section)
             except Exception as e:  # download failures get their own label
@@ -62,14 +63,14 @@ def run_job_process(job_dir, kind, source, piano_only, q, include_video=False,
                 # New input filename, no title change (None keeps the name).
                 q.put(("meta", os.path.basename(audio_path), None, video_name))
 
-        # Album-split jobs download RING_PAD_SEC past the chapter boundary so
-        # the last chord's ring-out is transcribed; cap the export window at
-        # the unpadded chapter length so next-track notes in the pad never
-        # play (their tails-only survive via the non-destructive trim).
-        max_end_sec = section[1] - section[0] if section else None
+        # Album-split jobs keep audio past the song's end (gap ring tail, or
+        # RING_PAD_SEC when no gap was found) so the last chord's ring-out is
+        # transcribed; cap the export window at the song's own length so
+        # next-track notes in a pad never play (their tails-only survive via
+        # the non-destructive trim).
         result = pipeline.run_job(job_dir, audio_path, cb,
                                   piano_only=piano_only,
-                                  max_end_sec=max_end_sec)
+                                  max_end_sec=song_len)
 
         # Kept video + a real separation ran: swap its soundtrack for the
         # piano-removed stem so the TV plays the backing track and the

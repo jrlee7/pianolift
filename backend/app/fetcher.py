@@ -19,7 +19,31 @@ from . import pipeline
 
 # Extra seconds downloaded past a chapter's end so the final chord's pedal
 # ring-out (which decays across the chapter boundary) reaches transcription.
+# Only used when no real gap between tracks is found near the mark (below).
 RING_PAD_SEC = 4.0
+
+# Chapter marks on album uploads are often seconds off, so each split job
+# looks for the actual silence between tracks around every mark and cuts
+# there instead. Searched further ahead than behind: an early mark (song's
+# last notes chopped) is the common failure, and pulling a boundary earlier
+# risks cutting a final chord that follows a dramatic pause.
+GAP_SEARCH_BACK_SEC = 4.0
+GAP_SEARCH_FWD_SEC = 15.0
+# Kept after a song's sound has decayed into the gap (unless the next track
+# starts sooner), so the last note's ring isn't clipped by the cut.
+RING_TAIL_SEC = 2.0
+# Kept before the next track's first attack when it becomes a song's start.
+GAP_LEAD_SEC = 0.2
+
+_SCAN_SR = 22050
+_FRAME_SEC = 0.02
+# A frame is gap-quiet this far below the window's loud level (95th pct),
+# but anything under the absolute floor always counts (quiet masters).
+_GAP_DB = 35.0
+_SILENCE_FLOOR_DB = -65.0
+_MIN_GAP_SEC = 0.25
+_BLIP_SEC = 0.1      # clicks/noise this short inside a gap don't split it
+_DIST_DB_PER_SEC = 2.0  # candidate gaps: deeper wins, nearer the mark breaks ties
 
 # A user-exported cookies.txt (Netscape format) lives beside the jobs dir, so
 # the same path works in dev and in the packaged exe. Mirrors main.BASE_DIR;
@@ -190,19 +214,138 @@ def probe_playlist(url):
     return title, entries
 
 
+def find_track_gap(x, sr, t0, mark):
+    """Locate the silence between two tracks near a chapter mark.
+
+    x: mono float samples starting at absolute time t0 (seconds), covering a
+    window around `mark`. Returns (quiet_from, next_at) in absolute seconds —
+    where the outgoing track's sound has decayed into the gap, and where the
+    next track's first attack lands (None if nothing starts again before the
+    window ends) — or None when there's no convincing gap (crossfaded tracks,
+    applause, or a window too short to judge); callers keep the mark then.
+
+    Deterministic in the window's audio alone, so the job ending at a mark
+    and the job starting at it agree on the same gap.
+    """
+    import numpy as np
+
+    hop = int(sr * _FRAME_SEC)
+    n = len(x) // hop
+    if n < int(1.0 / _FRAME_SEC):
+        return None
+    frames = np.asarray(x[:n * hop], dtype=np.float64).reshape(n, hop)
+    db = 10.0 * np.log10(np.mean(frames * frames, axis=1) + 1e-12)
+    ref = float(np.percentile(db, 95))
+    thr = max(ref - _GAP_DB, _SILENCE_FLOOR_DB)
+    if thr >= ref - 10.0:
+        return None  # nothing loud in the window to separate
+
+    quiet = db < thr
+    runs = []
+    i = 0
+    while i < n:
+        if not quiet[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and quiet[j]:
+            j += 1
+        if runs and (i - runs[-1][1]) * _FRAME_SEC <= _BLIP_SEC:
+            runs[-1][1] = j
+        else:
+            runs.append([i, j])
+        i = j
+
+    best, best_score = None, None
+    for i0, i1 in runs:
+        if (i1 - i0) * _FRAME_SEC < _MIN_GAP_SEC:
+            continue
+        a = t0 + i0 * _FRAME_SEC
+        b = t0 + i1 * _FRAME_SEC
+        dist = max(0.0, a - mark, mark - b)
+        depth = max(float(np.percentile(db[i0:i1], 10)), -100.0)
+        score = depth + _DIST_DB_PER_SEC * dist
+        if best_score is None or score < best_score:
+            best, best_score = (i0, i1), score
+    if best is None:
+        return None
+    i0, i1 = best
+    quiet_from = t0 + i0 * _FRAME_SEC
+    next_at = t0 + i1 * _FRAME_SEC if i1 < n else None
+    return round(quiet_from, 3), (round(next_at, 3) if next_at is not None
+                                  else None)
+
+
+def _scan_mono(source, t0, t1):
+    """Decode [t0, t1) seconds of `source` to mono float32 at _SCAN_SR for
+    gap analysis. Returns (samples, actual_t0) or None on failure."""
+    import numpy as np
+
+    t0 = max(0.0, t0)
+    if t1 <= t0:
+        return None
+    proc = subprocess.run(
+        [pipeline.FFMPEG_EXE, "-v", "error", "-ss", "%.3f" % t0, "-i", source,
+         "-t", "%.3f" % (t1 - t0), "-vn", "-ac", "1", "-ar", str(_SCAN_SR),
+         "-f", "f32le", "-"],
+        capture_output=True)
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return np.frombuffer(proc.stdout, dtype=np.float32), t0
+
+
+def _gap_near(source, mark):
+    scan = _scan_mono(source, mark - GAP_SEARCH_BACK_SEC,
+                      mark + GAP_SEARCH_FWD_SEC)
+    if scan is None:
+        return None
+    x, t0 = scan
+    return find_track_gap(x, _SCAN_SR, t0, mark)
+
+
+def refine_section(source, start, end):
+    """Snap an album chapter's marks to the real gaps between tracks.
+
+    Returns (song_start, song_end, keep_end) in source seconds: decode
+    [song_start, keep_end); notes struck at/after song_end never play.
+    With a gap found, the song ends RING_TAIL_SEC after its sound decays
+    (or just before the next track, if sooner) and nothing past that is
+    kept. Without one, the marks stand and RING_PAD_SEC of audio is kept
+    past the end so the ring-out still reaches transcription.
+    """
+    song_start, song_end, keep_end = start, end, end + RING_PAD_SEC
+    try:
+        if start >= 0.5:  # first track has nothing before it to split from
+            gap = _gap_near(source, start)
+            if gap and gap[1] is not None and gap[1] < end:
+                song_start = max(0.0, gap[1] - GAP_LEAD_SEC)
+        gap = _gap_near(source, end)
+        if gap:
+            quiet_from, next_at = gap
+            cut = quiet_from + RING_TAIL_SEC
+            if next_at is not None:
+                cut = min(cut, next_at - 0.1)
+            if cut > song_start + 1.0:
+                song_end = keep_end = cut
+    except Exception:
+        pass  # best-effort: a failed scan just keeps the marks as given
+    return song_start, song_end, keep_end
+
+
 def download_audio(url, job_dir, progress_cb, include_video=False,
                     section=None):
     """Download `url` into job_dir and decode audio to input.wav (44.1 kHz
-    stereo PCM). Returns (wav_path, title, video_name) — video_name is the
-    kept video file's basename (include_video=True), else None.
+    stereo PCM). Returns (wav_path, title, video_name, song_len) —
+    video_name is the kept video file's basename (include_video=True), else
+    None; song_len is the section's playable length (None without one).
 
     section=(start, end) seconds selects one chapter of an album-as-one-video
     (per-chapter split jobs). The whole source is still downloaded; the slice
-    is cut locally afterwards (see below). The kept slice is padded past `end`
-    by RING_PAD_SEC so the final chord's pedal ring-out — which crosses the
-    chapter boundary — is present in the audio for transcription; the pipeline
-    caps the export window at the unpadded boundary so any next-track notes
-    caught in the pad never play."""
+    is cut locally afterwards (see below), with the marks first snapped to the
+    real gaps between tracks (refine_section). When no gap is found the kept
+    slice is padded past `end` by RING_PAD_SEC so the final chord's ring-out
+    is present for transcription; the pipeline caps the export window at
+    song_len so any next-track notes caught in the pad never play."""
     pipeline._ensure_ffmpeg(lambda stage, pct: None)
 
     def hook(d):
@@ -260,13 +403,15 @@ def download_audio(url, job_dir, progress_cb, include_video=False,
         raise RuntimeError("download finished but media file missing")
 
     # Chapter slice cut from the local file. -ss before -i seeks the input
-    # and -t bounds the decoded duration, so the WAV starts at the chapter's
+    # and -t bounds the decoded duration, so the WAV starts at the song's
     # start (t=0 in the output), exactly as the old range download produced.
     seek, dur = [], []
+    song_len = None
     if section:
-        start, end = section
-        seek = ["-ss", "%.3f" % start]
-        dur = ["-t", "%.3f" % (end + RING_PAD_SEC - start)]
+        song_start, song_end, keep_end = refine_section(source, *section)
+        song_len = song_end - song_start
+        seek = ["-ss", "%.3f" % song_start]
+        dur = ["-t", "%.3f" % (keep_end - song_start)]
 
     progress_cb("downloading", 92)
     wav_path = os.path.join(job_dir, "input.wav")
@@ -302,4 +447,4 @@ def download_audio(url, job_dir, progress_cb, include_video=False,
     else:
         os.remove(source)
     progress_cb("downloading", 100)
-    return wav_path, title, video_name
+    return wav_path, title, video_name, song_len
