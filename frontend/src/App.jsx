@@ -539,6 +539,7 @@ export default function App() {
     setBatchResult(null)
     setBatch({ done: 0, total: toMove.length, verb: 'Moving' })
     const errors = []
+    const mp3Failed = []
     let done = 0
     for (const job of toMove) {
       try {
@@ -571,8 +572,12 @@ export default function App() {
           videoIsBacking: job.videoFile === 'video_bg.mp4'
         }
         // Family → shared cloud library; customers → on-device local library.
-        if (isFamily) await saveSong(songMeta, mp3Blob)
-        else await localSave(songMeta, mp3Blob)
+        if (isFamily) {
+          const r = await saveSong(songMeta, mp3Blob)
+          if (mp3Blob && !r.mp3Uploaded) {
+            mp3Failed.push(job.name + ' — ' + (r.mp3Error || 'unknown error'))
+          }
+        } else await localSave(songMeta, mp3Blob)
         await deleteJob(job.id)
         if (openJobId === job.id) setOpenJobId(null)
       } catch (e) {
@@ -583,6 +588,11 @@ export default function App() {
     }
     setBatch(null)
     setBatchResult({ verb: 'Moved', ok: toMove.length - errors.length, total: toMove.length, errors: errors })
+    if (mp3Failed.length) {
+      // Usually Storage quota/permissions — the songs are saved MIDI-only.
+      alert('These songs were saved to the library WITHOUT their MP3 (audio ' +
+        'upload failed — check your Storage usage):\n\n' + mp3Failed.join('\n'))
+    }
     clearSelection()
     refresh()
   }

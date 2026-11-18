@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   firebaseReady, listSongs, deleteSong, renameSong, downloadMidiBase64,
-  listFolders, createFolder, deleteFolder, setSongFolder
+  listFolders, createFolder, deleteFolder, setSongFolder,
+  backfillMp3Sizes, STORAGE_LIMIT_BYTES, STORAGE_WARN_FRACTION
 } from '../firebase.js'
 import {
   importFromLibrary, buildDiskFromLibrary, scaleMidi, applyMp3Gain
@@ -24,6 +25,12 @@ function fsSafe(name) {
     .slice(0, 60)
     .replace(/[ .]+$/, '')
   return cleaned || 'song'
+}
+
+function fmtBytes(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + ' GB'
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB'
+  return Math.round(n / 1e3) + ' KB'
 }
 
 function b64ToBytes(b64) {
@@ -64,6 +71,9 @@ export default function LibraryView({ onEdit, onWatch }) {
   const [diskPrompt, setDiskPrompt] = useState(null)
   // Blank-USB formatter, offered when a disk write finds no emulator stick.
   const [prepareUsb, setPrepareUsb] = useState(false)
+  // Old songs saved before the storage meter: how many MP3 sizes are still
+  // being looked up in the background (0 = none).
+  const [measuring, setMeasuring] = useState(0)
 
   async function refresh() {
     setLoading(true)
@@ -71,6 +81,21 @@ export default function LibraryView({ onEdit, onWatch }) {
       const items = await listSongs()
       setSongs(items)
       setError(null)
+      const missing = items.filter(function (s) {
+        return s.mp3Path && typeof s.mp3Bytes !== 'number'
+      })
+      if (missing.length) {
+        setMeasuring(missing.length)
+        backfillMp3Sizes(items, function (id, bytes) {
+          setSongs(function (prev) {
+            return prev.map(function (s) {
+              return s.id === id ? { ...s, mp3Bytes: bytes } : s
+            })
+          })
+          setMeasuring(function (n) { return Math.max(0, n - 1) })
+        }).catch(function () { /* meter stays partial */ })
+          .finally(function () { setMeasuring(0) })
+      }
     } catch (e) {
       setError(e.message)
     } finally {
@@ -102,6 +127,17 @@ export default function LibraryView({ onEdit, onWatch }) {
       else c[s.folder] = (c[s.folder] || 0) + 1
     })
     return c
+  }, [songs])
+
+  // Cloud Storage used by the stored MP3s (sizes cached on each song doc).
+  const usage = useMemo(function () {
+    let bytes = 0
+    let unmeasured = 0
+    songs.forEach(function (s) {
+      if (typeof s.mp3Bytes === 'number') bytes += s.mp3Bytes
+      else if (s.mp3Path) unmeasured++
+    })
+    return { bytes: bytes, unmeasured: unmeasured }
   }, [songs])
 
   const visible = useMemo(function () {
@@ -211,6 +247,36 @@ export default function LibraryView({ onEdit, onWatch }) {
       alert('Move failed: ' + e.message)
       refresh()
     }
+  }
+
+  // Move every selected song into one folder ('' = Unfiled) in a single go.
+  async function handleBulkMove(folder) {
+    const chosen = songs.filter(function (s) { return selected.has(s.id) })
+    if (!chosen.length) return
+    const next = folder || null
+    const ids = new Set(chosen.map(function (s) { return s.id }))
+    setSongs(function (prev) {
+      return prev.map(function (s) {
+        return ids.has(s.id) ? { ...s, folder: next } : s
+      })
+    })
+    setCopyResult(null)
+    const errors = []
+    for (let i = 0; i < chosen.length; i += 10) {
+      await Promise.all(chosen.slice(i, i + 10).map(async function (s) {
+        try {
+          await setSongFolder(s.id, next)
+        } catch (e) {
+          errors.push(s.title + ' — ' + (e.message || String(e)))
+        }
+      }))
+    }
+    setCopyResult({
+      verb: 'Moved', ok: chosen.length - errors.length, total: chosen.length,
+      errors: errors, note: 'to ' + (next ? '"' + next + '"' : 'Unfiled') + '.'
+    })
+    clearSelection()
+    if (errors.length) refresh()
   }
 
   async function handleCreateFolder() {
@@ -460,8 +526,38 @@ export default function LibraryView({ onEdit, onWatch }) {
     }
   }
 
+  const usedFrac = usage.bytes / STORAGE_LIMIT_BYTES
+  const meterLevel = usedFrac >= 0.95 ? 'crit' : usedFrac >= STORAGE_WARN_FRACTION ? 'warn' : 'ok'
+
   return (
     <div>
+      <div className={'storage-meter ' + meterLevel}>
+        <div className="storage-meter-top">
+          <span>
+            ☁ Storage: <strong>{fmtBytes(usage.bytes)}</strong> of{' '}
+            {fmtBytes(STORAGE_LIMIT_BYTES)} free ({Math.min(999, Math.round(usedFrac * 100))}%)
+          </span>
+          <span className="meta">
+            {measuring > 0
+              ? 'measuring ' + measuring + ' older song' + (measuring === 1 ? '' : 's') + '…'
+              : usage.unmeasured > 0
+                ? usage.unmeasured + ' song' + (usage.unmeasured === 1 ? '' : 's') + ' couldn\'t be measured (reload to retry)'
+                : ''}
+          </span>
+        </div>
+        <div className="storage-bar">
+          <div className="storage-bar-fill"
+            style={{ width: Math.min(100, usedFrac * 100) + '%' }} />
+        </div>
+        {meterLevel !== 'ok' && (
+          <div className="storage-meter-msg">
+            {meterLevel === 'crit'
+              ? 'Almost out of free Storage — new MP3s past the limit are billed on the Blaze plan. Delete songs you don\'t need.'
+              : 'Getting close to the free Storage allowance. Past it, extra MP3s are billed on the Blaze plan.'}
+          </div>
+        )}
+      </div>
+
       <div className="folder-bar">
         <button
           className={'chip' + (active === 'all' ? ' active' : '')}
@@ -538,6 +634,22 @@ export default function LibraryView({ onEdit, onWatch }) {
             <button className="ghost" onClick={clearSelection}>Clear</button>
           )}
           <span className="meta">{selected.size} selected</span>
+          <select
+            className="lib-folder-sel"
+            value=""
+            disabled={selected.size === 0 || Boolean(copying)}
+            title="Move all selected songs into a folder"
+            onChange={function (e) {
+              if (e.target.value === '') return
+              handleBulkMove(e.target.value === '__unfiled__' ? '' : e.target.value)
+            }}
+          >
+            <option value="">📁 Move selected to…</option>
+            <option value="__unfiled__">📂 Unfiled</option>
+            {folderNames.map(function (n) {
+              return <option key={n} value={n}>📁 {n}</option>
+            })}
+          </select>
           <label className="bulk-vol"
             title="Turn the selected songs down as they transfer — non-destructive, the stored library copies stay full-volume. Affects both the piano velocity and the accompaniment. 100% = untouched.">
             🔊

@@ -4,7 +4,8 @@ import {
   updateDoc, runTransaction, increment, query, orderBy, where, serverTimestamp
 } from 'firebase/firestore'
 import {
-  getStorage, ref as storageRef, uploadBytes, getDownloadURL, deleteObject
+  getStorage, ref as storageRef, uploadBytes, getDownloadURL, deleteObject,
+  getMetadata
 } from 'firebase/storage'
 import {
   getAuth, onAuthStateChanged, GoogleAuthProvider, signInWithPopup,
@@ -260,6 +261,8 @@ export async function saveSong(song, mp3Blob) {
     midiBase64: song.midiBase64,
     mp3Url: mp3Url,
     mp3Path: mp3Path,
+    // size of the stored audio, for the Library's storage meter
+    mp3Bytes: mp3Path ? mp3Blob.size : 0,
     sourceUrl: song.sourceUrl || null,
     // filename in the backend's local media folder (videos are too big for
     // the cloud) — the Play tab streams it from this computer
@@ -270,6 +273,40 @@ export async function saveSong(song, mp3Blob) {
     createdAt: serverTimestamp()
   })
   return { id: ref.id, mp3Uploaded: Boolean(mp3Url), mp3Error: mp3Error }
+}
+
+// Free Cloud Storage allowance on the Blaze plan. Decimal GB on purpose: it's
+// the smaller of the two readings, so the meter warns a touch early rather
+// than late.
+export const STORAGE_LIMIT_BYTES = 5e9
+export const STORAGE_WARN_FRACTION = 0.8
+
+// Songs saved before the meter existed have no `mp3Bytes`. Ask Storage for each
+// one's real size, write it onto the song doc (so this is a one-time cost), and
+// report each via onSize(id, bytes). A file already gone from Storage counts as
+// 0; any other failure leaves that song unmeasured to retry next time.
+export async function backfillMp3Sizes(songs, onSize) {
+  if (!db || !storage) return
+  const todo = songs.filter(function (s) {
+    return s.mp3Path && typeof s.mp3Bytes !== 'number'
+  })
+  let next = 0
+  async function worker() {
+    while (next < todo.length) {
+      const s = todo[next++]
+      let bytes = null
+      try {
+        const meta = await getMetadata(storageRef(storage, s.mp3Path))
+        bytes = Number(meta.size) || 0
+      } catch (e) {
+        if (e && e.code === 'storage/object-not-found') bytes = 0
+      }
+      if (bytes === null) continue
+      try { await updateDoc(doc(db, SONGS, s.id), { mp3Bytes: bytes }) } catch (e) { /* cache only */ }
+      onSize(s.id, bytes)
+    }
+  }
+  await Promise.all([worker(), worker(), worker(), worker()])
 }
 
 export async function listSongs() {
