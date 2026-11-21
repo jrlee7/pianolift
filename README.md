@@ -65,6 +65,23 @@ velocity/pedal/offset controls, download the `.mid`.
 3. If the piano feels early or late, adjust the **Timing offset** slider and
    re-download.
 
+The `.mid` runs to the end of the song's audio (End-of-Track = accompaniment
+end + 1 s), not just to the last piano note. The ENSPIRE ends a song at
+End-of-Track and starts the next one, so a MIDI that stopped at the last note
+cut off the outro/ring of chapter and playlist songs mid-phrase. Renders do
+this themselves; library songs saved earlier are fixed when copied to USB.
+
+## Watching the video (Play tab)
+
+Each song lines itself up with its own video automatically, once, and the
+result is saved. Convert-tab songs match the video's soundtrack against the
+audio the notes came from (exact to the sample); library songs match against
+their accompaniment MP3; with neither, a pitch-aware note match is tried and
+only applied when it is confident. What's left is the room — TV/HDMI delay and
+the piano — set once as the **Room trim** (⭐ Use as default). Library songs
+are listed in the Play tab's song picker. `backend/tools/autosync_check.py`
+checks the estimators against known offsets.
+
 ## E-SEQ output (floppy-era Disklaviers)
 
 Alongside MIDI, each conversion can be downloaded as a Yamaha **E-SEQ `.FIL`**

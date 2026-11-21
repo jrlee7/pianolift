@@ -3,7 +3,8 @@ import NoteEditor from './NoteEditor.jsx'
 import {
   getEvents, midiUrl, audioUrl, eseqUrl, hfeUrl, fetchMidiBase64,
   getUsbStatus, saveToUsb, saveEvents, resetEvents,
-  getDrives, exportToDrive, trimJob, saveJobSettings, archiveVideo
+  getDrives, exportToDrive, trimJob, saveJobSettings, archiveVideo,
+  videoSyncFields
 } from '../api.js'
 import { saveSong, findExistingSong } from '../firebase.js'
 import { createPreviewPlayer, createNotePlayer } from '../previewSynth.js'
@@ -465,17 +466,22 @@ export default function ResultView({ job, firebaseReady, onArchived, onPlayVideo
       }
       // Park the kept video in the backend's local media folder before the
       // job (and its files) get deleted; the song stores just the filename.
+      // The archive also reports how the baked MIDI lines up with the video
+      // (measured now, while the job's source audio still exists).
       let localVideo = null
+      let videoSync = {}
       if (job.videoFile) {
         try {
-          localVideo = (await archiveVideo(job.id)).file
+          const archived = await archiveVideo(job.id, settings.offsetMs)
+          localVideo = archived.file
+          videoSync = videoSyncFields(archived)
         } catch (e) { /* best-effort — song still moves without its video */ }
       }
       const r = await saveSong({
         title: job.name,
         noteCount: events ? events.notes.length : job.noteCount,
         pedalCount: events ? events.pedals.length : job.pedalCount,
-        settings: settings,
+        settings: { ...settings, ...videoSync },
         midiBase64: b64,
         sourceUrl: job.sourceUrl || null,
         localVideo: localVideo,

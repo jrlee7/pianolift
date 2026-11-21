@@ -241,16 +241,65 @@ def read_midi_file(path, drop_drums=True):
     return notes, pedals, stats
 
 
+def midi_length_sec(path):
+    """Song length of a Standard MIDI File in seconds (End-of-Track time,
+    tempo map applied) -- what a hardware player treats as the song's end."""
+    return float(mido.MidiFile(path).length)
+
+
+def pad_midi_end(data, end_sec):
+    """Return (bytes, length_sec): the MIDI with its End-of-Track pushed out
+    to end_sec, nothing else touched (no re-render, so events, velocities and
+    timing are byte-identical). Used to repair MIDIs baked before write_midi
+    learned end_sec -- see its docstring for why the ENSPIRE needs it. A file
+    already at least that long, or a type-2 file, comes back unchanged."""
+    import io
+
+    mid = mido.MidiFile(file=io.BytesIO(data))
+    cur = float(mid.length) if mid.type != 2 else 0.0
+    if mid.type == 2 or not mid.tracks or end_sec <= cur + 0.001:
+        return data, cur
+    # Tempo in effect at the end of the song converts the gap to ticks.
+    tempo = TEMPO
+    for msg in mido.merge_tracks(mid.tracks):
+        if msg.type == "set_tempo":
+            tempo = msg.tempo
+    extra = int(round(mido.second2tick(end_sec - cur, mid.ticks_per_beat,
+                                       tempo)))
+    if extra <= 0:
+        return data, cur
+
+    def ticks_to_end(track):
+        return sum(m.time for m in track)
+
+    longest = max(mid.tracks, key=ticks_to_end)
+    if longest and longest[-1].type == "end_of_track":
+        longest[-1] = longest[-1].copy(time=longest[-1].time + extra)
+    else:
+        longest.append(mido.MetaMessage("end_of_track", time=extra))
+    out = io.BytesIO()
+    mid.save(file=out)
+    return out.getvalue(), float(mid.length)
+
+
 def write_midi(notes, pedals, out_path,
                vel_min=20, vel_max=112, gamma=1.0,
                offset_ms=0, include_pedal=True, release_ms=0,
-               cap_sustain=True, vel_scale=1.0):
+               cap_sustain=True, vel_scale=1.0, end_sec=None):
     """notes: [{onset, offset, pitch, velocity}], pedals: [{onset, offset}].
 
     Times in seconds. offset_ms shifts every event (positive = later).
     release_ms trims each note's tail so keys don't hold too long; cap_sustain
     clamps any note to its pitch's physical sustain ceiling. vel_scale (0..1)
     turns the whole song's velocities down (non-destructive volume drop).
+
+    end_sec: where the song really ends, on the same timeline as the events
+    (before offset_ms). End-of-Track goes there, or right after the last
+    event if that is later. The Disklavier ENSPIRE ends a song -- and starts
+    the next one -- at End-of-Track, so a MIDI that stops at the last piano
+    note chops the accompaniment's outro and ring-out while the progress bar
+    (which follows the audio) is still short of the end. Store-bought
+    PianoSoft files run the MIDI to the end of the audio; so do these.
     Returns number of notes written.
     """
     shift = offset_ms / 1000.0
@@ -302,7 +351,10 @@ def write_midi(notes, pedals, out_path,
         track.append(msg)
         last_tick = tick
 
-    track.append(mido.MetaMessage("end_of_track", time=0))
+    end_tick = last_tick
+    if end_sec is not None:
+        end_tick = max(end_tick, _sec_to_ticks(end_sec + shift))
+    track.append(mido.MetaMessage("end_of_track", time=end_tick - last_tick))
     mid.save(out_path)
     note_count = sum(1 for n in notes if n["offset"] + shift > 0)
     return note_count

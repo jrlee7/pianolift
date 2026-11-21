@@ -5,7 +5,8 @@ import {
   backfillMp3Sizes, STORAGE_LIMIT_BYTES, STORAGE_WARN_FRACTION
 } from '../firebase.js'
 import {
-  importFromLibrary, buildDiskFromLibrary, scaleMidi, applyMp3Gain
+  importFromLibrary, buildDiskFromLibrary, scaleMidi, applyMp3Gain,
+  fitMidiToAudio
 } from '../api.js'
 import DiskTitlesModal from './DiskTitlesModal.jsx'
 import UsbPrepareModal from './UsbPrepareModal.jsx'
@@ -358,19 +359,23 @@ export default function LibraryView({ onEdit, onWatch }) {
     for (const song of chosen) {
       const base = fsSafe(song.title)
       try {
-        if (song.midiBase64) {
-          // Turn the piano down (velocity) if a volume drop is set; the backend
-          // rescales without disturbing timing or dynamics shape.
-          const midi = await scaleMidi(song.midiBase64, bulkVol)
-          await native.write(base + '.mid', b64ToBytes(midi))
-        }
+        let mp3 = null
         if (song.mp3Url) {
           const res = await fetch(song.mp3Url)
           if (!res.ok) throw new Error('MP3 download failed (' + res.status + ')')
           // Drop the accompaniment by the same amount so it matches the piano.
-          const mp3 = await applyMp3Gain(await res.blob(), bulkVol)
-          await native.write(base + ' (no piano).mp3', mp3)
+          mp3 = await applyMp3Gain(await res.blob(), bulkVol)
         }
+        if (song.midiBase64) {
+          // Turn the piano down (velocity) if a volume drop is set; the backend
+          // rescales without disturbing timing or dynamics shape.
+          let midi = await scaleMidi(song.midiBase64, bulkVol)
+          // Run the MIDI to the end of the accompaniment so the ENSPIRE doesn't
+          // jump to the next song at the last piano note.
+          if (mp3) midi = await fitMidiToAudio(midi, mp3)
+          await native.write(base + '.mid', b64ToBytes(midi))
+        }
+        if (mp3) await native.write(base + ' (no piano).mp3', mp3)
       } catch (e) {
         errors.push(song.title + ' — ' + (e.message || String(e)))
       }

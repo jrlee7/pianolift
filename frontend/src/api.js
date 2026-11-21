@@ -348,14 +348,27 @@ export function mediaVideoUrl(name) {
 }
 
 // Move a job's kept video into the local media folder before the job is
-// deleted (move-to-library). Returns { file } — store it on the song doc.
-export async function archiveVideo(id) {
-  const res = await fetch(BASE + '/jobs/' + id + '/archive-video', {
-    method: 'POST'
-  })
+// deleted (move-to-library). offsetMs = the export offset the library MIDI is
+// baked with. Returns { file, videoStartSec, videoAlignMs, ... } — store them
+// on the song (see videoSyncFields) so the Play tab lines the baked MIDI up
+// with the video without re-measuring.
+export async function archiveVideo(id, offsetMs) {
+  const res = await fetch(BASE + '/jobs/' + id + '/archive-video?offset_ms=' +
+    encodeURIComponent(offsetMs || 0), { method: 'POST' })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail || 'Video archive failed')
   return data
+}
+
+// The settings keys a library song keeps for the Play tab, from an
+// archiveVideo() result: where MIDI time 0 sits in the video, and the measured
+// residual on top. Merged into the song's `settings`.
+export function videoSyncFields(archived) {
+  if (!archived) return {}
+  const out = {}
+  if (archived.videoStartSec != null) out.videoStartSec = archived.videoStartSec
+  if (archived.videoAlignMs != null) out.videoAlignMs = archived.videoAlignMs
+  return out
 }
 
 // Decode a library song's baked MIDI into note/pedal events for the
@@ -386,6 +399,27 @@ export async function scaleMidi(midiBase64, volPct) {
   return data.midiBase64
 }
 
+// Run a song's MIDI to the end of its accompaniment. The ENSPIRE ends a song
+// (and starts the next) at the MIDI's End-of-Track, so a MIDI that stops at the
+// last piano note cuts the backing's outro off mid-phrase. Library songs baked
+// before renders did this themselves get it here, at copy time, from the exact
+// MP3 being written beside them. Returns padded base64 (events untouched).
+// Best effort: any failure hands back the MIDI unchanged.
+export async function fitMidiToAudio(midiBase64, audioBlob) {
+  try {
+    const fd = new FormData()
+    fd.append('midi_base64', midiBase64)
+    fd.append('audio', audioBlob, 'accompaniment.mp3')
+    const res = await fetch(BASE + '/midi/fit-to-audio', { method: 'POST', body: fd })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.detail || 'MIDI length fix failed')
+    return data.midiBase64
+  } catch (e) {
+    console.warn('fitMidiToAudio: copying MIDI unchanged —', e)
+    return midiBase64
+  }
+}
+
 // Attenuate an mp3 Blob by volPct (1-100) via the backend (ffmpeg). Returns a
 // new Blob. At full volume the original blob is returned untouched.
 export async function applyMp3Gain(blob, volPct) {
@@ -402,24 +436,32 @@ export async function applyMp3Gain(blob, volPct) {
   return res.blob()
 }
 
-// Auto-sync (job video): cross-correlates transcribed notes against the
-// job's own kept video audio. Returns { offsetMs, confidence } for the
-// caller to preview/apply -- not persisted server-side.
-export async function autoSyncJob(id) {
-  const res = await fetch(BASE + '/jobs/' + id + '/auto-sync', { method: 'POST' })
+// Auto-sync (job video): matches the kept video's audio against the audio the
+// notes were transcribed from (exact), falling back to a pitch-aware note
+// match. The backend caches the result on the job; force re-measures.
+// Returns { offsetMs, confidence (0..1), method: 'audio'|'midi' }.
+export async function autoSyncJob(id, force) {
+  const res = await fetch(BASE + '/jobs/' + id + '/auto-sync' +
+    (force ? '?force=true' : ''), { method: 'POST' })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail || 'Auto-sync failed')
   return data
 }
 
-// Auto-sync (library song): same as above but against an archived media
-// file + baked MIDI, since library songs have no job directory.
-export async function autoSyncMedia(filename, midiBase64) {
-  const res = await fetch(BASE + '/media/auto-sync', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ filename: filename, midiBase64: midiBase64 })
-  })
+// Auto-sync (library song): archived video + baked MIDI. Pass the song's
+// accompaniment MP3 (audioBlob) whenever there is one — it is the same audio as
+// a backing-track video, so the match is exact; without it the note match
+// searches ±searchSec. startSec = where the caller places MIDI time 0 in the
+// video; the returned offsetMs is what to add on top.
+export async function autoSyncMedia(opts) {
+  const fd = new FormData()
+  fd.append('filename', opts.filename)
+  fd.append('midi_base64', opts.midiBase64)
+  fd.append('offset_ms', String(opts.offsetMs || 0))
+  fd.append('start_sec', String(opts.startSec || 0))
+  fd.append('search_sec', String(opts.searchSec || 20))
+  if (opts.audioBlob) fd.append('audio', opts.audioBlob, 'accompaniment.mp3')
+  const res = await fetch(BASE + '/media/auto-sync', { method: 'POST', body: fd })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail || 'Auto-sync failed')
   return data

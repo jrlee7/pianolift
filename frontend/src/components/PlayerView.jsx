@@ -11,6 +11,7 @@ import {
 import { createMidiOut } from '../midiOut.js'
 import { createMockMidiOut, mockMidiEnabled } from '../devMockMidi.js'
 import { updateSongSettings } from '../firebase.js'
+import { localMp3Bytes } from '../localLibrary.js'
 import { loadCalibration, saveCalibration, effectiveCalibration } from '../calibrate.js'
 import { createLiveSyncMonitor } from '../liveSync.js'
 import CalibrationWizard from './CalibrationWizard.jsx'
@@ -34,6 +35,32 @@ function lsNum(key, fallback) {
   return Number.isFinite(v) ? v : fallback
 }
 
+// Sync is two numbers added together:
+//  * align — per song, automatic: how far the MIDI must move to sit on the
+//    video's own timeline (backend auto_sync; exact audio match when the
+//    song's source audio or accompaniment exists). Measured once and saved.
+//  * trim — the room: TV/HDMI delay and piano feel left over after
+//    calibration. Same for every song (⭐ Use as default), or saved per song.
+// The player gets align + trim.
+const MIN_AUTO_CONF = 0.5
+
+// Local (customer) library songs can't take a settings write, so their sync
+// lives here, keyed by song id.
+function readLocalSync(id) {
+  try { return JSON.parse(localStorage.getItem('pf_lib_sync_' + id) || 'null') } catch (e) { return null }
+}
+function writeLocalSync(id, patch) {
+  try {
+    const next = { ...(readLocalSync(id) || {}), ...patch }
+    localStorage.setItem('pf_lib_sync_' + id, JSON.stringify(next))
+  } catch (e) { /* storage full / blocked: re-measures next time */ }
+}
+
+// The library list is big (every song's MIDI); keep one copy across tab
+// switches instead of refetching on every visit.
+let libCache = null
+const LIB_CACHE_MS = 5 * 60 * 1000
+
 function fmt(sec) {
   if (!Number.isFinite(sec)) return '0:00'
   const s = Math.max(0, Math.floor(sec))
@@ -41,7 +68,7 @@ function fmt(sec) {
   return m + ':' + String(s % 60).padStart(2, '0')
 }
 
-export default function PlayerView({ jobs, initial }) {
+export default function PlayerView({ jobs, initial, loadLibrary, isFamily }) {
   const doneJobs = jobs.filter(function (j) { return j.status === 'done' })
   const jobsRef = useRef(jobs)
   jobsRef.current = jobs
@@ -53,6 +80,10 @@ export default function PlayerView({ jobs, initial }) {
   })
   const [libSong, setLibSong] = useState(
     initial && initial.libSong ? initial.libSong : null)
+  const libSongRef = useRef(libSong)
+  libSongRef.current = libSong
+  // every library song, for the song picker (null until loaded)
+  const [libList, setLibList] = useState(null)
   const [perf, setPerf] = useState(null)       // prepared note/pedal events
   const [songJob, setSongJob] = useState(null) // backing job when sel=job:*
   const [loadErr, setLoadErr] = useState(null)
@@ -72,8 +103,13 @@ export default function PlayerView({ jobs, initial }) {
   const [isFs, setIsFs] = useState(false)
   const [fsIdle, setFsIdle] = useState(false)
 
-  // piano
-  const [syncMs, setSyncMs] = useState(function () { return lsNum(LS.sync, 0) })
+  // piano — see the align/trim note at the top of the file
+  const [trimMs, setTrimMs] = useState(function () { return lsNum(LS.sync, 0) })
+  const [alignMs, setAlignMs] = useState(0)
+  // {state: 'measuring'|'ok'|'low'|'failed'|'manual', ms, conf, method, msg}
+  const [alignInfo, setAlignInfo] = useState(null)
+  const alignReqRef = useRef(0) // drops a measurement that finishes after the song changed
+  const syncMs = alignMs + trimMs
   const [pedalMs, setPedalMs] = useState(function () { return lsNum(LS.pedal, 0) })
   const [velScale, setVelScale] = useState(function () { return lsNum(LS.vel, 1) })
   const [pedalOn, setPedalOn] = useState(true)
@@ -84,8 +120,7 @@ export default function PlayerView({ jobs, initial }) {
   // sync aids
   const [tapArmed, setTapArmed] = useState(false)
   const [tapMsg, setTapMsg] = useState(null)
-  const [autoSyncBusy, setAutoSyncBusy] = useState(false)
-  const [autoSyncMsg, setAutoSyncMsg] = useState(null)
+  const autoSyncBusy = Boolean(alignInfo && alignInfo.state === 'measuring')
   // hardware calibration (velocity->latency curve + TV latency), persisted in
   // localStorage; applied to every scheduler so notes fire early by the right
   // per-note amount.
@@ -129,9 +164,111 @@ export default function PlayerView({ jobs, initial }) {
     }
   }, [initial])
 
-  // Load + prepare the selected song's events; auto-load its saved video.
+  // Library list for the song picker (family: cloud library; customers: the
+  // on-device one). Cached across tab switches; refreshed when stale.
+  useEffect(function () {
+    if (!loadLibrary) return
+    const fam = Boolean(isFamily)
+    if (libCache && libCache.family === fam && Date.now() - libCache.at < LIB_CACHE_MS) {
+      setLibList(libCache.list)
+      return
+    }
+    let dead = false
+    Promise.resolve(loadLibrary()).then(function (list) {
+      const songs = (list || []).filter(function (s) { return s && s.midiBase64 })
+      songs.sort(function (a, b) { return (a.title || '').localeCompare(b.title || '') })
+      libCache = { at: Date.now(), list: songs, family: fam }
+      if (!dead) setLibList(songs)
+    }).catch(function () { /* picker just lists Convert songs */ })
+    return function () { dead = true }
+  }, [loadLibrary, isFamily])
+
+  // Settings for a library song, with the local per-song overrides customers'
+  // on-device songs keep in localStorage.
+  function libSettings(song) {
+    const st = { ...(song.settings || {}) }
+    if (!isFamily) Object.assign(st, readLocalSync(song.id) || {})
+    return st
+  }
+
+  function applyAlign(r) {
+    if (r && r.confidence >= MIN_AUTO_CONF) {
+      const ms = Math.round(r.offsetMs)
+      setAlignMs(ms)
+      setAlignInfo({ state: 'ok', ms: ms, conf: r.confidence, method: r.method })
+      return true
+    }
+    setAlignMs(0)
+    setAlignInfo({ state: 'low', conf: r ? r.confidence : 0, method: r && r.method })
+    return false
+  }
+
+  async function measureJob(id, force, req) {
+    setAlignInfo({ state: 'measuring' })
+    try {
+      const r = await autoSyncJob(id, force)
+      if (req === alignReqRef.current) applyAlign(r) // backend saved it on the job
+    } catch (e) {
+      if (req === alignReqRef.current) setAlignInfo({ state: 'failed', msg: e.message })
+    }
+  }
+
+  async function measureLib(song, req) {
+    setAlignInfo({ state: 'measuring' })
+    try {
+      const st = libSettings(song)
+      // The accompaniment is the same audio as a backing-track video, on the
+      // MIDI's own timeline: with it the match is exact.
+      let audioBlob = null
+      try {
+        if (song.mp3Url) {
+          const res = await fetch(song.mp3Url)
+          if (res.ok) audioBlob = await res.blob()
+        } else if (song.hasMp3) {
+          const bytes = await localMp3Bytes(song.id)
+          if (bytes) audioBlob = new Blob([bytes], { type: 'audio/mpeg' })
+        }
+      } catch (e) { /* note match only */ }
+      const r = await autoSyncMedia({
+        filename: song.localVideo,
+        midiBase64: song.midiBase64,
+        offsetMs: st.offsetMs || 0,
+        startSec: st.videoStartSec || 0,
+        // songs moved before videoStartSec existed can be seconds off
+        searchSec: st.videoStartSec != null ? 3 : 20,
+        audioBlob: audioBlob
+      })
+      if (req !== alignReqRef.current) return
+      if (applyAlign(r)) saveLibSync(song, { videoAlignMs: Math.round(r.offsetMs) })
+    } catch (e) {
+      if (req === alignReqRef.current) setAlignInfo({ state: 'failed', msg: e.message })
+    }
+  }
+
+  // Persist sync keys on a library song without reloading it.
+  async function saveLibSync(song, patch) {
+    if (!isFamily) {
+      writeLocalSync(song.id, patch)
+      return
+    }
+    const settings = await updateSongSettings(song.id, song.settings, patch)
+    if (libSongRef.current && libSongRef.current.id === song.id) {
+      setLibSong(function (s) { return s ? { ...s, settings: settings } : s })
+    }
+    if (libCache) {
+      libCache.list = libCache.list.map(function (s) {
+        return s.id === song.id ? { ...s, settings: settings } : s
+      })
+    }
+    return settings
+  }
+
+  // Load + prepare the selected song's events; auto-load its saved video and
+  // line it up with the video automatically.
+  const libKey = libSong ? libSong.id : null
   useEffect(function () {
     let dead = false
+    const req = ++alignReqRef.current
     setPerf(null)
     setSongJob(null)
     setLoadErr(null)
@@ -140,7 +277,19 @@ export default function PlayerView({ jobs, initial }) {
     tapsRef.current = []
     setTapArmed(false)
     setTapMsg(null)
-    setAutoSyncMsg(null)
+    setAlignMs(0)
+    setAlignInfo(null)
+    // A song saved by hand before auto-align existed keeps its one number as
+    // the whole offset (it already included the alignment).
+    function startTrim(st) {
+      const legacy = st.videoSyncMs != null && st.videoTrimMs == null &&
+        st.videoAlignMs == null
+      setTrimMs(st.videoTrimMs != null ? st.videoTrimMs
+        : legacy ? st.videoSyncMs : lsNum(LS.sync, 0))
+      setPedalMs(st.pedalLagMs != null ? st.pedalLagMs : lsNum(LS.pedal, 0))
+      if (legacy) setAlignInfo({ state: 'manual' })
+      return legacy
+    }
     async function load() {
       if (sel.indexOf('job:') === 0) {
         const id = sel.slice(4)
@@ -152,8 +301,7 @@ export default function PlayerView({ jobs, initial }) {
         if (dead) return
         setPerf(p)
         setSongJob(job)
-        setSyncMs(st.videoSyncMs != null ? st.videoSyncMs : lsNum(LS.sync, 0))
-        setPedalMs(st.pedalLagMs != null ? st.pedalLagMs : lsNum(LS.pedal, 0))
+        const legacy = startTrim(st)
         // Conversion kept its video (URL fetch with "include video" or an
         // uploaded video file): load it straight away, no picking. When the
         // pipeline swapped in the piano-removed backing track, note that so
@@ -164,22 +312,37 @@ export default function PlayerView({ jobs, initial }) {
             isBg ? '🎵 backing track (piano removed)'
               : '🎞 saved with this conversion',
             isBg)
+          if (legacy) return
+          const cached = job.videoAlign && job.videoAlign.video === job.videoFile
+            ? job.videoAlign : null
+          if (cached) applyAlign(cached)
+          else measureJob(id, false, req)
         }
-      } else if (sel === 'lib' && libSong) {
-        const ev = await decodeMidi(libSong.midiBase64)
+      } else if (sel === 'lib' && libSongRef.current) {
+        const song = libSongRef.current
+        const ev = await decodeMidi(song.midiBase64)
+        const st = libSettings(song)
         // Library MIDI is a baked render: velocities mapped, release/cap
-        // applied. Play it verbatim.
-        const p = prepareEvents(ev, { releaseMs: 0, capSustain: false }, true, 0)
+        // applied, and it sits on the accompaniment's timeline (dead space
+        // cut, codec delay added). videoStartSec puts MIDI time 0 back where
+        // it falls in the video; songs moved before that existed get it from
+        // the measured alignment instead.
+        const p = prepareEvents(ev, { releaseMs: 0, capSustain: false }, true,
+          st.videoStartSec || 0)
         if (dead) return
         setPerf(p)
-        const libSt = libSong.settings || {}
-        setSyncMs(libSt.videoSyncMs != null ? libSt.videoSyncMs : lsNum(LS.sync, 0))
-        setPedalMs(libSt.pedalLagMs != null ? libSt.pedalLagMs : lsNum(LS.pedal, 0))
-        if (libSong.localVideo) {
-          const isBg = Boolean(libSong.videoIsBacking)
-          setVideoSrc(mediaVideoUrl(libSong.localVideo),
-            isBg ? '🎵 backing track (piano removed)' : '🎞 ' + libSong.localVideo,
+        const legacy = startTrim(st)
+        if (song.localVideo) {
+          const isBg = Boolean(song.videoIsBacking)
+          setVideoSrc(mediaVideoUrl(song.localVideo),
+            isBg ? '🎵 backing track (piano removed)' : '🎞 ' + song.localVideo,
             isBg)
+          if (legacy) return
+          if (st.videoAlignMs != null) {
+            applyAlign({ offsetMs: st.videoAlignMs, confidence: 1, method: 'saved' })
+          } else {
+            measureLib(song, req)
+          }
         }
       }
     }
@@ -187,7 +350,7 @@ export default function PlayerView({ jobs, initial }) {
       load().catch(function (e) { if (!dead) setLoadErr(e.message || String(e)) })
     }
     return function () { dead = true }
-  }, [sel, libSong])
+  }, [sel, libKey])
 
   // Bind the scheduler once both the song and a video are loaded.
   useEffect(function () {
@@ -299,7 +462,7 @@ export default function PlayerView({ jobs, initial }) {
   }
 
   function nudge(ms) {
-    setSyncMs(function (s) { return Math.round(s + ms) })
+    setTrimMs(function (s) { return Math.round(s + ms) })
     setSaveMsg(null)
   }
 
@@ -366,7 +529,7 @@ export default function PlayerView({ jobs, initial }) {
   function applyTapSync() {
     if (tapsRef.current.length < 4) return
     const med = tapMedianMs()
-    setSyncMs(function (m) { return Math.round(m + med) })
+    setTrimMs(function (m) { return Math.round(m + med) })
     tapsRef.current = []
     setTapArmed(false)
     setTapMsg('Applied ' + (med >= 0 ? '+' : '') + med +
@@ -402,36 +565,48 @@ export default function PlayerView({ jobs, initial }) {
     v.play()
   }
 
-  // --- Auto sync: cross-correlates the transcribed onsets against the
-  // loaded video's own audio track (backend does the DSP) instead of the
-  // user ear-matching taps. Sets syncMs directly; still needs Save.
-  async function runAutoSync() {
+  // --- Auto sync runs by itself on load (see the load effect) and is saved.
+  // The button re-measures from scratch and drops a hand-saved per-song
+  // offset back to the room trim, since the alignment now covers that part.
+  function runAutoSync() {
     if (autoSyncBusy) return
-    setAutoSyncBusy(true)
-    setAutoSyncMsg('Analyzing audio…')
-    try {
-      let result
-      if (sel === 'lib' && libSong) {
-        if (!libSong.localVideo) throw new Error('no video saved for this song')
-        result = await autoSyncMedia(libSong.localVideo, libSong.midiBase64)
-      } else if (songJob) {
-        if (!songJob.videoFile) throw new Error('no video kept for this song')
-        result = await autoSyncJob(songJob.id)
-      } else {
-        throw new Error('no song loaded')
+    const req = ++alignReqRef.current
+    setTrimMs(lsNum(LS.sync, 0))
+    setSaveMsg(null)
+    if (sel === 'lib' && libSong) {
+      if (!libSong.localVideo) {
+        setAlignInfo({ state: 'failed', msg: 'no video saved for this song' })
+        return
       }
-      const ms = Math.round(result.offsetMs)
-      setSyncMs(ms)
-      const pct = Math.round((result.confidence || 0) * 100)
-      setAutoSyncMsg('Set to ' + (ms >= 0 ? '+' : '') + ms + ' ms (confidence ' +
-        pct + '%)' + (pct < 40 ? ' — low confidence, check by ear' : '') +
-        ' — Save to keep it.')
-      setSaveMsg(null)
-    } catch (e) {
-      setAutoSyncMsg('Auto-sync failed: ' + e.message)
-    } finally {
-      setAutoSyncBusy(false)
+      measureLib(libSong, req)
+    } else if (songJob) {
+      if (!songJob.videoFile) {
+        setAlignInfo({ state: 'failed', msg: 'no video kept for this song' })
+        return
+      }
+      measureJob(songJob.id, true, req)
     }
+  }
+
+  function alignText() {
+    const a = alignInfo
+    if (!a) return null
+    if (a.state === 'measuring') return '⏳ Lining the piano up with this video…'
+    if (a.state === 'ok') {
+      return '✓ Lined up with the video automatically: ' +
+        (a.ms >= 0 ? '+' : '') + a.ms + ' ms (' +
+        (a.method === 'audio' ? 'exact audio match'
+          : a.method === 'saved' ? 'saved'
+            : 'note match, ' + Math.round((a.conf || 0) * 100) + '%') + ')'
+    }
+    if (a.state === 'low') {
+      return '⚠ Couldn\'t line this video up automatically (match ' +
+        Math.round((a.conf || 0) * 100) + '%) — use 👏 Tap sync'
+    }
+    if (a.state === 'manual') {
+      return 'Using the timing saved by hand for this song — ⚡ Auto sync to measure it'
+    }
+    return '⚠ Auto sync failed: ' + a.msg
   }
 
   // In fullscreen the transport bar hides after a moment of stillness.
@@ -463,14 +638,22 @@ export default function PlayerView({ jobs, initial }) {
     return function () { window.removeEventListener('keydown', onKey) }
   }, [videoUrl, isFs])
 
+  // Per-song save: the trim (and pedal lag) on top of the automatic
+  // alignment. videoSyncMs (the old single number) is cleared so the song
+  // stops being treated as hand-synced.
   async function handleSaveSync() {
-    const patch = { videoSyncMs: Math.round(syncMs), pedalLagMs: Math.round(pedalMs) }
+    const patch = {
+      videoTrimMs: Math.round(trimMs), pedalLagMs: Math.round(pedalMs),
+      videoSyncMs: null
+    }
+    if (alignInfo && alignInfo.state === 'ok') patch.videoAlignMs = alignMs
     try {
       if (sel === 'lib' && libSong) {
-        const settings = await updateSongSettings(libSong.id, libSong.settings, patch)
-        setLibSong(function (s) { return { ...s, settings: settings } })
+        await saveLibSync(libSong, patch)
       } else if (songJob) {
-        const merged = { ...DEFAULTS, ...(songJob.settings || {}), ...patch }
+        const jobPatch = { ...patch }
+        delete jobPatch.videoAlignMs // the job keeps its own (job.videoAlign)
+        const merged = { ...DEFAULTS, ...(songJob.settings || {}), ...jobPatch }
         await saveJobSettings(songJob.id, merged)
       } else {
         return
@@ -481,10 +664,12 @@ export default function PlayerView({ jobs, initial }) {
     }
   }
 
+  // The trim is the room's (TV + piano), not the song's, so it is the default
+  // every song starts from.
   function handleSaveDefault() {
-    localStorage.setItem(LS.sync, String(Math.round(syncMs)))
+    localStorage.setItem(LS.sync, String(Math.round(trimMs)))
     localStorage.setItem(LS.pedal, String(Math.round(pedalMs)))
-    setSaveMsg('Saved as default for new songs')
+    setSaveMsg('Saved as the trim every song starts with')
   }
 
   // Toggle the piano's fixed-delay compensation mode. On = the scheduler assumes
@@ -503,7 +688,7 @@ export default function PlayerView({ jobs, initial }) {
   function applyLiveTrim() {
     const info = liveSyncInfo
     if (!info || info.medianErr == null) return
-    setSyncMs(function (m) { return Math.round(m - info.medianErr) })
+    setTrimMs(function (m) { return Math.round(m - info.medianErr) })
     if (liveMonitorRef.current) liveMonitorRef.current.reset()
     setLiveSyncInfo(null)
     setSaveMsg(null)
@@ -528,16 +713,42 @@ export default function PlayerView({ jobs, initial }) {
 
       <div className="player-top">
         <select
-          value={sel}
-          onChange={function (e) { setSel(e.target.value); setSaveMsg(null) }}
+          value={sel === 'lib' && libSong ? 'lib:' + libSong.id : sel}
+          onChange={function (e) {
+            const v = e.target.value
+            setSaveMsg(null)
+            if (v.indexOf('lib:') === 0) {
+              const id = v.slice(4)
+              const song = (libList || []).find(function (s) { return s.id === id }) ||
+                (libSong && libSong.id === id ? libSong : null)
+              if (song) { setLibSong(song); setSel('lib') }
+            } else {
+              setSel(v)
+            }
+          }}
         >
           <option value="">🎵 Choose a song…</option>
-          {sel === 'lib' && libSong && (
-            <option value="lib">☁ {libSong.title}</option>
+          {sel === 'lib' && libSong && !(libList || []).some(function (s) { return s.id === libSong.id }) && (
+            <option value={'lib:' + libSong.id}>☁ {libSong.title}</option>
           )}
-          {doneJobs.map(function (j) {
-            return <option key={j.id} value={'job:' + j.id}>{j.name}</option>
-          })}
+          {doneJobs.length > 0 && (
+            <optgroup label="Convert tab">
+              {doneJobs.map(function (j) {
+                return <option key={j.id} value={'job:' + j.id}>
+                  {j.videoFile ? '🎞 ' : ''}{j.name}
+                </option>
+              })}
+            </optgroup>
+          )}
+          {libList && libList.length > 0 && (
+            <optgroup label="Library (🎞 = has its video)">
+              {libList.map(function (s) {
+                return <option key={s.id} value={'lib:' + s.id}>
+                  {s.localVideo ? '🎞 ' : ''}{s.title}
+                </option>
+              })}
+            </optgroup>
+          )}
         </select>
 
         <button onClick={function () { fileRef.current.click() }}>
@@ -644,24 +855,26 @@ export default function PlayerView({ jobs, initial }) {
       <div className="player-controls">
         <div className="player-group">
           <label>
-            Piano timing <strong>{Math.round(syncMs)} ms</strong>
-            <span className="meta"> (− earlier · + later)</span>
+            Room trim <strong>{Math.round(trimMs)} ms</strong>
+            <span className="meta"> (your TV + piano · − earlier · + later)</span>
           </label>
           <div className="row">
             <button onClick={function () { nudge(-50) }}>−50</button>
             <button onClick={function () { nudge(-10) }}>−10</button>
             <input
-              type="range" min="-2000" max="2000" step="10" value={syncMs}
-              onChange={function (e) { setSyncMs(parseFloat(e.target.value)); setSaveMsg(null) }}
+              type="range" min="-2000" max="2000" step="10" value={trimMs}
+              onChange={function (e) { setTrimMs(parseFloat(e.target.value)); setSaveMsg(null) }}
             />
             <button onClick={function () { nudge(10) }}>+10</button>
             <button onClick={function () { nudge(50) }}>+50</button>
           </div>
+          {alignInfo && <div className="meta" style={{ marginTop: 4 }}>{alignText()}</div>}
           <div className="row" style={{ marginTop: 8 }}>
-            <button className="primary" disabled={!ready || autoSyncBusy}
-              title="Analyze the video's own audio and set the timing automatically"
+            <button className={alignInfo && alignInfo.state !== 'ok' ? 'primary' : ''}
+              disabled={!ready || autoSyncBusy}
+              title="Measure this song's alignment with its video again (it runs by itself when a song loads)"
               onClick={runAutoSync}>
-              {autoSyncBusy ? '⏳ Analyzing…' : '⚡ Auto sync'}
+              {autoSyncBusy ? '⏳ Measuring…' : '⚡ Auto sync'}
             </button>
             <button className={tapArmed ? 'primary' : ''} disabled={!ready}
               title="Tap the T key on clear beats while watching — the app measures the offset for you"
@@ -717,10 +930,13 @@ export default function PlayerView({ jobs, initial }) {
               </button>
             </div>
           )}
-          {autoSyncMsg && <div className="meta">{autoSyncMsg}</div>}
-          {!autoSyncMsg && tapMsg && <div className="meta">{tapMsg}</div>}
-          {!autoSyncMsg && !tapMsg && (
-            <div className="meta">Nudge live with , and . keys while watching.</div>
+          {tapMsg && <div className="meta">{tapMsg}</div>}
+          {!tapMsg && (
+            <div className="meta">
+              Each song lines itself up with its video. The trim is what your
+              TV and piano add — set it once (⭐ Use as default). Nudge live with
+              , and . while watching.
+            </div>
           )}
         </div>
 
@@ -797,7 +1013,7 @@ export default function PlayerView({ jobs, initial }) {
               💾 Save timing for “{songLabel || 'song'}”
             </button>
             <button onClick={handleSaveDefault}
-              title="New songs start with these offsets">
+              title="Every song starts with this room trim and pedal timing">
               ⭐ Use as default
             </button>
           </div>
@@ -811,8 +1027,8 @@ export default function PlayerView({ jobs, initial }) {
         piano's USB TO HOST port, press play. Best sync: turn on the piano's
         <strong> MIDI IN Delay</strong> and tick <strong>500 ms delay mode</strong>,
         run <strong>⚡ Calibrate</strong> once (verifies the delay and measures your
-        TV), then <strong>⚡ Auto sync</strong> per song. 🎹 Visual sync test is only
-        for a final by-eye check.
+        TV), then set the room trim once with 🎹 Visual sync test and ⭐ Use as
+        default. Every song lines itself up with its own video automatically.
       </div>
 
       {showCalibrate && (
@@ -831,12 +1047,12 @@ export default function PlayerView({ jobs, initial }) {
       {showVisual && (
         <VisualTest
           midi={midi}
-          syncMs={syncMs}
+          syncMs={trimMs}
           pedalMs={pedalMs}
           velScale={velScale}
           pedalOn={pedalOn}
           calibration={calibration}
-          onSyncChange={function (ms) { setSyncMs(ms); setSaveMsg(null) }}
+          onSyncChange={function (ms) { setTrimMs(ms); setSaveMsg(null) }}
           onClose={function () { setShowVisual(false) }}
         />
       )}

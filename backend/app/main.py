@@ -780,19 +780,23 @@ def rename_job(job_id: str, payload: dict = Body(...)):
     return {"ok": True, "name": name}
 
 
-@app.post("/api/jobs/{job_id}/auto-sync")
-def auto_sync_job(job_id: str):
-    """Cross-correlate the transcribed notes against the job's kept video's
-    own audio track to estimate videoSyncMs automatically (see auto_sync.py).
-    Returns the offset for the frontend to preview/apply; it isn't persisted
-    here so the user can still nudge/save like with tap-sync."""
+def _job_video_align(job_id, force=False):
+    """Measure (or return the cached) automatic alignment of a job's kept
+    video: {offsetMs, confidence, method, video}. Matches the video's audio
+    against the audio the notes came from -- the piano-removed stem for a
+    backing-track video, else the input mix -- and falls back to the
+    pitch-aware note match. Cached on the job per video file."""
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "job not found")
-    if not job.get("videoFile"):
+    video_rel = job.get("videoFile")
+    if not video_rel:
         raise HTTPException(404, "no video kept for this song")
+    cached = job.get("videoAlign")
+    if not force and cached and cached.get("video") == video_rel:
+        return cached
     job_dir = _job_dir(job_id)
-    video_path = os.path.join(job_dir, job["videoFile"])
+    video_path = os.path.join(job_dir, video_rel)
     if not os.path.exists(video_path):
         raise HTTPException(404, "video file missing")
     events_path = os.path.join(job_dir, "events.json")
@@ -800,49 +804,107 @@ def auto_sync_job(job_id: str):
         raise HTTPException(404, "events not ready")
     with open(events_path) as f:
         events = json.load(f)
+    # Events live on the (destructively trimmed) job timeline; the reference
+    # audio and the video are on the untrimmed source timeline.
     shift = job.get("srcStartSec") or 0
-    notes = [{"onset": n["onset"] + shift, "velocity": n.get("velocity", 64)}
-              for n in events["notes"]]
+    notes = [{"onset": n["onset"] + shift, "pitch": n.get("pitch", 60),
+              "velocity": n.get("velocity", 64)} for n in events["notes"]]
+    if video_rel == "video_bg.mp4":
+        ref = os.path.join(job_dir, "separated", "no_piano.wav")
+    else:
+        ref = _input_path(job_id)
     try:
-        result = auto_sync.compute_offset(video_path, notes)
+        result = auto_sync.compute_offset(video_path, notes, ref_path=ref)
     except Exception as e:
         raise HTTPException(422, "auto-sync failed: " + str(e))
+    result = dict(result, video=video_rel)
+    with jobs_lock:
+        job["videoAlign"] = result
+        _persist(job_id)
     return result
 
 
+@app.post("/api/jobs/{job_id}/auto-sync")
+def auto_sync_job(job_id: str, force: bool = False):
+    """Automatic video alignment for a Convert-tab song (see auto_sync.py).
+    Persisted on the job (job.videoAlign) so the Play tab applies it on every
+    load without asking; force=true re-measures."""
+    return _job_video_align(job_id, force=force)
+
+
 @app.post("/api/media/auto-sync")
-def auto_sync_media(payload: dict = Body(...)):
-    """Library-song variant of auto-sync: video lives in MEDIA_DIR, MIDI is
-    the baked base64 blob stored on the Firestore song doc."""
-    name = payload.get("filename") or ""
+async def auto_sync_media(filename: str = Form(...),
+                          midi_base64: str = Form(...),
+                          offset_ms: float = Form(0.0),
+                          start_sec: float = Form(0.0),
+                          search_sec: float = Form(20.0),
+                          audio: Optional[UploadFile] = File(None)):
+    """Library-song auto-sync: the video lives in MEDIA_DIR, the MIDI is the
+    baked blob from the song doc. Notes are placed at MIDI time + start_sec
+    (the song's stored videoStartSec; 0 for songs moved before it existed)
+    and the returned offsetMs is what to add on top.
+
+    With `audio` (the song's accompaniment MP3 -- the same piano-removed
+    audio as a backing-track video, on the MIDI's own timeline give or take
+    the user's export offset_ms), the match is audio-to-audio and exact.
+    Without it, the pitch-aware note match searches +-search_sec."""
+    name = filename or ""
     if "/" in name or "\\" in name or ".." in name:
         raise HTTPException(400, "bad filename")
     video_path = os.path.join(MEDIA_DIR, name)
     if not os.path.exists(video_path):
         raise HTTPException(404, "video file missing")
     try:
-        raw = base64.b64decode(payload.get("midiBase64") or "", validate=True)
+        raw = base64.b64decode(midi_base64 or "", validate=True)
     except (ValueError, TypeError):
-        raise HTTPException(400, "invalid midiBase64")
+        raise HTTPException(400, "invalid midi_base64")
     if not raw:
         raise HTTPException(400, "empty MIDI payload")
-    tmp = os.path.join(JOBS_DIR, "_autosync_%s.mid" % uuid.uuid4().hex[:8])
+    tag = uuid.uuid4().hex[:8]
+    tmp = os.path.join(JOBS_DIR, "_autosync_%s.mid" % tag)
+    tmp_audio = None
     try:
         with open(tmp, "wb") as f:
             f.write(raw)
-        notes, _pedals = midi_writer.read_midi(tmp)
-    except Exception as e:
-        raise HTTPException(400, "could not parse MIDI: " + str(e))
-    finally:
         try:
-            os.remove(tmp)
-        except OSError:
-            pass
-    try:
-        result = auto_sync.compute_offset(video_path, notes)
-    except Exception as e:
-        raise HTTPException(422, "auto-sync failed: " + str(e))
-    return result
+            notes, _pedals = midi_writer.read_midi(tmp)
+        except Exception as e:
+            raise HTTPException(400, "could not parse MIDI: " + str(e))
+        result = None
+        if audio is not None:
+            data = await audio.read()
+            if data:
+                tmp_audio = os.path.join(JOBS_DIR, "_autosync_%s.mp3" % tag)
+                with open(tmp_audio, "wb") as f:
+                    f.write(data)
+                try:
+                    # MP3 time t <-> MIDI time t + offset_ms: the MIDI render
+                    # already absorbed the codec delay and the dead-space cut.
+                    a = auto_sync.align_audio(
+                        video_path, tmp_audio, search_sec=max(search_sec, 8.0),
+                        guess_sec=start_sec + offset_ms / 1000.0)
+                    result = dict(a, offsetMs=round(
+                        a["offsetMs"] - offset_ms - start_sec * 1000.0, 1))
+                except Exception:
+                    result = None
+        if result is None or result["confidence"] < 0.6:
+            placed = [dict(n, onset=n["onset"] + start_sec) for n in notes]
+            try:
+                m = auto_sync.align_midi(video_path, placed,
+                                         search_sec=search_sec)
+                if result is None or m["confidence"] > result["confidence"]:
+                    result = m
+            except Exception as e:
+                if result is None:
+                    raise HTTPException(422, "auto-sync failed: " + str(e))
+        return result
+    finally:
+        for p in (tmp, tmp_audio):
+            if p:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
 
 def _vol_scale(vol_pct):
@@ -901,6 +963,39 @@ def _trim_tail(job, events):
     return notes, pedals
 
 
+# MIDI End-of-Track lands this far past the end of the song's audio, so the
+# accompaniment MP3 (which ends at the same point, give or take its ~25 ms
+# codec delay and a user offset of a few hundred ms) always finishes first.
+MIDI_END_PAD_SEC = 1.0
+
+
+def _song_end_sec(job):
+    """Where the song's audio ends, on the job's events timeline (the same
+    span the accompaniment MP3 covers), plus MIDI_END_PAD_SEC. None when the
+    source audio can't be measured -- the MIDI then ends at its last event,
+    as it always used to."""
+    job_dir = _job_dir(job["id"])
+    src_start = job.get("srcStartSec") or 0.0
+    end = None
+    if job.get("srcEndSec") is not None:
+        end = job["srcEndSec"] - src_start
+    else:
+        # Both are full-length, on the original (untrimmed) source timeline.
+        for p in (_input_path(job["id"]),
+                  os.path.join(job_dir, "separated", "no_piano.wav")):
+            if os.path.exists(p):
+                total = pipeline.media_duration(p)
+                if total:
+                    end = total - src_start
+                    break
+    trim_end = job.get("trimEndSec")
+    if trim_end is not None:
+        end = trim_end if end is None else min(end, trim_end)
+    if end is None or end <= 0:
+        return None
+    return end + MIDI_END_PAD_SEC
+
+
 @app.get("/api/jobs/{job_id}/midi")
 def get_midi(job_id: str, vel_min: int = 20, vel_max: int = 112,
              gamma: float = 1.0, offset_ms: int = 0, pedal: bool = True,
@@ -928,7 +1023,7 @@ def get_midi(job_id: str, vel_min: int = 20, vel_max: int = 112,
         vel_min=vel_min, vel_max=vel_max, gamma=gamma,
         offset_ms=effective_offset_ms, include_pedal=pedal,
         release_ms=release_ms, cap_sustain=cap_sustain,
-        vel_scale=_vol_scale(vol_pct))
+        vel_scale=_vol_scale(vol_pct), end_sec=_song_end_sec(job))
     return FileResponse(
         out, media_type="audio/midi",
         filename=job["name"] + ".mid")
@@ -1968,11 +2063,19 @@ def get_media(name: str, request: Request):
 
 
 @app.post("/api/jobs/{job_id}/archive-video")
-def archive_video(job_id: str):
+def archive_video(job_id: str, offset_ms: float = 0.0):
     """Move the job's kept video into the local media folder so it survives
     the job's deletion when the song moves to the (cloud) library — video
     files are far too big for Firebase, so they live on this computer and
-    the library entry stores just the filename."""
+    the library entry stores just the filename.
+
+    Also returns how the library's baked MIDI maps onto this video, measured
+    while the job's source audio still exists:
+      videoStartSec -- MIDI time 0 sits this far into the video. The bake is
+        on the accompaniment's timeline (dead space cut, codec delay and the
+        export offset_ms added), not the video's.
+      videoAlignMs  -- the measured residual on top (container offsets), or
+        null if it couldn't be measured."""
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "job not found")
@@ -1982,6 +2085,15 @@ def archive_video(job_id: str):
     src = os.path.join(_job_dir(job_id), video_rel)
     if not os.path.exists(src):
         raise HTTPException(404, "video file missing")
+    start_sec = ((job.get("srcStartSec") or 0.0)
+                 + (job.get("trimStartSec") or 0.0)
+                 - (job.get("encoderDelayMs") or 0.0) / 1000.0
+                 - offset_ms / 1000.0)
+    align = None
+    try:
+        align = _job_video_align(job_id)
+    except Exception:
+        align = None  # best effort: the Play tab can still measure later
     ext = os.path.splitext(video_rel)[1].lower()
     base = _fs_safe_name(job["name"])
     name = base + ext
@@ -1993,7 +2105,12 @@ def archive_video(job_id: str):
     with jobs_lock:
         job.pop("videoFile", None)
         _persist(job_id)
-    return {"file": name}
+    good = align is not None and align.get("confidence", 0) >= 0.5
+    return {"file": name,
+            "videoStartSec": round(start_sec, 4),
+            "videoAlignMs": align["offsetMs"] if good else None,
+            "alignConfidence": align["confidence"] if align else None,
+            "alignMethod": align["method"] if align else None}
 
 
 @app.post("/api/midi/decode")
@@ -2044,11 +2161,13 @@ def scale_midi(payload: dict = Body(...)):
         with open(tmp_in, "wb") as f:
             f.write(raw)
         notes, pedals = midi_writer.read_midi(tmp_in)
+        # Keep the song's End-of-Track where it was (the ENSPIRE ends the song
+        # there); re-rendering would otherwise pull it in to the last note.
         midi_writer.write_midi(
             notes, pedals, tmp_out,
             vel_min=0, vel_max=127, gamma=1.0, offset_ms=0,
             include_pedal=True, release_ms=0, cap_sustain=False,
-            vel_scale=scale)
+            vel_scale=scale, end_sec=midi_writer.midi_length_sec(tmp_in))
         with open(tmp_out, "rb") as f:
             out = f.read()
     except Exception as e:
@@ -2060,6 +2179,45 @@ def scale_midi(payload: dict = Body(...)):
             except OSError:
                 pass
     return {"midiBase64": base64.b64encode(out).decode("ascii")}
+
+
+@app.post("/api/midi/fit-to-audio")
+async def fit_midi_to_audio(midi_base64: str = Form(...),
+                            audio: UploadFile = File(...)):
+    """Push a MIDI's End-of-Track out to the end of its accompaniment (+1 s)
+    so the ENSPIRE plays the whole song instead of jumping to the next one at
+    the last piano note. Events are untouched. For library songs baked before
+    renders padded End-of-Track themselves; the 'copy to USB folder' paths
+    call it with the exact MP3 they're about to write. Returns
+    {midiBase64, midiSec, audioSec, padded}."""
+    try:
+        raw = base64.b64decode(midi_base64 or "", validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "invalid midi_base64")
+    if not raw:
+        raise HTTPException(400, "empty MIDI payload")
+    data = await audio.read()
+    ext = os.path.splitext(audio.filename or "")[1].lower() or ".mp3"
+    tmp = os.path.join(JOBS_DIR, "_fit_%s%s" % (uuid.uuid4().hex[:8], ext))
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        audio_sec = pipeline.media_duration(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if not audio_sec:
+        raise HTTPException(422, "could not read the audio's length")
+    try:
+        out, midi_sec = midi_writer.pad_midi_end(
+            raw, audio_sec + MIDI_END_PAD_SEC)
+    except Exception as e:
+        raise HTTPException(400, "could not read MIDI: " + str(e))
+    return {"midiBase64": base64.b64encode(out).decode("ascii"),
+            "midiSec": round(midi_sec, 3), "audioSec": round(audio_sec, 3),
+            "padded": out is not raw}
 
 
 @app.post("/api/audio/gain")

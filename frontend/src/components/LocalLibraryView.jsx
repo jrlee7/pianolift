@@ -4,7 +4,7 @@ import {
   localLibraryOnDisk
 } from '../localLibrary.js'
 import { downloadMidiBase64 } from '../firebase.js'
-import { scaleMidi, applyMp3Gain } from '../api.js'
+import { scaleMidi, applyMp3Gain, fitMidiToAudio } from '../api.js'
 
 // Windows/FAT-safe filename (mirrors the cloud library's fsSafe).
 function fsSafe(name) {
@@ -93,23 +93,24 @@ export default function LocalLibraryView({ onWatch }) {
     for (const song of chosen) {
       const base = fsSafe(song.title)
       try {
+        let gained = null
+        if (song.hasMp3) {
+          const mp3 = await localMp3Bytes(song.id)
+          // Drop the accompaniment by the same amount to match the piano.
+          if (mp3) gained = await applyMp3Gain(new Blob([mp3], { type: 'audio/mpeg' }), bulkVol)
+        }
         if (song.midiBase64) {
           // Non-destructive volume drop: rescale the stored MIDI's velocities.
-          const b64 = await scaleMidi(song.midiBase64, bulkVol)
+          let b64 = await scaleMidi(song.midiBase64, bulkVol)
+          // Run the MIDI to the end of the accompaniment so the ENSPIRE doesn't
+          // jump to the next song at the last piano note.
+          if (gained) b64 = await fitMidiToAudio(b64, gained)
           const bin = atob(b64)
           const bytes = new Uint8Array(bin.length)
           for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
           await write(base + '.mid', bytes)
         }
-        if (song.hasMp3) {
-          const mp3 = await localMp3Bytes(song.id)
-          if (mp3) {
-            // Drop the accompaniment by the same amount to match the piano.
-            const gained = await applyMp3Gain(new Blob([mp3], { type: 'audio/mpeg' }), bulkVol)
-            const buf = new Uint8Array(await gained.arrayBuffer())
-            await write(base + ' (no piano).mp3', buf)
-          }
-        }
+        if (gained) await write(base + ' (no piano).mp3', new Uint8Array(await gained.arrayBuffer()))
       } catch (e) { errors.push(song.title + ' — ' + (e.message || e)) }
       done++
       setCopying({ done, total: chosen.length })

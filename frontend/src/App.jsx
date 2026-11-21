@@ -15,8 +15,8 @@ import SheetJobCard from './components/SheetJobCard.jsx'
 import SheetResultView from './components/SheetResultView.jsx'
 import {
   listJobs, uploadMp3, submitUrl, probeUrl, probePlaylist, deleteJob, verifyJob,
-  midiUrl, audioUrl, fetchMidiBase64, archiveVideo, buildDiskFromJobs,
-  listSheetJobs, uploadSheet
+  midiUrl, audioUrl, fetchMidiBase64, archiveVideo, videoSyncFields,
+  buildDiskFromJobs, listSheetJobs, uploadSheet
 } from './api.js'
 import ChapterSplitModal from './components/ChapterSplitModal.jsx'
 import PlaylistModal from './components/PlaylistModal.jsx'
@@ -555,17 +555,23 @@ export default function App() {
         // Videos are too big for the cloud: park the file in the backend's
         // local media folder (it would die with the job otherwise) and store
         // only its filename on the song.
+        // The archive also reports how the baked MIDI lines up with the video
+        // (measured now, while the job's source audio still exists).
+        const settings = jobSettings(job)
         let localVideo = null
+        let videoSync = {}
         if (job.videoFile) {
           try {
-            localVideo = (await archiveVideo(job.id)).file
+            const archived = await archiveVideo(job.id, settings.offsetMs)
+            localVideo = archived.file
+            videoSync = videoSyncFields(archived)
           } catch (e) { /* video archive best-effort — song still moves */ }
         }
         const songMeta = {
           title: job.name,
           noteCount: job.noteCount,
           pedalCount: job.pedalCount,
-          settings: jobSettings(job),
+          settings: { ...settings, ...videoSync },
           midiBase64: b64,
           sourceUrl: job.sourceUrl || null,
           localVideo: localVideo,
@@ -967,7 +973,10 @@ export default function App() {
           : <LocalLibraryView onWatch={handleWatchFromLibrary} />
       )}
 
-      {tab === 'play' && <PlayerView jobs={jobs} initial={playerInit} />}
+      {tab === 'play' && (
+        <PlayerView jobs={jobs} initial={playerInit} isFamily={isFamily}
+          loadLibrary={isFamily ? (firebaseReady ? listSongs : null) : localList} />
+      )}
 
       {tab === 'disk' && (
         <GotekView

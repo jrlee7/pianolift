@@ -72,6 +72,34 @@ def _ensure_ffmpeg(progress_cb):
     os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ["PATH"]
 
 
+def media_duration(path):
+    """Length in seconds of an audio or video file, or None if unreadable.
+    libsndfile reads WAV/FLAC/MP3 headers instantly; anything else (mp4,
+    webm, m4a) falls back to the "Duration:" line ffmpeg prints for -i."""
+    import re
+    import subprocess
+
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        if info.samplerate and info.frames:
+            return info.frames / float(info.samplerate)
+    except Exception:
+        pass
+    try:
+        _ensure_ffmpeg(lambda stage, pct: None)
+        proc = subprocess.run([FFMPEG_EXE, "-hide_banner", "-i", path],
+                              capture_output=True)
+        err = proc.stderr.decode("utf-8", "replace")
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
+        if m:
+            return (int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                    + float(m.group(3)))
+    except Exception:
+        pass
+    return None
+
+
 # A whole-file separation loads the entire stereo waveform (plus the model's
 # tensors) into RAM at once. On the CPU path a full-length concert/movie
 # (~2.6 GB just for the 44.1k stereo PCM of a 2-hour file) overruns memory and
@@ -775,7 +803,9 @@ def run_job(job_dir, audio_path, progress_cb, piano_only=False,
     # accompaniment; the user's slider is then pure room/feel adjustment.
     midi_path = os.path.join(job_dir, "output.mid")
     baked_offset_ms = encoder_delay_ms - trim_start * 1000.0
-    midi_writer.write_midi(notes, pedals, midi_path, offset_ms=baked_offset_ms)
+    song_end = trim_end if trim_end is not None else media_duration(audio_path)
+    midi_writer.write_midi(notes, pedals, midi_path, offset_ms=baked_offset_ms,
+                           end_sec=(song_end + 1.0) if song_end else None)
 
     return {
         "pianoStem": piano_wav,
