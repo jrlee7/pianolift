@@ -71,6 +71,11 @@ End-of-Track and starts the next one, so a MIDI that stopped at the last note
 cut off the outro/ring of chapter and playlist songs mid-phrase. Renders do
 this themselves; library songs saved earlier are fixed when copied to USB.
 
+To repair files already made (a USB stick, or the cloud library itself), use
+`backend/tools/fix_midi_endings.py` — `folder E:\` or `library`, dry run unless
+`--apply`, originals backed up to `~/PianoForge backups` (`restore` puts them
+back). Only the End-of-Track moves; notes and timing are untouched.
+
 ## Watching the video (Play tab)
 
 Each song lines itself up with its own video automatically, once, and the

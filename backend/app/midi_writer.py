@@ -279,7 +279,10 @@ def pad_midi_end(data, end_sec):
         longest.append(mido.MetaMessage("end_of_track", time=extra))
     out = io.BytesIO()
     mid.save(file=out)
-    return out.getvalue(), float(mid.length)
+    data = out.getvalue()
+    # mido caches the merged track behind .length, so re-read the new bytes
+    # rather than trust mid.length (it would still report the old end).
+    return data, float(mido.MidiFile(file=io.BytesIO(data)).length)
 
 
 def write_midi(notes, pedals, out_path,
