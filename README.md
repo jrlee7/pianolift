@@ -74,7 +74,11 @@ this themselves; library songs saved earlier are fixed when copied to USB.
 To repair files already made (a USB stick, or the cloud library itself), use
 `backend/tools/fix_midi_endings.py` — `folder E:\` or `library`, dry run unless
 `--apply`, originals backed up to `~/PianoForge backups` (`restore` puts them
-back). Only the End-of-Track moves; notes and timing are untouched.
+back). Only the End-of-Track moves; notes and timing are untouched. On a stick
+that also holds store-bought audio songs (`X.mid` + `X.mp3`), add `--ours-only`
+so only `X (no piano).mp3` pairs are touched. The ENSPIRE's own index
+(`.dkvsong.db` at the stick root) stores each song's length as the MIDI's
+length — that is where it ends the song — so the tool updates it too.
 
 ## Watching the video (Play tab)
 

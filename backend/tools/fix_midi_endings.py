@@ -150,7 +150,9 @@ def report(rows, applied):
         print("  %s +%6.1fs  %7.1fs -> %7.1fs  %s%s" % (
             "fixed" if applied else "fix  ", r["audioSec"] - r["midiSec"],
             r["midiSec"], r["newSec"], r["name"],
-            ("   (" + r["why"] + ")") if r.get("why") else ""))
+            ("   (" + r["why"] + ")") if r.get("why") else "")
+            + ("   [paired with " + r["mp3"] + "]"
+               if r.get("mp3") and "(no piano)" not in r["mp3"].lower() else ""))
     for r in skips:
         print("  skip              %s   (%s)" % (r["name"], r["why"]))
     print("\n%d %s, %d already run to the end of their MP3, %d skipped."
@@ -163,16 +165,26 @@ def report(rows, applied):
 
 def backup_path(args, kind):
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    d = os.path.join(os.path.expanduser(args.backup_dir), "%s-%s" % (kind, stamp))
-    os.makedirs(d, exist_ok=True)
-    return d
+    base = os.path.join(os.path.expanduser(args.backup_dir), "%s-%s" % (kind, stamp))
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    d, n = base, 1
+    while True:  # never share a folder with another run (its manifest would be lost)
+        try:
+            os.makedirs(d)
+            return d
+        except FileExistsError:
+            n += 1
+            d = "%s-%d" % (base, n)
 
 
 # ---------------------------------------------------------------- folder mode
 
 
-def _pair(folder, stem, names):
-    for cand in (stem + " (no piano).mp3", stem + ".mp3"):
+def _pair(folder, stem, names, ours_only=False):
+    """The MP3 that plays with this MIDI. PianoForge writes "X (no piano).mp3";
+    a bare "X.mp3" may be a store-bought audio song, so --ours-only skips it."""
+    cands = [stem + " (no piano).mp3"] + ([] if ours_only else [stem + ".mp3"])
+    for cand in cands:
         hit = names.get(cand.lower())
         if hit:
             return os.path.join(folder, hit)
@@ -191,20 +203,22 @@ def run_folder(args):
             if not f.lower().endswith(".mid") or f.startswith("._"):
                 continue
             path = os.path.join(folder, f)
-            mp3 = _pair(folder, f[:-4], names)
-            audio = None
-            if mp3:
-                with open(mp3, "rb") as fh:
-                    def read(start, n, fh=fh):
-                        fh.seek(start)
-                        return fh.read(n)
-                    audio = mp3_seconds(read, os.path.getsize(mp3))
+            rel = os.path.relpath(path, root)
+            mp3 = _pair(folder, f[:-4], names, args.ours_only)
+            if not mp3:
+                # piano-only, or a MIDI we didn't make: not even read
+                rows.append({"name": rel, "status": "solo", "path": path})
+                continue
+            with open(mp3, "rb") as fh:
+                def read(start, n, fh=fh):
+                    fh.seek(start)
+                    return fh.read(n)
+                audio = mp3_seconds(read, os.path.getsize(mp3))
             with open(path, "rb") as fh:
                 data = fh.read()
-            row = plan(os.path.relpath(path, root), data, audio)
-            if not mp3:
-                row["status"] = "solo"  # piano-only, or a MIDI we didn't make
+            row = plan(rel, data, audio)
             row["path"] = path
+            row["mp3"] = os.path.basename(mp3)
             rows.append(row)
     if not rows:
         sys.exit("no .mid files under " + root)
@@ -217,15 +231,63 @@ def run_folder(args):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(r["path"], dst)
             manifest.append({"backup": r["name"], "path": r["path"]})
+        db = _find_index(root)
+        if db:
+            shutil.copy2(db, os.path.join(bdir, INDEX_NAME))
         with open(os.path.join(bdir, "manifest.json"), "w", encoding="utf-8") as fh:
-            json.dump({"kind": "folder", "files": manifest}, fh, indent=1)
+            json.dump({"kind": "folder", "files": manifest,
+                       "index": db and {"backup": INDEX_NAME, "path": db}}, fh, indent=1)
         print("Originals backed up to " + bdir)
         for r in pads:
             tmp = r["path"] + ".tmp"
             with open(tmp, "wb") as fh:
                 fh.write(r["data"])
             os.replace(tmp, r["path"])
+        if db:
+            n = _update_index(db, pads)
+            print("ENSPIRE index %s: length updated on %d of %d songs" % (db, n, len(pads)))
     report(rows, args.apply)
+
+
+# The ENSPIRE keeps a SQLite index at the stick's root. Its song.length (ms) is
+# the MIDI's length -- measured: equal to mido's on all 137 PianoForge songs on
+# a real stick -- and it ends the song there. It also stores each MIDI's mtime,
+# so it most likely re-reads a changed file; length is set here too so the fix
+# holds either way. mtime is left alone on purpose: a stale one still tells the
+# piano to look again.
+INDEX_NAME = ".dkvsong.db"
+
+
+def _find_index(root):
+    d = root
+    while True:
+        p = os.path.join(d, INDEX_NAME)
+        if os.path.isfile(p):
+            return p
+        up = os.path.dirname(d)
+        if up == d:
+            return None
+        d = up
+
+
+def _update_index(db, pads):
+    import sqlite3
+
+    base = os.path.dirname(db)
+    con = sqlite3.connect(db)
+    try:
+        n = 0
+        for r in pads:
+            rel = os.path.relpath(r["path"], base).replace(os.sep, "/")
+            n += con.execute("UPDATE song SET length=? WHERE midi_path=?",
+                             (int(round(r["newSec"] * 1000)), rel)).rowcount
+        con.commit()
+        ok = con.execute("PRAGMA integrity_check").fetchone()[0]
+        if ok != "ok":
+            raise RuntimeError("index integrity check: " + ok)
+        return n
+    finally:
+        con.close()
 
 
 # ---------------------------------------------------------------- library mode
@@ -358,7 +420,8 @@ def run_restore(args):
         b = json.load(fh)
     if b["kind"] == "folder":
         bdir = os.path.dirname(p)
-        for f in b["files"]:
+        idx = b.get("index")
+        for f in b["files"] + ([idx] if idx else []):
             if args.apply:
                 shutil.copy2(os.path.join(bdir, f["backup"]), f["path"])
             print("  %s %s" % ("restored" if args.apply else "would restore", f["path"]))
@@ -383,6 +446,8 @@ def main():
     sub = ap.add_subparsers(dest="mode", required=True)
     f = sub.add_parser("folder", parents=[common])
     f.add_argument("path")
+    f.add_argument("--ours-only", action="store_true",
+                   help='only MIDIs beside a "(no piano).mp3" (leave X.mid + X.mp3 alone)')
     lib = sub.add_parser("library", parents=[common])
     lib.add_argument("--project", default="pianolift-jl")
     lib.add_argument("--bucket")
