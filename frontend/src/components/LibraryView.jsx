@@ -823,8 +823,17 @@ export default function LibraryView({ onEdit, onWatch }) {
               <div className="lib-card-actions">
                 <button
                   className="primary"
-                  onClick={function () {
-                    downloadMidiBase64(song.midiBase64, song.title + '.mid')
+                  onClick={async function () {
+                    // Run the MIDI to the end of its accompaniment, same as Copy to
+                    // USB, so a song saved before the fix still plays to the end.
+                    let midi = song.midiBase64
+                    if (song.mp3Url) {
+                      try {
+                        const res = await fetch(song.mp3Url)
+                        if (res.ok) midi = await fitMidiToAudio(midi, await res.blob())
+                      } catch (e) { console.warn('⬇ .mid: MP3 fetch failed, MIDI unchanged —', e) }
+                    }
+                    downloadMidiBase64(midi, song.title + '.mid')
                   }}
                 >⬇ .mid</button>
                 {song.mp3Url && (

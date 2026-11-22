@@ -120,6 +120,17 @@ export default function LocalLibraryView({ onWatch }) {
     setSelected(new Set())
   }
 
+  // Run the MIDI to the end of its accompaniment, same as Copy to USB, so a
+  // song saved before the fix still plays to the end on the ENSPIRE.
+  async function downloadMid(song) {
+    let b64 = song.midiBase64
+    if (song.hasMp3) {
+      const mp3 = await localMp3Bytes(song.id)
+      if (mp3) b64 = await fitMidiToAudio(b64, new Blob([mp3], { type: 'audio/mpeg' }))
+    }
+    downloadMidiBase64(b64, song.title + '.mid')
+  }
+
   async function downloadMp3(song) {
     const url = await localMp3Url(song.id)
     if (!url) { alert('No MP3 stored for this song.'); return }
@@ -207,7 +218,7 @@ export default function LocalLibraryView({ onWatch }) {
                 <div className="lib-audio"><audio controls autoPlay src={audio.url} /></div>
               )}
               <div className="lib-card-actions">
-                <button className="primary" onClick={() => downloadMidiBase64(song.midiBase64, song.title + '.mid')}>⬇ .mid</button>
+                <button className="primary" onClick={() => downloadMid(song)}>⬇ .mid</button>
                 {song.hasMp3 && <button className="ghost" onClick={() => downloadMp3(song)}>⬇ .mp3</button>}
                 {song.hasMp3 && <button className="ghost" onClick={() => play(song)}>{audio && audio.id === song.id ? '⏸' : '▶'} Play</button>}
                 {onWatch && song.midiBase64 && (
